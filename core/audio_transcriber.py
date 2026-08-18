@@ -47,7 +47,7 @@ class AudioTranscriber:
     def __init__(
         self,
         language: str = "en",
-        model_size: str = "tiny",
+        model_size: str = "base",
         device: Optional[str] = None,
         compute_type: Optional[str] = None,
         cpu_threads: int = 4,
@@ -210,42 +210,14 @@ class AudioTranscriber:
 
             segments, info = self.model.transcribe(
                 audio_input,
-
-                # Source language.
-                language=(
-                    self.language
-                    if self.language
-                    else None
-                ),
-
-                # IMPORTANT:
-                #
-                # "translate" means:
-                #   speech -> English
-                #
-                # "transcribe" means:
-                #   speech -> original language
-                #
+                language=self.language or None,
                 task=self.task,
-
-                # Fast decoding.
-                beam_size=1,
-
-                # VAD avoids wasting time processing silence.
+                beam_size=3,
                 vad_filter=True,
-
                 vad_parameters={
                     "min_silence_duration_ms": 500,
                 },
-
-                # Do not unnecessarily generate multiple
-                # candidate results.
-                best_of=1,
-
-                # Faster than more expensive decoding options.
                 temperature=0,
-
-                # Prevent excessive hallucination in silence.
                 condition_on_previous_text=True,
             )
 
