@@ -99,6 +99,7 @@ class JobProcessor:
             progress_callback=self.progress_callback,
             error_callback=self.error_callback,
             overwrite_callback=self.overwrite_callback,
+            translate_callback=self.overwrite_callback
         )
 
         self.check_cancelled()

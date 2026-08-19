@@ -189,7 +189,7 @@ def show_progress(
 # OVERWRITE
 # ==============================================================
 
-def ask_overwrite(filepath: str) -> bool:
+def ask_overwrite(filepath: str, type) -> bool:
     """
     Ask the user whether an existing subtitle should be overwritten.
     """
@@ -202,7 +202,7 @@ def ask_overwrite(filepath: str) -> bool:
         print()
 
         print(
-            "Subtitle file already exists:"
+            f"{type} subtitle file already exists:"
         )
 
         print(

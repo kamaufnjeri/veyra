@@ -1,577 +1,555 @@
 from __future__ import annotations
 
-from typing import List, Tuple, Optional, Dict
-import os
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
-import argostranslate.package
-import argostranslate.translate
+import httpx
+import requests
 
 
 class SubtitlesTranslator:
     """
-    Fast subtitle translator using Argos Translate.
+    Fast subtitle translator using Google's GTX endpoint.
 
-    Main optimizations:
-        - Loads the translation model only once.
-        - Avoids downloading an already-installed model.
-        - Uses text caching.
-        - Translates multiple subtitle lines in one model call.
-        - Preserves subtitle ordering.
-        - Preserves blank subtitles.
-        - Supports single-text translation for SubtitleService.
-        - Supports timed subtitle pairs.
+    No CTranslate2.
+    No NLLB model.
+    No local model files.
 
-    Expected structures:
+    Example:
 
-        transcripts:
-            ["Hello", "How are you?", "I'm fine."]
+        translator = SubtitlesTranslator(
+            source_language="es",
+            target_language="en",
+        )
 
-        timed_subtitles:
-            [
-                ((0.0, 2.0), "Hello"),
-                ((2.0, 4.0), "How are you?"),
-            ]
+        result = translator([
+            "Hola, ¿cómo estás?",
+            "Me llamo Carlos.",
+        ])
     """
 
-    # Number of subtitle lines combined into one translation request.
-    #
-    # Larger values reduce Python/model overhead, but extremely large
-    # values can make individual translation requests too expensive.
-    DEFAULT_BATCH_SIZE = 32
+    DEFAULT_TIMEOUT = 30
+    DEFAULT_RETRIES = 3
+    DEFAULT_BATCH_SIZE = 16
 
     def __init__(
         self,
         source_language: str,
         target_language: str,
         error_messages_callback=None,
+        progress_callback=None,
         batch_size: int = DEFAULT_BATCH_SIZE,
-        **kwargs,
+        timeout: int = DEFAULT_TIMEOUT,
+        retries: int = DEFAULT_RETRIES,
+        patience: int = 1,
     ):
-        self.source_language = self._normalize_language(source_language)
-        self.target_language = self._normalize_language(target_language)
+        self.source_language = self._normalize_language(
+            source_language
+        )
 
-        self.error_messages_callback = error_messages_callback
+        self.target_language = self._normalize_language(
+            target_language
+        )
 
-        self.translation_model = None
+        self.error_messages_callback = (
+            error_messages_callback
+        )
 
-        self.batch_size = max(1, int(batch_size))
+        self.progress_callback = (
+            progress_callback
+        )
 
-        # Cache:
-        #
-        # original text -> translated text
-        #
-        # This is particularly useful when transcripts contain repeated
-        # phrases such as:
-        #
-        # "Thank you."
-        # "Thank you."
-        # "Thank you."
-        self._translation_cache: Dict[str, str] = {}
+        self.batch_size = max(
+            1,
+            int(batch_size),
+        )
 
-        self._initialize_argos_settings()
-        self._initialize_translation_model()
+        self.timeout = max(
+            1,
+            int(timeout),
+        )
+
+        self.retries = max(
+            0,
+            int(retries),
+        )
+
+        self.patience = max(
+            0,
+            int(patience),
+        )
+
+        self._translation_cache: Dict[
+            str,
+            str,
+        ] = {}
+
+        self._session = requests.Session()
+
+        self._session.headers.update(
+            {
+                "User-Agent": (
+                    "Mozilla/5.0 "
+                    "(Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) "
+                    "Chrome/131.0 Safari/537.36"
+                ),
+                "Referer": (
+                    "https://translate.google.com/"
+                ),
+            }
+        )
 
     # ==========================================================
-    # Language helpers
+    # LANGUAGE
     # ==========================================================
 
     @staticmethod
-    def _normalize_language(language: Optional[str]) -> str:
-        """
-        Normalize language codes.
-
-        Examples:
-            en-US -> en
-            EN_us -> en
-            es -> es
-        """
+    def _normalize_language(
+        language: Optional[str],
+    ) -> str:
 
         if not language:
             return ""
 
-        return str(language).strip().lower().replace("_", "-").split("-")[0]
+        return (
+            str(language)
+            .strip()
+            .lower()
+            .replace("_", "-")
+        )
 
     # ==========================================================
-    # Argos configuration
+    # STATUS
     # ==========================================================
 
-    def _initialize_argos_settings(self) -> None:
-        """
-        Configure Argos for faster translation.
-
-        These are environment variables used by Argos Translate.
-        We set them before the translation model is loaded.
-        """
-
-        try:
-            # Number of batches Argos processes.
-            os.environ.setdefault(
-                "ARGOS_BATCH_SIZE",
-                str(self.batch_size),
-            )
-
-            # Let CTranslate2 choose the appropriate CPU thread count.
-            os.environ.setdefault(
-                "ARGOS_INTRA_THREADS",
-                "0",
-            )
-
-            # One translator is normally sufficient for this application.
-            os.environ.setdefault(
-                "ARGOS_INTER_THREADS",
-                "1",
-            )
-
-            # int8 is generally much faster on CPU with some potential
-            # accuracy differences.
-            #
-            # We do NOT force it if the user already configured another
-            # compute type.
-            os.environ.setdefault(
-                "ARGOS_COMPUTE_TYPE",
-                "int8",
-            )
-
-        except Exception as exc:
-            self._error(
-                f"Could not configure Argos performance settings: {exc}"
-            )
+    @property
+    def is_available(self) -> bool:
+        return bool(
+            self.source_language
+            and self.target_language
+        )
 
     # ==========================================================
-    # Model initialization
+    # SINGLE TRANSLATION
     # ==========================================================
 
-    def _initialize_translation_model(self) -> None:
-        """
-        Load the required Argos translation model.
-
-        If the model is already installed, we do not download it again.
-        """
-
-        if not self.source_language or not self.target_language:
-            self._error(
-                "Source and target languages are required."
-            )
-            return
-
-        if self.source_language == self.target_language:
-            self._error(
-                "Source and target languages are the same. "
-                "Translation is unnecessary."
-            )
-            return
-
-        try:
-            # --------------------------------------------------
-            # First check installed languages.
-            # --------------------------------------------------
-
-            installed_languages = (
-                argostranslate.translate.get_installed_languages()
-            )
-
-            from_lang = next(
-                (
-                    language
-                    for language in installed_languages
-                    if language.code == self.source_language
-                ),
-                None,
-            )
-
-            to_lang = next(
-                (
-                    language
-                    for language in installed_languages
-                    if language.code == self.target_language
-                ),
-                None,
-            )
-
-            # --------------------------------------------------
-            # Check whether the translation model already exists.
-            # --------------------------------------------------
-
-            if from_lang and to_lang:
-                existing_translation = from_lang.get_translation(to_lang)
-
-                if existing_translation is not None:
-                    self.translation_model = existing_translation
-                    return
-
-            # --------------------------------------------------
-            # Model is not installed.
-            #
-            # Only now do we access the package index.
-            # --------------------------------------------------
-
-            self._error(
-                f"Installing Argos model "
-                f"{self.source_language} -> {self.target_language}..."
-            )
-
-            argostranslate.package.update_package_index()
-
-            available_packages = (
-                argostranslate.package.get_available_packages()
-            )
-
-            package_to_install = next(
-                (
-                    package
-                    for package in available_packages
-                    if package.from_code == self.source_language
-                    and package.to_code == self.target_language
-                ),
-                None,
-            )
-
-            if package_to_install is None:
-                self._error(
-                    f"No Argos package available for "
-                    f"{self.source_language} -> "
-                    f"{self.target_language}"
-                )
-                return
-
-            download_path = package_to_install.download()
-
-            argostranslate.package.install_from_path(
-                download_path
-            )
-
-            # --------------------------------------------------
-            # Reload installed languages after installation.
-            # --------------------------------------------------
-
-            installed_languages = (
-                argostranslate.translate.get_installed_languages()
-            )
-
-            from_lang = next(
-                (
-                    language
-                    for language in installed_languages
-                    if language.code == self.source_language
-                ),
-                None,
-            )
-
-            to_lang = next(
-                (
-                    language
-                    for language in installed_languages
-                    if language.code == self.target_language
-                ),
-                None,
-            )
-
-            if not from_lang or not to_lang:
-                self._error(
-                    f"Could not load installed languages for "
-                    f"{self.source_language} -> "
-                    f"{self.target_language}"
-                )
-                return
-
-            self.translation_model = (
-                from_lang.get_translation(to_lang)
-            )
-
-            if self.translation_model is None:
-                self._error(
-                    f"Could not create translation model for "
-                    f"{self.source_language} -> "
-                    f"{self.target_language}"
-                )
-
-        except Exception as exc:
-            self.translation_model = None
-
-            self._error(
-                f"Failed to initialize translation model: {exc}"
-            )
-
-    # ==========================================================
-    # Single translation
-    # ==========================================================
-
-    def translate(self, text: str) -> str:
-        """
-        Translate one piece of text.
-
-        Used by SubtitleService:
-
-            translator.translate(text)
-        """
+    def translate(
+        self,
+        text: Optional[str],
+    ) -> str:
 
         if text is None:
-            return text
+            return ""
 
-        original_text = str(text)
+        original = str(text)
 
-        if not original_text.strip():
-            return text
-
-        if self.translation_model is None:
-            return text
+        if not original.strip():
+            return original
 
         # ------------------------------------------------------
-        # Cache lookup
+        # Cache
         # ------------------------------------------------------
 
-        cached = self._translation_cache.get(original_text)
+        cached = self._translation_cache.get(
+            original
+        )
 
         if cached is not None:
             return cached
 
-        try:
-            translated_text = self.translation_model.translate(
-                original_text
+        if not self.is_available:
+            raise RuntimeError(
+                "Translator is not configured."
             )
 
-            if translated_text is None:
-                translated_text = original_text
-            else:
-                translated_text = str(translated_text).strip()
+        try:
 
-                if not translated_text:
-                    translated_text = original_text
+            translated = self.google_translate(
+                text=original,
+                source=self.source_language,
+                target=self.target_language,
+            )
 
-            self._translation_cache[original_text] = translated_text
+            if not translated:
+                return original
 
-            return translated_text
+            # --------------------------------------------------
+            # GTX occasionally returns a trailing newline.
+            # Retry if requested.
+            # --------------------------------------------------
+
+            attempts = 0
+
+            while (
+                translated.endswith("\n")
+                and attempts < self.patience
+            ):
+                attempts += 1
+
+                retry_result = (
+                    self.google_translate(
+                        text=original,
+                        source=self.source_language,
+                        target=self.target_language,
+                    )
+                )
+
+                if not retry_result:
+                    break
+
+                translated = retry_result
+
+            translated = translated.strip()
+
+            if not translated:
+                translated = original
+
+            self._translation_cache[
+                original
+            ] = translated
+
+            return translated
 
         except Exception as exc:
+
             self._error(
-                f"Translation failed for line "
-                f"'{original_text}': {exc}"
+                f"Translation failed: {exc}"
             )
 
-            return original_text
+            # Keep subtitle processing alive.
+            return original
 
     # ==========================================================
-    # Batch translation
+    # GOOGLE GTX
+    # ==========================================================
+
+    def google_translate(
+        self,
+        text: str,
+        source: str,
+        target: str,
+    ) -> Optional[str]:
+
+        url = (
+            "https://translate.googleapis.com/"
+            "translate_a/single"
+        )
+
+        params = {
+            "client": "gtx",
+            "sl": source,
+            "tl": target,
+            "dt": "t",
+            "q": text,
+        }
+
+        last_error = None
+
+        for attempt in range(
+            self.retries + 1
+        ):
+
+            try:
+
+                response = self._session.get(
+                    url,
+                    params=params,
+                    timeout=self.timeout,
+                )
+
+                response.raise_for_status()
+
+                data = response.json()
+
+                translated = (
+                    self._parse_response(data)
+                )
+
+                if translated:
+                    return translated
+
+                raise RuntimeError(
+                    "Google returned an empty translation."
+                )
+
+            except requests.exceptions.RequestException as exc:
+
+                last_error = exc
+
+                if attempt < self.retries:
+                    time.sleep(
+                        min(
+                            0.5 * (attempt + 1),
+                            2.0,
+                        )
+                    )
+
+            except Exception as exc:
+
+                last_error = exc
+
+                if attempt < self.retries:
+                    time.sleep(0.2)
+
+        # ------------------------------------------------------
+        # HTTPX fallback
+        # ------------------------------------------------------
+
+        try:
+
+            with httpx.Client(
+                timeout=self.timeout,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 "
+                        "(Windows NT 10.0; Win64; x64)"
+                    ),
+                    "Referer": (
+                        "https://translate.google.com/"
+                    ),
+                },
+            ) as client:
+
+                response = client.get(
+                    url,
+                    params=params,
+                )
+
+                response.raise_for_status()
+
+                return self._parse_response(
+                    response.json()
+                )
+
+        except Exception as exc:
+
+            last_error = exc
+
+        if last_error:
+            self._error(
+                last_error
+            )
+
+        return None
+
+    # ==========================================================
+    # RESPONSE PARSER
+    # ==========================================================
+
+    def _parse_response(
+        self,
+        response_data: Any,
+    ) -> Optional[str]:
+
+        try:
+
+            if not response_data:
+                return None
+
+            if not isinstance(
+                response_data,
+                list,
+            ):
+                return None
+
+            if not response_data[0]:
+                return None
+
+            parts = []
+
+            for item in response_data[0]:
+
+                if not item:
+                    continue
+
+                if not isinstance(
+                    item,
+                    list,
+                ):
+                    continue
+
+                if len(item) < 1:
+                    continue
+
+                translated_text = item[0]
+
+                if translated_text:
+                    parts.append(
+                        str(translated_text)
+                    )
+
+            if not parts:
+                return None
+
+            return "".join(parts)
+
+        except (
+            IndexError,
+            KeyError,
+            TypeError,
+        ) as exc:
+
+            self._error(exc)
+
+            return None
+
+    # ==========================================================
+    # BATCH
     # ==========================================================
 
     def _translate_batch(
         self,
         texts: List[str],
     ) -> List[str]:
-        """
-        Translate a batch of subtitle lines.
-
-        Argos's public translation interface accepts one text at a time,
-        so we combine multiple subtitle lines into one translation request
-        using newline separators.
-
-        The separator lets us map the translated lines back to the
-        original subtitle entries.
-
-        If Argos changes or collapses the separators, we fall back to
-        translating each line individually.
-        """
 
         if not texts:
             return []
 
-        if self.translation_model is None:
-            return texts
+        results: List[Optional[str]] = [
+            None
+        ] * len(texts)
+
+        uncached_indices = []
+        uncached_texts = []
 
         # ------------------------------------------------------
-        # Remove already cached strings from the actual request.
+        # Cache lookup
         # ------------------------------------------------------
-
-        results: List[Optional[str]] = [None] * len(texts)
-
-        uncached_indices: List[int] = []
-        uncached_texts: List[str] = []
 
         for index, text in enumerate(texts):
-            original = str(text)
 
-            if not original.strip():
-                results[index] = original
+            text = str(text)
+
+            if not text.strip():
+                results[index] = text
                 continue
 
-            cached = self._translation_cache.get(original)
+            cached = (
+                self._translation_cache.get(
+                    text
+                )
+            )
 
             if cached is not None:
                 results[index] = cached
-                continue
+            else:
+                uncached_indices.append(index)
+                uncached_texts.append(text)
 
-            uncached_indices.append(index)
-            uncached_texts.append(original)
-
+        # Everything was cached.
         if not uncached_texts:
+
             return [
-                result if result is not None else texts[i]
-                for i, result in enumerate(results)
+                results[index]
+                if results[index] is not None
+                else str(texts[index])
+                for index in range(len(texts))
             ]
 
         # ------------------------------------------------------
-        # IMPORTANT:
+        # Google GTX does not have a reliable official
+        # multi-sentence batch API, so translate requests
+        # individually.
         #
-        # Use a separator that is very unlikely to occur naturally.
-        #
-        # Newlines are understood by Argos's paragraph handling.
+        # The Session keeps HTTP connections alive, which makes
+        # this considerably cheaper than creating a new client
+        # for every subtitle.
         # ------------------------------------------------------
 
-        combined_text = "\n".join(uncached_texts)
-
-        try:
-            translated_combined = self.translation_model.translate(
-                combined_text
-            )
-
-            translated_combined = (
-                str(translated_combined)
-                if translated_combined is not None
-                else ""
-            )
-
-            translated_lines = translated_combined.splitlines()
-
-            # --------------------------------------------------
-            # The number of output lines must match the input.
-            #
-            # If it does, map them directly.
-            # --------------------------------------------------
-
-            if len(translated_lines) == len(uncached_texts):
-
-                for index, original, translated in zip(
-                    uncached_indices,
-                    uncached_texts,
-                    translated_lines,
-                ):
-                    translated = translated.strip()
-
-                    if not translated:
-                        translated = original
-
-                    self._translation_cache[original] = translated
-
-                    results[index] = translated
-
-                return [
-                    result if result is not None else texts[i]
-                    for i, result in enumerate(results)
-                ]
-
-            # --------------------------------------------------
-            # Argos may have changed the paragraph structure.
-            #
-            # Fall back safely rather than corrupting subtitles.
-            # --------------------------------------------------
-
-            self._error(
-                "Batch translation returned an unexpected number "
-                "of lines. Falling back to individual translation."
-            )
-
-        except Exception as exc:
-            self._error(
-                f"Batch translation failed: {exc}. "
-                f"Falling back to individual translation."
-            )
-
-        # ------------------------------------------------------
-        # Safe fallback
-        # ------------------------------------------------------
-
-        for index, original in zip(
+        for index, text in zip(
             uncached_indices,
             uncached_texts,
         ):
-            results[index] = self.translate(original)
+
+            translated = self.translate(
+                text
+            )
+
+            results[index] = translated
 
         return [
-            result if result is not None else texts[i]
-            for i, result in enumerate(results)
+            results[index]
+            if results[index] is not None
+            else str(texts[index])
+            for index in range(len(texts))
         ]
 
     # ==========================================================
-    # Translate transcript list
+    # LIST TRANSLATION
     # ==========================================================
 
     def __call__(
         self,
         transcripts: List[str],
     ) -> List[str]:
-        """
-        Translate a list of transcript strings.
-
-        The list length and ordering are preserved.
-        """
 
         if not transcripts:
-            return transcripts
+            return []
 
-        if self.translation_model is None:
-            return transcripts
+        if not self.is_available:
+            raise RuntimeError(
+                "Translator is not configured."
+            )
 
-        translated_transcripts: List[str] = []
-
-        # ------------------------------------------------------
-        # Process subtitles in batches.
-        # ------------------------------------------------------
+        translated: List[str] = []
 
         total = len(transcripts)
 
-        for start in range(0, total, self.batch_size):
+        for start in range(
+            0,
+            total,
+            self.batch_size,
+        ):
+
             end = min(
                 start + self.batch_size,
                 total,
             )
 
-            batch = transcripts[start:end]
+            batch = transcripts[
+                start:end
+            ]
 
-            translated_batch = self._translate_batch(
-                batch
+            translated_batch = (
+                self._translate_batch(
+                    batch
+                )
             )
 
-            translated_transcripts.extend(
+            translated.extend(
                 translated_batch
             )
 
-        return translated_transcripts
+            self._progress(
+                "Translating subtitles",
+                int(end * 100 / total),
+            )
+
+        return translated
 
     # ==========================================================
-    # Timed subtitle translation
+    # TIMED SUBTITLES
     # ==========================================================
 
     def translate_pairs(
         self,
         timed_subtitles: List[
-            Tuple[Tuple[float, float], str]
+            Tuple[
+                Tuple[float, float],
+                str,
+            ]
         ],
     ) -> List[
-        Tuple[Tuple[float, float], str]
+        Tuple[
+            Tuple[float, float],
+            str,
+        ]
     ]:
-        """
-        Translate timed subtitles while preserving timestamps.
-
-        Input:
-
-            [
-                ((0.0, 2.0), "Hello"),
-                ((2.0, 4.0), "How are you?"),
-            ]
-
-        Output:
-
-            [
-                ((0.0, 2.0), "Hola"),
-                ((2.0, 4.0), "¿Cómo estás?"),
-            ]
-        """
 
         if not timed_subtitles:
-            return timed_subtitles
-
-        if self.translation_model is None:
-            return timed_subtitles
+            return []
 
         regions = [
             region
@@ -583,60 +561,83 @@ class SubtitlesTranslator:
             for _, text in timed_subtitles
         ]
 
-        translated_texts = self(texts)
+        translated = self(
+            texts
+        )
 
         return [
             (
                 regions[index],
-                translated_texts[index],
+                translated[index],
             )
-            for index in range(len(regions))
+            for index in range(
+                len(regions)
+            )
         ]
 
     # ==========================================================
-    # Cache
+    # CACHE
     # ==========================================================
 
     def clear_cache(self) -> None:
-        """
-        Clear translated text cache.
-        """
-
         self._translation_cache.clear()
 
     def cache_size(self) -> int:
-        """
-        Return number of cached translations.
-        """
-
-        return len(self._translation_cache)
+        return len(
+            self._translation_cache
+        )
 
     # ==========================================================
-    # Status
+    # PROGRESS
     # ==========================================================
 
-    @property
-    def is_available(self) -> bool:
-        """
-        True when a translation model is ready.
-        """
+    def _progress(
+        self,
+        message: str,
+        percentage: int,
+    ) -> None:
 
-        return self.translation_model is not None
+        if not self.progress_callback:
+            return
+
+        try:
+            self.progress_callback(
+                message,
+                percentage,
+            )
+        except Exception:
+            pass
 
     # ==========================================================
-    # Error callback
+    # ERROR
     # ==========================================================
 
-    def _error(self, error: str) -> None:
-        """
-        Send errors/warnings to the configured callback.
-        """
+    def _error(
+        self,
+        error: Any,
+    ) -> None:
 
         if self.error_messages_callback:
+
             try:
-                self.error_messages_callback(error)
+                self.error_messages_callback(
+                    error
+                )
                 return
             except Exception:
                 pass
 
-        print(error)
+        print(
+            f"ERROR: {error}"
+        )
+
+    # ==========================================================
+    # CLEANUP
+    # ==========================================================
+
+    def close(self) -> None:
+
+        try:
+            self._session.close()
+        except Exception:
+            pass
