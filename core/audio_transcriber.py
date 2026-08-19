@@ -1,20 +1,241 @@
 from __future__ import annotations
 
+import audioop
+import math
 import os
-import time
 import wave
+
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    as_completed,
+)
 
 from typing import (
     Any,
     Callable,
     List,
     Optional,
+    Tuple,
 )
 
 import speech_recognition as sr
 
 from core.wav_converter import WavConverter
 
+
+# ==============================================================
+# SPEECH REGION FINDER
+# ==============================================================
+
+class SpeechRegionFinder:
+    """
+    Detect speech regions using RMS energy analysis.
+
+    This is intentionally lightweight. It scans the WAV once
+    and avoids creating an FFmpeg process for every region.
+    """
+
+    def __init__(
+        self,
+        frame_width: int = 4096,
+        min_region_size: float = 0.5,
+        max_region_size: float = 6.0,
+        error_messages_callback=None,
+    ):
+        self.frame_width = frame_width
+        self.min_region_size = min_region_size
+        self.max_region_size = max_region_size
+        self.error_messages_callback = (
+            error_messages_callback
+        )
+
+    @staticmethod
+    def percentile(
+        arr: List[float],
+        percent: float,
+    ) -> float:
+
+        if not arr:
+            return 0.0
+
+        arr = sorted(arr)
+
+        k = (len(arr) - 1) * percent
+
+        f = math.floor(k)
+        c = math.ceil(k)
+
+        if f == c:
+            return arr[int(k)]
+
+        d0 = arr[int(f)] * (c - k)
+        d1 = arr[int(c)] * (k - f)
+
+        return d0 + d1
+
+    def __call__(
+        self,
+        wav_filepath: str,
+    ) -> List[Tuple[float, float]]:
+
+        try:
+
+            with wave.open(
+                wav_filepath,
+                "rb",
+            ) as reader:
+
+                sample_width = reader.getsampwidth()
+                rate = reader.getframerate()
+                total_frames = reader.getnframes()
+
+                if rate <= 0:
+                    return []
+
+                total_duration = (
+                    total_frames / float(rate)
+                )
+
+                chunk_duration = (
+                    float(self.frame_width)
+                    / float(rate)
+                )
+
+                n_chunks = int(
+                    math.ceil(
+                        total_duration
+                        / chunk_duration
+                    )
+                )
+
+                energies = []
+
+                for _ in range(n_chunks):
+
+                    chunk = reader.readframes(
+                        self.frame_width
+                    )
+
+                    if not chunk:
+                        break
+
+                    energy = audioop.rms(
+                        chunk,
+                        sample_width,
+                    )
+
+                    energies.append(energy)
+
+        except KeyboardInterrupt:
+
+            self._error(
+                "Cancelling speech detection"
+            )
+
+            raise
+
+        except Exception as exc:
+
+            self._error(exc)
+
+            return []
+
+        if not energies:
+            return []
+
+        threshold = self.percentile(
+            energies,
+            0.20,
+        )
+
+        elapsed_time = 0.0
+
+        regions = []
+
+        region_start = None
+
+        for energy in energies:
+
+            is_silence = (
+                energy <= threshold
+            )
+
+            max_exceeded = (
+                region_start is not None
+                and (
+                    elapsed_time
+                    - region_start
+                    >= self.max_region_size
+                )
+            )
+
+            if max_exceeded or is_silence:
+
+                if region_start is not None:
+
+                    duration = (
+                        elapsed_time
+                        - region_start
+                    )
+
+                    if duration >= self.min_region_size:
+
+                        regions.append(
+                            (
+                                region_start,
+                                elapsed_time,
+                            )
+                        )
+
+                    region_start = None
+
+            elif region_start is None:
+
+                region_start = elapsed_time
+
+            elapsed_time += chunk_duration
+
+        # Close final region.
+
+        if region_start is not None:
+
+            duration = (
+                elapsed_time
+                - region_start
+            )
+
+            if duration >= self.min_region_size:
+
+                regions.append(
+                    (
+                        region_start,
+                        min(
+                            elapsed_time,
+                            total_duration,
+                        ),
+                    )
+                )
+
+        return regions
+
+    def _error(self, error):
+
+        if self.error_messages_callback:
+
+            try:
+                self.error_messages_callback(
+                    error
+                )
+            except Exception:
+                pass
+
+        else:
+            print(error)
+
+
+# ==============================================================
+# AUDIO TRANSCRIBER
+# ==============================================================
 
 class AudioTranscriber:
 
@@ -26,18 +247,19 @@ class AudioTranscriber:
         compute_type: Optional[str] = None,
         cpu_threads: int = 4,
         task: str = "transcribe",
-        progress_callback: Optional[
-            Callable[..., None]
-        ] = None,
-        error_callback: Optional[
-            Callable[[Any], None]
-        ] = None,
-        error_messages_callback: Optional[
-            Callable[[Any], None]
-        ] = None,
+        progress_callback=None,
+        error_callback=None,
+        error_messages_callback=None,
 
-        # Google chunk size.
-        chunk_seconds: float = 8.0,
+        frame_width: int = 4096,
+        min_region_size: float = 0.5,
+        max_region_size: float = 6.0,
+
+        include_before: float = 0.25,
+        include_after: float = 0.25,
+
+        # Google requests running concurrently.
+        workers: int = 6,
     ):
 
         self.language = (
@@ -52,6 +274,13 @@ class AudioTranscriber:
             else "transcribe"
         )
 
+        if self.task != "transcribe":
+
+            raise ValueError(
+                "AudioTranscriber only supports "
+                "task='transcribe'."
+            )
+
         self.progress_callback = (
             progress_callback
         )
@@ -61,25 +290,21 @@ class AudioTranscriber:
             or error_messages_callback
         )
 
-        self.chunk_seconds = max(
-            3.0,
-            float(chunk_seconds),
+        self.include_before = float(
+            include_before
+        )
+
+        self.include_after = float(
+            include_after
+        )
+
+        self.workers = max(
+            1,
+            int(workers),
         )
 
         # ------------------------------------------------------
-        # Google recognizer
-        # ------------------------------------------------------
-
-        self.recognizer = sr.Recognizer()
-
-        self.recognizer.dynamic_energy_threshold = True
-
-        self.recognizer.pause_threshold = 0.6
-
-        self.recognizer.non_speaking_duration = 0.3
-
-        # ------------------------------------------------------
-        # WAV
+        # WAV converter
         # ------------------------------------------------------
 
         self.wav_converter = WavConverter(
@@ -87,6 +312,19 @@ class AudioTranscriber:
             rate=16000,
             progress_callback=self._core_progress,
             error_messages_callback=self._error,
+        )
+
+        # ------------------------------------------------------
+        # Speech detector
+        # ------------------------------------------------------
+
+        self.region_finder = (
+            SpeechRegionFinder(
+                frame_width=frame_width,
+                min_region_size=min_region_size,
+                max_region_size=max_region_size,
+                error_messages_callback=self._error,
+            )
         )
 
     # ==========================================================
@@ -162,9 +400,9 @@ class AudioTranscriber:
 
         try:
 
-            # --------------------------------------------------
-            # Convert media
-            # --------------------------------------------------
+            # ==================================================
+            # 1. CONVERT MEDIA ONCE
+            # ==================================================
 
             self._progress(
                 "Extracting speech audio",
@@ -178,171 +416,146 @@ class AudioTranscriber:
             )
 
             if not wav_path:
+
                 raise RuntimeError(
                     "Failed to create WAV audio."
                 )
 
-            # --------------------------------------------------
-            # Get WAV information
-            # --------------------------------------------------
+            # ==================================================
+            # 2. DETECT SPEECH
+            # ==================================================
 
-            with wave.open(
-                wav_path,
-                "rb",
-            ) as wav:
-
-                frames = wav.getnframes()
-                rate = wav.getframerate()
-
-            duration = (
-                frames / float(rate)
-                if rate
-                else 0
+            self._progress(
+                "Detecting speech regions",
+                16,
             )
 
-            # --------------------------------------------------
-            # Number of chunks
-            # --------------------------------------------------
-
-            chunk_frames = int(
-                rate
-                * self.chunk_seconds
-            )
-
-            total_chunks = max(
-                1,
-                (
-                    frames
-                    + chunk_frames
-                    - 1
+            regions = (
+                self.region_finder(
+                    wav_path
                 )
-                // chunk_frames,
             )
 
-            results: List[dict] = []
+            if not regions:
 
-            # --------------------------------------------------
-            # Process chunks
-            # --------------------------------------------------
+                raise RuntimeError(
+                    "No speech regions were detected."
+                )
 
-            with wave.open(
-                wav_path,
-                "rb",
-            ) as wav:
+            total_regions = len(
+                regions
+            )
 
-                for index in range(
-                    total_chunks
+            self._progress(
+                (
+                    f"Detected {total_regions} "
+                    "speech regions"
+                ),
+                20,
+            )
+
+            # ==================================================
+            # 3. PARALLEL GOOGLE RECOGNITION
+            # ==================================================
+
+            workers = min(
+                self.workers,
+                total_regions,
+            )
+
+            self._progress(
+                (
+                    f"Recognizing speech using "
+                    f"{workers} workers"
+                ),
+                20,
+            )
+
+            results_by_index = {}
+
+            with ThreadPoolExecutor(
+                max_workers=workers
+            ) as executor:
+
+                futures = {}
+
+                for index, region in enumerate(
+                    regions
                 ):
 
-                    start_frame = (
-                        index
-                        * chunk_frames
+                    future = executor.submit(
+                        self._recognize_region,
+                        index,
+                        region,
+                        wav_path,
                     )
 
-                    wav.setpos(
-                        start_frame
-                    )
+                    futures[future] = index
 
-                    audio_frames = (
-                        wav.readframes(
-                            chunk_frames
-                        )
-                    )
+                completed = 0
 
-                    if not audio_frames:
-                        break
+                for future in as_completed(
+                    futures
+                ):
 
-                    actual_frames = (
-                        len(audio_frames)
-                        // wav.getsampwidth()
-                        // wav.getnchannels()
-                    )
-
-                    start = (
-                        start_frame
-                        / float(rate)
-                    )
-
-                    end = (
-                        start
-                        + actual_frames
-                        / float(rate)
-                    )
-
-                    # --------------------------------------------------
-                    # Create SpeechRecognition AudioData
-                    # --------------------------------------------------
-
-                    audio = sr.AudioData(
-                        audio_frames,
-                        rate,
-                        wav.getsampwidth(),
-                    )
-
-                    text = ""
+                    completed += 1
 
                     try:
 
-                        text = (
-                            self.recognizer
-                            .recognize_google(
-                                audio,
-                                language=self.language,
-                                show_all=False,
-                            )
+                        index, result = (
+                            future.result()
                         )
 
-                    except sr.UnknownValueError:
+                        if result is not None:
 
-                        # No understandable speech.
-                        text = ""
+                            results_by_index[
+                                index
+                            ] = result
 
-                    except sr.RequestError as exc:
+                    except Exception as exc:
 
-                        raise RuntimeError(
-                            "Google speech recognition "
-                            f"request failed: {exc}"
-                        ) from exc
-
-                    if text:
-
-                        text = text.strip()
-
-                        if text:
-
-                            results.append(
-                                {
-                                    "region": (
-                                        start,
-                                        end,
-                                    ),
-                                    "text": text,
-                                }
-                            )
-
-                    # --------------------------------------------------
-                    # Progress
-                    # --------------------------------------------------
+                        self._error(
+                            exc
+                        )
 
                     percentage = int(
                         (
-                            (index + 1)
-                            / total_chunks
+                            completed
+                            / total_regions
                         )
                         * 100
                     )
 
                     mapped = (
-                        15
+                        20
                         + int(
                             percentage
-                            * 0.45
+                            * 0.40
                         )
                     )
 
                     self._progress(
                         "Recognizing speech with Google",
                         mapped,
+                    )
+
+            # ==================================================
+            # 4. RESTORE ORIGINAL ORDER
+            # ==================================================
+
+            results = []
+
+            for index in sorted(
+                results_by_index
+            ):
+
+                result = (
+                    results_by_index[index]
+                )
+
+                if result:
+                    results.append(
+                        result
                     )
 
             self._progress(
@@ -380,6 +593,129 @@ class AudioTranscriber:
                     pass
 
     # ==========================================================
+    # RECOGNIZE ONE REGION
+    # ==========================================================
+
+    def _recognize_region(
+        self,
+        index: int,
+        region: Tuple[float, float],
+        wav_path: str,
+    ) -> Tuple[int, Optional[dict]]:
+
+        start, end = region
+
+        # ------------------------------------------------------
+        # Read only the required WAV section.
+        #
+        # IMPORTANT:
+        # No FFmpeg process is created here.
+        # ------------------------------------------------------
+
+        with wave.open(
+            wav_path,
+            "rb",
+        ) as wav:
+
+            rate = wav.getframerate()
+            sample_width = wav.getsampwidth()
+
+            start_time = max(
+                0.0,
+                float(start)
+                - self.include_before,
+            )
+
+            end_time = (
+                float(end)
+                + self.include_after
+            )
+
+            start_frame = int(
+                start_time * rate
+            )
+
+            end_frame = int(
+                end_time * rate
+            )
+
+            frame_count = max(
+                1,
+                end_frame - start_frame,
+            )
+
+            wav.setpos(
+                min(
+                    start_frame,
+                    wav.getnframes(),
+                )
+            )
+
+            audio_frames = (
+                wav.readframes(
+                    frame_count
+                )
+            )
+
+        if not audio_frames:
+            return index, None
+
+        # ------------------------------------------------------
+        # SpeechRecognition AudioData
+        #
+        # WAV is already:
+        #   mono
+        #   16 kHz
+        #
+        # so we can send the raw PCM directly.
+        # ------------------------------------------------------
+
+        audio = sr.AudioData(
+            audio_frames,
+            rate,
+            sample_width,
+        )
+
+        recognizer = sr.Recognizer()
+
+        try:
+
+            text = recognizer.recognize_google(
+                audio,
+                language=self.language,
+                show_all=False,
+            )
+
+        except sr.UnknownValueError:
+
+            return index, None
+
+        except sr.RequestError as exc:
+
+            raise RuntimeError(
+                "Google speech recognition "
+                f"request failed: {exc}"
+            ) from exc
+
+        if not text:
+            return index, None
+
+        text = str(
+            text
+        ).strip()
+
+        if not text:
+            return index, None
+
+        return index, {
+            "region": (
+                start,
+                end,
+            ),
+            "text": text,
+        }
+
+    # ==========================================================
     # ALIAS
     # ==========================================================
 
@@ -405,18 +741,20 @@ class AudioTranscriber:
         if not self.progress_callback:
             return
 
+        percentage = max(
+            0,
+            min(
+                100,
+                int(percentage),
+            ),
+        )
+
         try:
 
             self.progress_callback(
                 info,
                 "",
-                max(
-                    0,
-                    min(
-                        100,
-                        int(percentage),
-                    ),
-                ),
+                percentage,
             )
 
         except TypeError:
@@ -478,453 +816,3 @@ class AudioTranscriber:
 
         else:
             print(error)
-
-# from __future__ import annotations
-
-# import io
-# import torch
-
-# from typing import (
-#     Any,
-#     BinaryIO,
-#     Callable,
-#     List,
-#     Optional,
-#     Union,
-# )
-
-# from faster_whisper import WhisperModel
-
-
-# class AudioTranscriber:
-#     """
-#     Local speech transcription using faster-whisper.
-
-#     Supports two modes:
-
-#         task="transcribe"
-#             Speech -> original language text
-
-#         task="translate"
-#             Speech -> English text
-
-#     The service decides which mode should be used.
-
-#     Examples:
-
-#         Spanish -> English
-#             task="translate"
-
-#         French -> English
-#             task="translate"
-
-#         Spanish -> French
-#             task="transcribe"
-
-#         English -> Swahili
-#             task="transcribe"
-#     """
-
-#     def __init__(
-#         self,
-#         language: str = "en",
-#         model_size: str = "tiny",
-#         device: Optional[str] = None,
-#         compute_type: Optional[str] = None,
-#         cpu_threads: int = 4,
-#         task: str = "transcribe",
-#         progress_callback: Optional[
-#             Callable[..., None]
-#         ] = None,
-#         error_callback: Optional[
-#             Callable[[Any], None]
-#         ] = None,
-#         error_messages_callback: Optional[
-#             Callable[[Any], None]
-#         ] = None,
-#     ):
-#         self.language = self._normalize_language(language)
-
-#         self.task = (
-#             task.strip().lower()
-#             if task
-#             else "transcribe"
-#         )
-
-#         if self.task not in {
-#             "transcribe",
-#             "translate",
-#         }:
-#             self.task = "transcribe"
-
-#         # Support both callback naming conventions.
-#         self.progress_callback = progress_callback
-
-#         self.error_callback = (
-#             error_callback
-#             or error_messages_callback
-#         )
-
-#         # ------------------------------------------------------
-#         # Device
-#         # ------------------------------------------------------
-
-#         if device is None:
-#             device = (
-#                 "cuda"
-#                 if torch.cuda.is_available()
-#                 else "cpu"
-#             )
-
-#         self.device = device
-
-#         # ------------------------------------------------------
-#         # Compute type
-#         # ------------------------------------------------------
-
-#         if compute_type is None:
-#             if device == "cuda":
-#                 compute_type = "float16"
-#             else:
-#                 compute_type = "int8"
-
-#         self.compute_type = compute_type
-
-#         # ------------------------------------------------------
-#         # Load model
-#         # ------------------------------------------------------
-
-#         try:
-#             self.model = WhisperModel(
-#                 model_size_or_path=model_size,
-#                 device=device,
-#                 compute_type=compute_type,
-#                 cpu_threads=cpu_threads,
-#             )
-
-#         except Exception as exc:
-#             self._error(
-#                 "Failed to initialize WhisperModel: "
-#                 f"{exc}"
-#             )
-
-#             self.model = None
-
-#     # ==========================================================
-#     # Language
-#     # ==========================================================
-
-#     @staticmethod
-#     def _normalize_language(
-#         language: Optional[str],
-#     ) -> str:
-#         if not language:
-#             return ""
-
-#         return (
-#             str(language)
-#             .strip()
-#             .lower()
-#             .replace("_", "-")
-#             .split("-")[0]
-#         )
-
-#     # ==========================================================
-#     # Transcription
-#     # ==========================================================
-
-#     def __call__(
-#         self,
-#         audio_input: Union[
-#             str,
-#             bytes,
-#             BinaryIO,
-#         ],
-#     ) -> List[dict]:
-#         """
-#         Transcribe or translate audio.
-
-#         Returns:
-
-#             [
-#                 {
-#                     "region": (start, end),
-#                     "text": "..."
-#                 }
-#             ]
-#         """
-
-#         if not audio_input:
-#             return []
-
-#         if self.model is None:
-#             return []
-
-#         try:
-#             # --------------------------------------------------
-#             # Progress
-#             # --------------------------------------------------
-
-#             if self.task == "translate":
-#                 self._progress(
-#                     "Starting speech translation",
-#                     10,
-#                 )
-#             else:
-#                 self._progress(
-#                     "Starting transcription",
-#                     10,
-#                 )
-
-#             # --------------------------------------------------
-#             # Convert bytes to file-like object.
-#             # --------------------------------------------------
-
-#             if isinstance(audio_input, bytes):
-#                 audio_input = io.BytesIO(
-#                     audio_input
-#                 )
-
-#             # --------------------------------------------------
-#             # Faster-whisper
-#             # --------------------------------------------------
-
-#             segments, info = self.model.transcribe(
-#                 audio_input,
-
-#                 # ------------------------------------------------------
-#                 # Language
-#                 # ------------------------------------------------------
-#                 language=self.language or None,
-
-#                 # transcribe = original language
-#                 # translate  = English
-#                 task=self.task,
-
-#                 # ------------------------------------------------------
-#                 # CPU SPEED
-#                 # ------------------------------------------------------
-#                 beam_size=3,
-
-#                 # Prevent previous bad text from propagating.
-#                 # This is especially important for your repeated
-#                 # "y aquí está un barco" problem.
-#                 condition_on_previous_text=False,
-
-#                 # ------------------------------------------------------
-#                 # VAD
-#                 # ------------------------------------------------------
-#                 vad_filter=True,
-#                 vad_parameters={
-#                     "threshold": 0.5,
-#                     "min_speech_duration_ms": 250,
-#                     "min_silence_duration_ms": 500,
-#                     "speech_pad_ms": 200,
-#                 },
-
-#                 # ------------------------------------------------------
-#                 # Decoding
-#                 # ------------------------------------------------------
-#                 temperature=0,
-
-#                 # ------------------------------------------------------
-#                 # Hallucination protection
-#                 # ------------------------------------------------------
-#                 compression_ratio_threshold=2.4,
-#                 log_prob_threshold=-1.0,
-#                 no_speech_threshold=0.6,
-
-#                 # ------------------------------------------------------
-#                 # Repetition protection
-#                 # ------------------------------------------------------
-#                 repetition_penalty=1.02,
-#                 no_repeat_ngram_size=3,
-
-#                 # Keep decoding from becoming excessively long.
-#                 max_new_tokens=96,
-#             )
-#             raw_segments: List[dict] = []
-
-#             total_duration = getattr(
-#                 info,
-#                 "duration",
-#                 None,
-#             )
-
-#             # --------------------------------------------------
-#             # Read segments.
-#             #
-#             # faster-whisper is lazy, so actual processing
-#             # happens while iterating over segments.
-#             # --------------------------------------------------
-
-#             for seg in segments:
-
-#                 text = (
-#                     seg.text.strip()
-#                     if seg.text
-#                     else ""
-#                 )
-
-#                 if not text:
-#                     continue
-
-#                 raw_segments.append(
-#                     {
-#                         "region": (
-#                             float(seg.start),
-#                             float(seg.end),
-#                         ),
-#                         "text": text,
-#                     }
-#                 )
-
-#                 # ------------------------------------------------
-#                 # Progress
-#                 # ------------------------------------------------
-
-#                 if (
-#                     total_duration
-#                     and total_duration > 0
-#                 ):
-#                     percentage = int(
-#                         (
-#                             seg.end
-#                             / total_duration
-#                         )
-#                         * 100
-#                     )
-
-#                     percentage = max(
-#                         0,
-#                         min(
-#                             100,
-#                             percentage,
-#                         ),
-#                     )
-
-#                     # Transcription/translation occupies
-#                     # 10 -> 60.
-#                     mapped_percentage = (
-#                         10
-#                         + int(
-#                             percentage
-#                             * 0.50
-#                         )
-#                     )
-
-#                     if self.task == "translate":
-#                         message = (
-#                             "Translating speech"
-#                         )
-#                     else:
-#                         message = (
-#                             "Transcribing audio"
-#                         )
-
-#                     self._progress(
-#                         message,
-#                         mapped_percentage,
-#                     )
-
-#             # --------------------------------------------------
-#             # Complete
-#             # --------------------------------------------------
-
-#             if self.task == "translate":
-#                 self._progress(
-#                     "Speech translation complete",
-#                     60,
-#                 )
-#             else:
-#                 self._progress(
-#                     "Transcribing complete",
-#                     60,
-#                 )
-
-#             return raw_segments
-
-#         except Exception as exc:
-
-#             self._error(
-#                 f"Transcription Error: {exc}"
-#             )
-
-#             return []
-
-#     # ==========================================================
-#     # Alias
-#     # ==========================================================
-
-#     def transcribe(
-#         self,
-#         audio_input,
-#     ):
-#         """Compatibility alias for __call__."""
-#         return self(audio_input)
-
-#     # ==========================================================
-#     # Progress
-#     # ==========================================================
-
-#     def _progress(
-#         self,
-#         info: str,
-#         percentage: int,
-#     ) -> None:
-
-#         if not self.progress_callback:
-#             return
-
-#         percentage = max(
-#             0,
-#             min(
-#                 100,
-#                 int(percentage),
-#             ),
-#         )
-
-#         try:
-#             self.progress_callback(
-#                 info,
-#                 "",
-#                 percentage,
-#             )
-
-#         except TypeError:
-
-#             try:
-#                 self.progress_callback(
-#                     info,
-#                     "",
-#                     percentage,
-#                     None,
-#                 )
-
-#             except Exception:
-#                 pass
-
-#         except Exception:
-#             pass
-
-#     # ==========================================================
-#     # Error
-#     # ==========================================================
-
-#     def _error(
-#         self,
-#         error: Any,
-#     ) -> None:
-
-#         if self.error_callback:
-
-#             try:
-#                 self.error_callback(
-#                     error
-#                 )
-
-#             except Exception:
-#                 pass
-
-#         else:
-#             print(error)

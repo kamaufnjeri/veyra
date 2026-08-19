@@ -16,40 +16,160 @@ from core.subtitle_formatter import SubtitleFormatter
 from core.language import Language, is_same_language
 from core.subtitle_writer import SubtitleWriter
 from core.subtitle_translator import SubtitlesTranslator
+from core.media_subtitle import (
+    EmbeddedSubtitle,
+    MediaSubtitleExtractor,
+    MediaSubtitleInspector,
+)
 
 
 class SubtitleService:
     """
     Subtitle creation pipeline.
 
-    Pipeline:
+    SOURCE PRIORITY
+    ---------------
 
-        1. Check source SRT.
-        2. If source SRT exists, ask whether to overwrite.
-        3. If source SRT is missing or overwrite was accepted:
-               Faster-Whisper transcribes the media.
-        4. Write source-language SRT.
-        5. Ask whether translation should happen.
-        6. If target SRT exists, ask whether to overwrite.
-        7. If translation is required:
-               NLLB Translate performs the translation.
-        8. Write target-language SRT.
+        1. Matching embedded text subtitle
+        2. Single / selected unknown-language embedded text subtitle
+        3. Existing external source subtitle
+        4. Whisper transcription
 
-    IMPORTANT:
+    TARGET PRIORITY
+    ---------------
 
-        Faster-Whisper is ALWAYS used with task="transcribe".
+        1. Matching embedded target text subtitle
+        2. Existing external target subtitle
+        3. NLLB translation
 
-        NLLB is used for ALL translations, including:
+    IMPORTANT
+    ---------
 
-            es -> en
-            fr -> en
-            de -> en
-            en -> es
-            en -> fr
-            etc.
+    Embedded text subtitles ALWAYS have priority over external
+    subtitle files.
 
-        Whisper's built-in translation task is deliberately NOT used.
+    An embedded text subtitle with missing/unknown language
+    metadata is still usable.
+
+    If there is exactly one embedded text subtitle and its
+    language is unknown, it is treated as the source subtitle.
+
+    Whisper is ONLY used when there is no usable embedded text
+    subtitle and no usable external source subtitle.
+
+    NLLB translation is AUTOMATIC when:
+
+        source subtitle exists
+        AND target language is configured
+        AND no usable target subtitle exists.
+
+    translate_callback is OPTIONAL. It is only used as a
+    confirmation/UI hook when supplied. Its absence does NOT
+    disable translation.
     """
+
+    LANGUAGE_ALIASES = {
+        "eng": "en",
+        "english": "en",
+
+        "spa": "es",
+        "esp": "es",
+        "spanish": "es",
+
+        "fra": "fr",
+        "fre": "fr",
+        "french": "fr",
+
+        "deu": "de",
+        "ger": "de",
+        "german": "de",
+
+        "ita": "it",
+        "italian": "it",
+
+        "por": "pt",
+        "ptg": "pt",
+        "portuguese": "pt",
+
+        "jpn": "ja",
+        "japanese": "ja",
+
+        "kor": "ko",
+        "korean": "ko",
+
+        "zho": "zh",
+        "chi": "zh",
+        "chinese": "zh",
+
+        "rus": "ru",
+        "russian": "ru",
+
+        "ara": "ar",
+        "arabic": "ar",
+
+        "hin": "hi",
+        "hindi": "hi",
+
+        "nld": "nl",
+        "dut": "nl",
+        "dutch": "nl",
+
+        "pol": "pl",
+        "polish": "pl",
+
+        "tur": "tr",
+        "turkish": "tr",
+
+        "swe": "sv",
+        "swedish": "sv",
+
+        "dan": "da",
+        "danish": "da",
+
+        "nor": "no",
+        "norwegian": "no",
+
+        "fin": "fi",
+        "finnish": "fi",
+
+        "ces": "cs",
+        "cze": "cs",
+        "czech": "cs",
+
+        "hun": "hu",
+        "hungarian": "hu",
+
+        "ron": "ro",
+        "rum": "ro",
+        "romanian": "ro",
+
+        "ukr": "uk",
+        "ukrainian": "uk",
+
+        "vie": "vi",
+        "vietnamese": "vi",
+
+        "tha": "th",
+        "thai": "th",
+
+        "heb": "he",
+        "hebrew": "he",
+
+        "ind": "id",
+        "indonesian": "id",
+
+        "msa": "ms",
+        "may": "ms",
+        "malay": "ms",
+
+        "fil": "tl",
+        "tgl": "tl",
+        "tagalog": "tl",
+    }
+
+    # ==========================================================
+    # INIT
+    # ==========================================================
 
     def __init__(
         self,
@@ -58,13 +178,19 @@ class SubtitleService:
         subtitle_format: str = "srt",
         progress_callback: Optional[Callable[..., None]] = None,
         error_callback: Optional[Callable[[Any], None]] = None,
-        overwrite_callback: Optional[Callable[[str], bool]] = None,
+        overwrite_callback: Optional[Callable[..., bool]] = None,
         translate_callback: Optional[Callable[..., bool]] = None,
         language_registry: Optional[Language] = None,
+        overwrite_existing: bool = False,
     ):
-        # ------------------------------------------------------
-        # Language registry
-        # ------------------------------------------------------
+
+        self.media_subtitle_inspector = MediaSubtitleInspector(
+            error_callback=self._error,
+        )
+
+        self.media_subtitle_extractor = MediaSubtitleExtractor(
+            error_callback=self._error,
+        )
 
         self.lang_registry = (
             language_registry or Language()
@@ -74,9 +200,10 @@ class SubtitleService:
             source_language
         )
 
-        self.target_language = None
+        self.target_language: Optional[str] = None
 
         if target_language:
+
             resolved_target = self._resolve_language(
                 target_language
             )
@@ -87,10 +214,6 @@ class SubtitleService:
                 self._error,
             ):
                 self.target_language = resolved_target
-
-        # ------------------------------------------------------
-        # Settings
-        # ------------------------------------------------------
 
         self.subtitle_format = (
             str(subtitle_format)
@@ -103,12 +226,7 @@ class SubtitleService:
         self.error_callback = error_callback
         self.overwrite_callback = overwrite_callback
         self.translate_callback = translate_callback
-
-        # ------------------------------------------------------
-        # Translation engine
-        #
-        # ALWAYS NLLB.
-        # ------------------------------------------------------
+        self.overwrite_existing = overwrite_existing
 
         self.translation_engine = (
             "NLLB"
@@ -116,47 +234,63 @@ class SubtitleService:
             else None
         )
 
-        # ------------------------------------------------------
-        # Whisper
-        #
-        # NEVER use Whisper's translate task.
-        # ------------------------------------------------------
-
         self.whisper_task = "transcribe"
-
-        # ------------------------------------------------------
-        # Formatter
-        # ------------------------------------------------------
 
         self.formatter = SubtitleFormatter(
             format_type=self.subtitle_format,
             error_messages_callback=self._error,
         )
 
-        # ------------------------------------------------------
-        # Transcriber
-        # ------------------------------------------------------
-
         self.transcriber = AudioTranscriber(
             language=self.source_language,
             task="transcribe",
             progress_callback=self._core_progress,
             error_callback=self._error,
+            frame_width=4096,
+            min_region_size=0.5,
+            max_region_size=6.0,
+            include_before=0.25,
+            include_after=0.25,
         )
 
     # ==========================================================
     # LANGUAGE
     # ==========================================================
-    def _translator_progress(
-        self,
-        info: str,
-        percentage: int,
-    ) -> None:
 
-        self._progress(
-            info,
+    @classmethod
+    def _normalize_language(
+        cls,
+        language: Optional[str],
+    ) -> str:
+
+        if not language:
+            return ""
+
+        value = (
+            str(language)
+            .strip()
+            .lower()
+            .replace("_", "-")
+        )
+
+        if value in {
             "",
-            percentage,
+            "unknown",
+            "und",
+            "undefined",
+            "none",
+            "null",
+        }:
+            return ""
+
+        primary = value.split("-", 1)[0]
+
+        return cls.LANGUAGE_ALIASES.get(
+            value,
+            cls.LANGUAGE_ALIASES.get(
+                primary,
+                primary,
+            ),
         )
 
     def _resolve_language(
@@ -164,29 +298,34 @@ class SubtitleService:
         language: str,
     ) -> str:
 
-        if self.lang_registry.exists(language):
-            return self.lang_registry.get(language).code
-
-        if self.lang_registry.name_exists(language):
-            return self.lang_registry.get_by_name(language).code
-
-        return self._normalize_language(language)
-
-    @staticmethod
-    def _normalize_language(
-        language: Optional[str],
-    ) -> str:
-
         if not language:
             return ""
 
-        return (
-            str(language)
-            .strip()
-            .lower()
-            .replace("_", "-")
-            .split("-")[0]
-        )
+        try:
+            if self.lang_registry.exists(language):
+
+                code = self.lang_registry.get(
+                    language
+                ).code
+
+                return self._normalize_language(code)
+
+        except Exception:
+            pass
+
+        try:
+            if self.lang_registry.name_exists(language):
+
+                code = self.lang_registry.get_by_name(
+                    language
+                ).code
+
+                return self._normalize_language(code)
+
+        except Exception:
+            pass
+
+        return self._normalize_language(language)
 
     # ==========================================================
     # PUBLIC API
@@ -211,6 +350,175 @@ class SubtitleService:
         )
 
     # ==========================================================
+    # EMBEDDED INSPECTION
+    # ==========================================================
+
+    def inspect_embedded_subtitles(
+        self,
+        media_filepath: str,
+    ) -> List[EmbeddedSubtitle]:
+
+        return self.media_subtitle_inspector.inspect(
+            media_filepath
+        )
+
+    def _subtitle_language(
+        self,
+        subtitle: EmbeddedSubtitle,
+    ) -> str:
+
+        return self._normalize_language(
+            subtitle.language
+        )
+
+    # ==========================================================
+    # FIND EMBEDDED SUBTITLE
+    # ==========================================================
+
+    def _find_embedded_subtitle(
+        self,
+        subtitles: List[EmbeddedSubtitle],
+        language: str,
+    ) -> Optional[EmbeddedSubtitle]:
+
+        requested = self._normalize_language(
+            language
+        )
+
+        if not requested:
+            return None
+
+        exact_text_matches: List[
+            EmbeddedSubtitle
+        ] = []
+
+        exact_image_matches: List[
+            EmbeddedSubtitle
+        ] = []
+
+        unknown_text_matches: List[
+            EmbeddedSubtitle
+        ] = []
+
+        for subtitle in subtitles:
+
+            actual = self._subtitle_language(
+                subtitle
+            )
+
+            # Unknown language.
+            if not actual:
+
+                if subtitle.extractable:
+                    unknown_text_matches.append(
+                        subtitle
+                    )
+
+                continue
+
+            # Requested language does not match.
+            if actual != requested:
+                continue
+
+            if subtitle.extractable:
+
+                exact_text_matches.append(
+                    subtitle
+                )
+
+            else:
+
+                exact_image_matches.append(
+                    subtitle
+                )
+
+        # Matching text wins.
+        if exact_text_matches:
+
+            return self._choose_embedded_candidate(
+                exact_text_matches
+            )
+
+        # Unknown text is usable.
+        if unknown_text_matches:
+
+            return self._choose_embedded_candidate(
+                unknown_text_matches
+            )
+
+        # Image subtitle is returned for reporting.
+        if exact_image_matches:
+
+            return self._choose_embedded_candidate(
+                exact_image_matches
+            )
+
+        return None
+
+    @staticmethod
+    def _choose_embedded_candidate(
+        subtitles: List[EmbeddedSubtitle],
+    ) -> Optional[EmbeddedSubtitle]:
+
+        if not subtitles:
+            return None
+
+        text = [
+            item
+            for item in subtitles
+            if item.extractable
+        ]
+
+        candidates = text or list(subtitles)
+
+        non_forced = [
+            item
+            for item in candidates
+            if not item.forced
+        ]
+
+        if non_forced:
+            candidates = non_forced
+
+        defaults = [
+            item
+            for item in candidates
+            if item.default
+        ]
+
+        if defaults:
+            return defaults[0]
+
+        return candidates[0]
+
+    # ==========================================================
+    # EMBEDDED EXTRACTION
+    # ==========================================================
+
+    def _extract_embedded_subtitle(
+        self,
+        media_filepath: str,
+        stream: EmbeddedSubtitle,
+        output_filepath: str,
+    ) -> str:
+
+        self._progress(
+            (
+                "Extracting embedded "
+                f"{self._subtitle_language(stream) or 'unknown'} "
+                "subtitle"
+            ),
+            os.path.basename(media_filepath),
+            8,
+        )
+
+        return self.media_subtitle_extractor.extract(
+            media_filepath=media_filepath,
+            stream=stream,
+            output_filepath=output_filepath,
+        )
+
+    # ==========================================================
     # MAIN PIPELINE
     # ==========================================================
 
@@ -224,6 +532,7 @@ class SubtitleService:
         )
 
         if not os.path.isfile(media_filepath):
+
             error = FileNotFoundError(
                 f"Media file does not exist: "
                 f"{media_filepath}"
@@ -240,15 +549,20 @@ class SubtitleService:
             media_filepath
         )[0]
 
+        # ======================================================
+        # OUTPUT PATHS
+        # ======================================================
+
         source_subtitle = (
             f"{base_name}."
             f"{self.source_language}."
             f"{self.subtitle_format}"
         )
 
-        translated_subtitle = None
+        translated_subtitle: Optional[str] = None
 
         if self.target_language:
+
             translated_subtitle = (
                 f"{base_name}."
                 f"{self.target_language}."
@@ -256,81 +570,407 @@ class SubtitleService:
             )
 
         # ======================================================
-        # STEP 1
-        #
-        # Decide what to do with SOURCE SRT.
+        # INSPECT
+        # ======================================================
+
+        self._progress(
+            "Inspecting embedded subtitles",
+            filename,
+            3,
+        )
+
+        embedded_subtitles = (
+            self.inspect_embedded_subtitles(
+                media_filepath
+            )
+        )
+
+        # ======================================================
+        # REPORT STREAMS
+        # ======================================================
+
+        if embedded_subtitles:
+
+            self._progress(
+                (
+                    f"Found {len(embedded_subtitles)} "
+                    "embedded subtitle stream(s)"
+                ),
+                filename,
+                5,
+            )
+
+            for subtitle in embedded_subtitles:
+
+                raw_language = (
+                    subtitle.language
+                    or "unknown"
+                )
+
+                normalized_language = (
+                    self._subtitle_language(
+                        subtitle
+                    )
+                    or "unknown"
+                )
+
+                codec = (
+                    subtitle.codec
+                    or "unknown"
+                )
+
+                kind = (
+                    "text"
+                    if subtitle.extractable
+                    else "image"
+                )
+
+                self._progress(
+                    (
+                        "Embedded subtitle: "
+                        f"{raw_language} -> "
+                        f"{normalized_language} / "
+                        f"{codec} / "
+                        f"{kind}"
+                    ),
+                    filename,
+                    6,
+                )
+
+        else:
+
+            self._progress(
+                "No embedded subtitles found",
+                filename,
+                6,
+            )
+
+        # ======================================================
+        # FIND SOURCE
+        # ======================================================
+
+        embedded_source = (
+            self._find_embedded_subtitle(
+                embedded_subtitles,
+                self.source_language,
+            )
+        )
+
+        if embedded_source:
+
+            self._progress(
+                (
+                    "Selected embedded source subtitle: "
+                    f"{embedded_source.language or 'unknown'} "
+                    f"-> "
+                    f"{self._subtitle_language(embedded_source) or 'unknown'} "
+                    f"({embedded_source.codec or 'unknown'}) / "
+                    f"{'text' if embedded_source.extractable else 'image'}"
+                ),
+                filename,
+                7,
+            )
+
+        else:
+
+            self._progress(
+                (
+                    "No embedded source subtitle matched "
+                    f"language '{self.source_language}'"
+                ),
+                filename,
+                7,
+            )
+
+        # ======================================================
+        # FIND TARGET
+        # ======================================================
+
+        embedded_target: Optional[
+            EmbeddedSubtitle
+        ] = None
+
+        if self.target_language:
+
+            embedded_target = (
+                self._find_embedded_subtitle(
+                    embedded_subtitles,
+                    self.target_language,
+                )
+            )
+
+            if embedded_target:
+
+                self._progress(
+                    (
+                        "Selected embedded target subtitle: "
+                        f"{embedded_target.language or 'unknown'} "
+                        f"-> "
+                        f"{self._subtitle_language(embedded_target) or 'unknown'} "
+                        f"({embedded_target.codec or 'unknown'}) / "
+                        f"{'text' if embedded_target.extractable else 'image'}"
+                    ),
+                    filename,
+                    7,
+                )
+
+        # ======================================================
+        # SOURCE DECISION
         # ======================================================
 
         source_exists = os.path.isfile(
             source_subtitle
         )
 
+        source_available = False
         transcribe_required = False
-        write_source = False
 
-        if source_exists:
+        # ------------------------------------------------------
+        # 1. EMBEDDED SOURCE TEXT
+        # ------------------------------------------------------
+
+        if (
+            embedded_source
+            and embedded_source.extractable
+        ):
 
             self._progress(
-                "Source subtitle already exists",
+                (
+                    "Embedded source text subtitle found; "
+                    "extracting it instead of using Whisper"
+                ),
                 filename,
-                2,
+                10,
             )
 
-            overwrite_source = (
-                self._should_overwrite(
-                    source_subtitle,
-                    'source'
+            self._extract_embedded_subtitle(
+                media_filepath=media_filepath,
+                stream=embedded_source,
+                output_filepath=source_subtitle,
+            )
+
+            source_available = os.path.isfile(
+                source_subtitle
+            )
+
+            if not source_available:
+
+                raise RuntimeError(
+                    "Embedded subtitle extraction completed "
+                    "but source subtitle file was not created."
                 )
+
+            self._progress(
+                (
+                    "Embedded source subtitle extracted: "
+                    f"{source_subtitle}"
+                ),
+                filename,
+                15,
             )
 
-            if overwrite_source:
+        # ------------------------------------------------------
+        # 2. EXISTING EXTERNAL SOURCE
+        # ------------------------------------------------------
 
-                transcribe_required = True
-                write_source = True
+        elif source_exists and not self.overwrite_existing:
+
+            self._progress(
+                (
+                    "No usable embedded source text subtitle; "
+                    "using existing external source subtitle"
+                ),
+                filename,
+                15,
+            )
+
+            source_available = True
+
+        # ------------------------------------------------------
+        # 3. EMBEDDED IMAGE SOURCE
+        # ------------------------------------------------------
+
+        elif (
+            embedded_source
+            and not embedded_source.extractable
+        ):
+
+            self._progress(
+                (
+                    "Embedded source subtitle is image-based "
+                    "and cannot be directly extracted as text"
+                ),
+                filename,
+                15,
+            )
+
+            if source_exists and not self.overwrite_existing:
+
+                source_available = True
 
             else:
 
-                # IMPORTANT:
-                #
-                # We keep the existing source SRT.
-                #
-                # We DO NOT transcribe again.
-                #
-                # Translation can still happen later.
-                #
-                transcribe_required = False
-                write_source = False
+                transcribe_required = True
+
+        # ------------------------------------------------------
+        # 4. OVERWRITE
+        # ------------------------------------------------------
+
+        elif source_exists and self.overwrite_existing:
+
+            self._progress(
+                (
+                    "Overwrite enabled; Whisper will regenerate "
+                    "the source subtitle"
+                ),
+                filename,
+                15,
+            )
+
+            transcribe_required = True
+
+        # ------------------------------------------------------
+        # 5. NOTHING
+        # ------------------------------------------------------
 
         else:
 
+            self._progress(
+                (
+                    "No usable embedded or external source "
+                    "subtitle found; Whisper will transcribe "
+                    "the audio"
+                ),
+                filename,
+                15,
+            )
+
             transcribe_required = True
-            write_source = True
 
         # ======================================================
-        # STEP 2
-        #
-        # Ask whether translation should happen.
+        # TARGET DECISION
         # ======================================================
+
+        target_exists = bool(
+            translated_subtitle
+            and os.path.isfile(
+                translated_subtitle
+            )
+        )
 
         translate_required = False
 
         if self.target_language:
 
-            translate_required = (
-                self._should_translate(
-                    filename=filename,
-                    source_subtitle=source_subtitle,
-                    translated_subtitle=translated_subtitle,
+            # --------------------------------------------------
+            # EMBEDDED TARGET
+            # --------------------------------------------------
+
+            if (
+                embedded_target
+                and embedded_target.extractable
+            ):
+
+                self._progress(
+                    (
+                        "Embedded target text subtitle found; "
+                        "using it instead of NLLB"
+                    ),
+                    filename,
+                    18,
                 )
-            )
+
+                self._extract_embedded_subtitle(
+                    media_filepath=media_filepath,
+                    stream=embedded_target,
+                    output_filepath=translated_subtitle,
+                )
+
+                target_exists = os.path.isfile(
+                    translated_subtitle
+                )
+
+                if not target_exists:
+
+                    raise RuntimeError(
+                        "Embedded target subtitle extraction "
+                        "completed but target subtitle file "
+                        "was not created."
+                    )
+
+            # --------------------------------------------------
+            # EXISTING TARGET
+            # --------------------------------------------------
+
+            elif (
+                target_exists
+                and not self.overwrite_existing
+            ):
+
+                self._progress(
+                    (
+                        "Existing target subtitle found; "
+                        "translation skipped"
+                    ),
+                    filename,
+                    20,
+                )
+
+            # --------------------------------------------------
+            # IMAGE TARGET
+            # --------------------------------------------------
+
+            elif (
+                embedded_target
+                and not embedded_target.extractable
+            ):
+
+                self._progress(
+                    (
+                        "Embedded target subtitle is image-based; "
+                        "it cannot be directly extracted as text"
+                    ),
+                    filename,
+                    20,
+                )
+
+                if (
+                    target_exists
+                    and not self.overwrite_existing
+                ):
+
+                    self._progress(
+                        "Using existing external target subtitle",
+                        filename,
+                        21,
+                    )
+
+                else:
+
+                    translate_required = (
+                        self._should_translate(
+                            filename=filename,
+                            source_subtitle=source_subtitle,
+                            translated_subtitle=translated_subtitle,
+                        )
+                    )
+
+            # --------------------------------------------------
+            # NO EMBEDDED TARGET
+            # --------------------------------------------------
+
+            else:
+
+                translate_required = (
+                    self._should_translate(
+                        filename=filename,
+                        source_subtitle=source_subtitle,
+                        translated_subtitle=translated_subtitle,
+                    )
+                )
 
         # ======================================================
-        # STEP 3
-        #
-        # Target already exists and user says NO.
-        #
-        # If there is also no transcription required,
-        # we can finish immediately.
+        # NOTHING TO DO
         # ======================================================
 
         if (
@@ -339,28 +979,18 @@ class SubtitleService:
         ):
 
             self._progress(
-                "Existing subtitles kept",
+                "Subtitles complete",
                 filename,
                 100,
             )
 
-            return {
-                "media": media_filepath,
-                "source_subtitle": source_subtitle,
-                "translated_subtitle": translated_subtitle,
-                "regions": 0,
-                "recognized_segments": 0,
-                "transcription_task": "transcribe",
-                "translation_engine": (
-                    "NLLB"
-                    if self.target_language
-                    else None
-                ),
-            }
-
-        # ======================================================
-        # Data that will be used for translation.
-        # ======================================================
+            return self._build_result(
+                media_filepath=media_filepath,
+                source_subtitle=source_subtitle,
+                translated_subtitle=translated_subtitle,
+                regions=0,
+                recognized_segments=0,
+            )
 
         regions: List[
             Tuple[float, float]
@@ -371,9 +1001,7 @@ class SubtitleService:
         try:
 
             # ==================================================
-            # STEP 4
-            #
-            # TRANSCRIBE
+            # WHISPER
             # ==================================================
 
             if transcribe_required:
@@ -381,7 +1009,7 @@ class SubtitleService:
                 self._progress(
                     "Extracting audio and transcribing",
                     filename,
-                    10,
+                    20,
                 )
 
                 transcription_results = (
@@ -391,6 +1019,7 @@ class SubtitleService:
                 )
 
                 if not transcription_results:
+
                     raise RuntimeError(
                         "Speech recognition produced "
                         "no subtitles."
@@ -398,7 +1027,10 @@ class SubtitleService:
 
                 for item in transcription_results:
 
-                    if not isinstance(item, dict):
+                    if not isinstance(
+                        item,
+                        dict,
+                    ):
                         continue
 
                     region = item.get(
@@ -424,6 +1056,7 @@ class SubtitleService:
                         continue
 
                     try:
+
                         start = float(
                             region[0]
                         )
@@ -436,6 +1069,7 @@ class SubtitleService:
                         TypeError,
                         ValueError,
                     ):
+
                         continue
 
                     if end <= start:
@@ -453,6 +1087,7 @@ class SubtitleService:
                     )
 
                 if not transcripts:
+
                     raise RuntimeError(
                         "Speech recognition produced "
                         "no usable subtitles."
@@ -464,45 +1099,40 @@ class SubtitleService:
                     60,
                 )
 
-                # ----------------------------------------------
-                # Write source SRT
-                # ----------------------------------------------
+                self._write_subtitle(
+                    filepath=source_subtitle,
+                    regions=regions,
+                    transcripts=transcripts,
+                    filename=filename,
+                    progress_message="Writing source subtitle",
+                )
 
-                if write_source:
+                source_available = True
 
-                    self._write_subtitle(
-                        filepath=source_subtitle,
-                        regions=regions,
-                        transcripts=transcripts,
-                        filename=filename,
-                        progress_message=(
-                            "Writing source subtitle"
-                        ),
+            # ==================================================
+            # READ SOURCE FOR TRANSLATION
+            # ==================================================
+
+            if translate_required:
+
+                if not source_available:
+
+                    source_available = os.path.isfile(
+                        source_subtitle
                     )
 
-            # ==================================================
-            # STEP 5
-            #
-            # If translation is requested but we did NOT
-            # transcribe, load the existing source SRT.
-            #
-            # This is the important case:
-            #
-            # source.srt exists
-            # user says NO to overwrite
-            # user says YES to translation
-            #
-            # We translate the existing SRT instead of
-            # retranscribing the video.
-            # ==================================================
+                if not source_available:
 
-            if (
-                translate_required
-                and not transcribe_required
-            ):
+                    raise RuntimeError(
+                        "Translation was requested but "
+                        "no source subtitle is available."
+                    )
 
                 self._progress(
-                    "Reading existing source subtitle",
+                    (
+                        "Reading source subtitle for "
+                        "translation"
+                    ),
                     filename,
                     55,
                 )
@@ -515,37 +1145,44 @@ class SubtitleService:
                 )
 
                 if not transcripts:
+
                     raise RuntimeError(
-                        "The existing source subtitle "
-                        "contains no usable subtitle lines."
+                        "The source subtitle contains "
+                        "no usable subtitle lines."
                     )
 
+                self._progress(
+                    (
+                        f"Loaded {len(transcripts)} "
+                        "subtitle lines for translation"
+                    ),
+                    filename,
+                    60,
+                )
+
             # ==================================================
-            # STEP 6
-            #
-            # TRANSLATION
-            #
-            # ALWAYS ARGOS.
+            # NLLB
             # ==================================================
 
             if translate_required:
 
                 if not self.target_language:
+
                     raise RuntimeError(
                         "Translation was requested but "
                         "no target language is configured."
                     )
 
-                if not transcripts:
+                if not translated_subtitle:
+
                     raise RuntimeError(
-                        "There are no subtitles available "
-                        "for translation."
+                        "Target subtitle filepath is missing."
                     )
 
                 self._progress(
                     (
                         "Starting offline NLLB CTranslate2 "
-                        f"translation "
+                        "translation "
                         f"{self.source_language} -> "
                         f"{self.target_language}"
                     ),
@@ -564,21 +1201,22 @@ class SubtitleService:
 
                     raise RuntimeError(
                         "NLLB CTranslate2 failed to initialize.\n"
-                        f"Model path: {translator.model_path}\n"
-                        f"Source: {self.source_language}\n"
-                        f"Target: {self.target_language}"
+                        f"Model path: "
+                        f"{translator.model_path}\n"
+                        f"Source: "
+                        f"{self.source_language}\n"
+                        f"Target: "
+                        f"{self.target_language}"
                     )
 
                 self._progress(
-                    "Translating subtitles offline",
+                    "Translating subtitles offline with NLLB",
                     filename,
                     70,
                 )
 
-                translated_transcripts = (
-                    translator(
-                        transcripts
-                    )
+                translated_transcripts = translator(
+                    transcripts
                 )
 
                 if (
@@ -592,6 +1230,50 @@ class SubtitleService:
                         "invalid number of subtitle lines."
                     )
 
+                # Basic sanity check.
+                cleaned_translations = []
+
+                for original, translated in zip(
+                    transcripts,
+                    translated_transcripts,
+                ):
+
+                    translated = str(
+                        translated or ""
+                    ).strip()
+
+                    if not translated:
+
+                        raise RuntimeError(
+                            "NLLB returned an empty translation "
+                            f"for subtitle line: {original!r}"
+                        )
+
+                    cleaned_translations.append(
+                        translated
+                    )
+
+                translated_transcripts = (
+                    cleaned_translations
+                )
+
+                if os.path.isfile(
+                    translated_subtitle
+                ):
+
+                    try:
+
+                        os.remove(
+                            translated_subtitle
+                        )
+
+                    except OSError as exc:
+
+                        raise RuntimeError(
+                            "Cannot replace existing target "
+                            f"subtitle: {translated_subtitle}"
+                        ) from exc
+
                 self._write_subtitle(
                     filepath=translated_subtitle,
                     regions=regions,
@@ -601,8 +1283,15 @@ class SubtitleService:
                         "Writing translated subtitle"
                     ),
                 )
-                # ----------------------------------------------
-                
+
+                self._progress(
+                    (
+                        "Translation complete: "
+                        f"{translated_subtitle}"
+                    ),
+                    filename,
+                    98,
+                )
 
             # ==================================================
             # COMPLETE
@@ -614,21 +1303,15 @@ class SubtitleService:
                 100,
             )
 
-            return {
-                "media": media_filepath,
-                "source_subtitle": source_subtitle,
-                "translated_subtitle": translated_subtitle,
-                "regions": len(regions),
-                "recognized_segments": len(
+            return self._build_result(
+                media_filepath=media_filepath,
+                source_subtitle=source_subtitle,
+                translated_subtitle=translated_subtitle,
+                regions=len(regions),
+                recognized_segments=len(
                     transcripts
                 ),
-                "transcription_task": "transcribe",
-                "translation_engine": (
-                    "NLLB"
-                    if self.target_language
-                    else None
-                ),
-            }
+            )
 
         except KeyboardInterrupt:
 
@@ -645,7 +1328,59 @@ class SubtitleService:
             raise
 
     # ==========================================================
-    # TRANSLATION QUESTION
+    # RESULT
+    # ==========================================================
+
+    @staticmethod
+    def _existing_file(
+        filepath: Optional[str],
+    ) -> Optional[str]:
+
+        if (
+            filepath
+            and os.path.isfile(filepath)
+        ):
+            return filepath
+
+        return None
+
+    def _build_result(
+        self,
+        media_filepath: str,
+        source_subtitle: str,
+        translated_subtitle: Optional[str],
+        regions: int,
+        recognized_segments: int,
+    ) -> Dict[str, Any]:
+
+        return {
+            "media": media_filepath,
+
+            "source_subtitle": self._existing_file(
+                source_subtitle
+            ),
+
+            "translated_subtitle": self._existing_file(
+                translated_subtitle
+            ),
+
+            "regions": regions,
+
+            "recognized_segments": (
+                recognized_segments
+            ),
+
+            "transcription_task": "transcribe",
+
+            "translation_engine": (
+                "NLLB"
+                if self.target_language
+                else None
+            ),
+        }
+
+    # ==========================================================
+    # TRANSLATION DECISION — FIXED
     # ==========================================================
 
     def _should_translate(
@@ -655,125 +1390,158 @@ class SubtitleService:
         translated_subtitle: Optional[str],
     ) -> bool:
 
+        # No target = no translation.
         if not self.target_language:
+
             return False
 
-        # ------------------------------------------------------
-        # If source == target, translation makes no sense.
-        # ------------------------------------------------------
-
+        # Same language = no translation.
         if is_same_language(
             self.source_language,
             self.target_language,
             self._error,
         ):
+
+            self._progress(
+                (
+                    "Source and target languages are identical; "
+                    "translation skipped"
+                ),
+                filename,
+                62,
+            )
+
+            return False
+
+        # Existing target = don't translate unless overwrite.
+        if (
+            translated_subtitle
+            and os.path.isfile(
+                translated_subtitle
+            )
+            and not self.overwrite_existing
+        ):
+
+            self._progress(
+                (
+                    "Target subtitle already exists; "
+                    "translation skipped"
+                ),
+                filename,
+                62,
+            )
+
             return False
 
         # ------------------------------------------------------
-        # Ask the application/UI whether translation should
-        # happen.
+        # FIX:
         #
-        # If no callback is supplied, safe default is NO.
+        # Translation is automatic.
+        #
+        # translate_callback is NOT required.
+        #
+        # If supplied, use it as an optional confirmation hook.
+        # If absent, continue directly to NLLB.
         # ------------------------------------------------------
 
         if self.translate_callback:
 
             try:
 
-                return bool(
-                    self.translate_callback(
-                        self.source_language,
-                        self.target_language,
-                        source_subtitle,
-                        translated_subtitle,
-                    )
+                decision = self.translate_callback(
+                    self.source_language,
+                    self.target_language,
+                    source_subtitle,
+                    translated_subtitle,
                 )
+
+                return bool(decision)
 
             except TypeError:
 
+                # Support older callback signatures.
                 try:
-                    return bool(
-                        self.translate_callback(
-                            self.target_language,
-                            'Target/Translation'
-                        )
+
+                    decision = self.translate_callback(
+                        self.target_language,
+                        "Target/Translation",
                     )
+
+                    return bool(decision)
 
                 except TypeError:
 
                     try:
-                        return bool(
-                            self.translate_callback()
-                        )
+
+                        decision = self.translate_callback()
+
+                        return bool(decision)
 
                     except Exception as exc:
+
                         self._error(exc)
-                        return False
+
+                        # Do not silently disable translation
+                        # because the callback failed.
+                        self._progress(
+                            (
+                                "Translation callback failed; "
+                                "continuing with NLLB"
+                            ),
+                            filename,
+                            63,
+                        )
+
+                        return True
 
                 except Exception as exc:
+
                     self._error(exc)
-                    return False
+
+                    self._progress(
+                        (
+                            "Translation callback failed; "
+                            "continuing with NLLB"
+                        ),
+                        filename,
+                        63,
+                    )
+
+                    return True
 
             except Exception as exc:
+
                 self._error(exc)
-                return False
+
+                self._progress(
+                    (
+                        "Translation callback failed; "
+                        "continuing with NLLB"
+                    ),
+                    filename,
+                    63,
+                )
+
+                return True
 
         # ------------------------------------------------------
-        # If there is no translation callback, don't silently
-        # translate.
+        # NO CALLBACK:
+        # AUTOMATIC TRANSLATION
         # ------------------------------------------------------
 
         self._progress(
             (
-                "Translation not requested "
-                "(no translation callback)"
+                "No existing target subtitle; "
+                "automatic NLLB translation requested"
             ),
             filename,
             62,
         )
 
-        return False
+        return True
 
     # ==========================================================
-    # OVERWRITE
-    # ==========================================================
-
-    def _should_overwrite(
-        self,
-        filepath: str,
-        type
-    ) -> bool:
-
-        if not os.path.exists(filepath):
-            return True
-
-        if self.overwrite_callback:
-
-            try:
-
-                return bool(
-                    self.overwrite_callback(
-                        filepath, 
-                        "Source/Original"
-                    )
-                )
-
-            except Exception as exc:
-
-                self._error(exc)
-
-                return False
-
-        # ------------------------------------------------------
-        # SAFE DEFAULT
-        #
-        # Never overwrite automatically.
-        # ------------------------------------------------------
-
-        return False
-
-    # ==========================================================
-    # READ EXISTING SOURCE SRT
+    # READ SOURCE
     # ==========================================================
 
     def _read_source_subtitle(
@@ -792,10 +1560,6 @@ class SubtitleService:
             )
 
         try:
-
-            # --------------------------------------------------
-            # Prefer SubtitleFormatter if it exposes a reader.
-            # --------------------------------------------------
 
             reader = getattr(
                 self.formatter,
@@ -834,8 +1598,11 @@ class SubtitleService:
                     else:
 
                         try:
+
                             region, text = item
+
                         except Exception:
+
                             continue
 
                     if (
@@ -851,10 +1618,30 @@ class SubtitleService:
                     if not text:
                         continue
 
+                    try:
+
+                        start = float(
+                            region[0]
+                        )
+
+                        end = float(
+                            region[1]
+                        )
+
+                    except (
+                        TypeError,
+                        ValueError,
+                    ):
+
+                        continue
+
+                    if end <= start:
+                        continue
+
                     parsed_regions.append(
                         (
-                            float(region[0]),
-                            float(region[1]),
+                            start,
+                            end,
                         )
                     )
 
@@ -869,13 +1656,6 @@ class SubtitleService:
                         parsed_texts,
                     )
 
-            # --------------------------------------------------
-            # Built-in SRT parser.
-            #
-            # This is used when SubtitleFormatter does not
-            # expose a reader.
-            # --------------------------------------------------
-
             return self._parse_srt(
                 filepath
             )
@@ -888,7 +1668,7 @@ class SubtitleService:
             ) from exc
 
     # ==========================================================
-    # SIMPLE SRT READER
+    # SRT PARSER
     # ==========================================================
 
     @staticmethod
@@ -907,13 +1687,13 @@ class SubtitleService:
 
             content = file.read()
 
-        blocks = content.replace(
-            "\r\n",
-            "\n",
-        ).replace(
-            "\r",
-            "\n",
-        ).split(
+        content = (
+            content
+            .replace("\r\n", "\n")
+            .replace("\r", "\n")
+        )
+
+        blocks = content.split(
             "\n\n"
         )
 
@@ -936,19 +1716,10 @@ class SubtitleService:
                 if line
             ]
 
-            if len(lines) < 3:
+            if len(lines) < 2:
                 continue
 
-            # ----------------------------------------------
-            # Usually:
-            #
-            # 1
-            # 00:00:01,000 --> 00:00:03,000
-            # Hello
-            # ----------------------------------------------
-
             timing_line = None
-
             timing_index = -1
 
             for index, line in enumerate(lines):
@@ -972,20 +1743,25 @@ class SubtitleService:
                 )
 
                 start = (
-                    SubtitleService
-                    ._srt_timestamp_to_seconds(
+                    self_timestamp_to_seconds(
                         start_text.strip()
                     )
                 )
 
+                end_timestamp = (
+                    end_text
+                    .strip()
+                    .split()[0]
+                )
+
                 end = (
-                    SubtitleService
-                    ._srt_timestamp_to_seconds(
-                        end_text.strip()
+                    self_timestamp_to_seconds(
+                        end_timestamp
                     )
                 )
 
             except Exception:
+
                 continue
 
             if end <= start:
@@ -1014,50 +1790,7 @@ class SubtitleService:
         return regions, texts
 
     # ==========================================================
-    # SRT TIMESTAMP
-    # ==========================================================
-
-    @staticmethod
-    def _srt_timestamp_to_seconds(
-        timestamp: str,
-    ) -> float:
-
-        timestamp = timestamp.strip()
-
-        timestamp = timestamp.replace(
-            ",",
-            ".",
-        )
-
-        parts = timestamp.split(
-            ":"
-        )
-
-        if len(parts) != 3:
-            raise ValueError(
-                f"Invalid SRT timestamp: {timestamp}"
-            )
-
-        hours = float(
-            parts[0]
-        )
-
-        minutes = float(
-            parts[1]
-        )
-
-        seconds = float(
-            parts[2]
-        )
-
-        return (
-            hours * 3600
-            + minutes * 60
-            + seconds
-        )
-
-    # ==========================================================
-    # WRITE SUBTITLE
+    # WRITE
     # ==========================================================
 
     def _write_subtitle(
@@ -1220,6 +1953,38 @@ class SubtitleService:
             except Exception:
                 pass
 
-        print(
-            error
+        print(error)
+
+
+# ==============================================================
+# SRT TIMESTAMP
+# ==============================================================
+
+def self_timestamp_to_seconds(
+    timestamp: str,
+) -> float:
+
+    timestamp = (
+        timestamp
+        .strip()
+        .replace(",", ".")
+    )
+
+    parts = timestamp.split(":")
+
+    if len(parts) != 3:
+
+        raise ValueError(
+            f"Invalid SRT timestamp: "
+            f"{timestamp}"
         )
+
+    hours = float(parts[0])
+    minutes = float(parts[1])
+    seconds = float(parts[2])
+
+    return (
+        hours * 3600
+        + minutes * 60
+        + seconds
+    )

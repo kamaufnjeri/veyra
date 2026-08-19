@@ -1,6 +1,6 @@
 # main.py
 
-from cli.main import main
+from cli.main_GUI import main
 
 
 if __name__ == "__main__":
