@@ -33,14 +33,14 @@ class SubtitleService:
         1. Matching embedded text subtitle
         2. Single / selected unknown-language embedded text subtitle
         3. Existing external source subtitle
-        4. Whisper transcription
+        4. Google transcription
 
     TARGET PRIORITY
     ---------------
 
         1. Matching embedded target text subtitle
         2. Existing external target subtitle
-        3. NLLB translation
+        3. Translation
 
     IMPORTANT
     ---------
@@ -54,10 +54,10 @@ class SubtitleService:
     If there is exactly one embedded text subtitle and its
     language is unknown, it is treated as the source subtitle.
 
-    Whisper is ONLY used when there is no usable embedded text
+    Google is ONLY used when there is no usable embedded text
     subtitle and no usable external source subtitle.
 
-    NLLB translation is AUTOMATIC when:
+    Translation is AUTOMATIC when:
 
         source subtitle exists
         AND target language is configured
@@ -228,14 +228,7 @@ class SubtitleService:
         self.translate_callback = translate_callback
         self.overwrite_existing = overwrite_existing
 
-        self.translation_engine = (
-            "NLLB"
-            if self.target_language
-            else None
-        )
-
-        self.whisper_task = "transcribe"
-
+    
         self.formatter = SubtitleFormatter(
             format_type=self.subtitle_format,
             error_messages_callback=self._error,
@@ -243,12 +236,8 @@ class SubtitleService:
 
         self.transcriber = AudioTranscriber(
             language=self.source_language,
-            task="transcribe",
             progress_callback=self._core_progress,
             error_callback=self._error,
-            frame_width=4096,
-            min_region_size=0.5,
-            max_region_size=6.0,
             include_before=0.25,
             include_after=0.25,
         )
@@ -727,17 +716,20 @@ class SubtitleService:
 
         # ------------------------------------------------------
         # 1. EMBEDDED SOURCE TEXT
+        #
+        # Only use embedded subtitle when overwrite is FALSE.
         # ------------------------------------------------------
 
         if (
             embedded_source
             and embedded_source.extractable
+            and not self.overwrite_existing
         ):
 
             self._progress(
                 (
                     "Embedded source text subtitle found; "
-                    "extracting it instead of using Whisper"
+                    "extracting it instead of using Google"
                 ),
                 filename,
                 10,
@@ -771,9 +763,14 @@ class SubtitleService:
 
         # ------------------------------------------------------
         # 2. EXISTING EXTERNAL SOURCE
+        #
+        # Only reuse existing subtitle when overwrite is FALSE.
         # ------------------------------------------------------
 
-        elif source_exists and not self.overwrite_existing:
+        elif (
+            source_exists
+            and not self.overwrite_existing
+        ):
 
             self._progress(
                 (
@@ -787,7 +784,29 @@ class SubtitleService:
             source_available = True
 
         # ------------------------------------------------------
-        # 3. EMBEDDED IMAGE SOURCE
+        # 3. OVERWRITE
+        #
+        # Ignore BOTH embedded and existing external subtitles.
+        # ------------------------------------------------------
+
+        elif self.overwrite_existing:
+
+            self._progress(
+                (
+                    "Overwrite enabled; ignoring embedded and "
+                    "existing source subtitles. Google will "
+                    "regenerate the source subtitle."
+                ),
+                filename,
+                15,
+            )
+
+            transcribe_required = True
+
+        # ------------------------------------------------------
+        # 4. EMBEDDED IMAGE SOURCE
+        #
+        # This is only reached when overwrite is FALSE.
         # ------------------------------------------------------
 
         elif (
@@ -804,30 +823,13 @@ class SubtitleService:
                 15,
             )
 
-            if source_exists and not self.overwrite_existing:
+            if source_exists:
 
                 source_available = True
 
             else:
 
                 transcribe_required = True
-
-        # ------------------------------------------------------
-        # 4. OVERWRITE
-        # ------------------------------------------------------
-
-        elif source_exists and self.overwrite_existing:
-
-            self._progress(
-                (
-                    "Overwrite enabled; Whisper will regenerate "
-                    "the source subtitle"
-                ),
-                filename,
-                15,
-            )
-
-            transcribe_required = True
 
         # ------------------------------------------------------
         # 5. NOTHING
@@ -838,7 +840,7 @@ class SubtitleService:
             self._progress(
                 (
                     "No usable embedded or external source "
-                    "subtitle found; Whisper will transcribe "
+                    "subtitle found; Google will transcribe "
                     "the audio"
                 ),
                 filename,
@@ -863,18 +865,21 @@ class SubtitleService:
         if self.target_language:
 
             # --------------------------------------------------
-            # EMBEDDED TARGET
+            # 1. EMBEDDED TARGET
+            #
+            # Only use embedded target when overwrite is FALSE.
             # --------------------------------------------------
 
             if (
                 embedded_target
                 and embedded_target.extractable
+                and not self.overwrite_existing
             ):
 
                 self._progress(
                     (
                         "Embedded target text subtitle found; "
-                        "using it instead of NLLB"
+                        "using it instead of Translation "
                     ),
                     filename,
                     18,
@@ -899,7 +904,28 @@ class SubtitleService:
                     )
 
             # --------------------------------------------------
-            # EXISTING TARGET
+            # 2. OVERWRITE
+            #
+            # Ignore BOTH embedded and existing target subtitles.
+            # Translation will regenerate the target subtitle.
+            # --------------------------------------------------
+
+            elif self.overwrite_existing:
+
+                self._progress(
+                    (
+                        "Overwrite enabled; ignoring embedded and "
+                        "existing target subtitles. Translation will "
+                        "regenerate the target subtitle."
+                    ),
+                    filename,
+                    20,
+                )
+
+                translate_required = True
+
+            # --------------------------------------------------
+            # 3. EXISTING TARGET
             # --------------------------------------------------
 
             elif (
@@ -917,7 +943,7 @@ class SubtitleService:
                 )
 
             # --------------------------------------------------
-            # IMAGE TARGET
+            # 4. EMBEDDED IMAGE TARGET
             # --------------------------------------------------
 
             elif (
@@ -956,7 +982,7 @@ class SubtitleService:
                     )
 
             # --------------------------------------------------
-            # NO EMBEDDED TARGET
+            # 5. NO EMBEDDED TARGET
             # --------------------------------------------------
 
             else:
@@ -1001,7 +1027,7 @@ class SubtitleService:
         try:
 
             # ==================================================
-            # WHISPER
+            # TRANSCRIBE
             # ==================================================
 
             if transcribe_required:
@@ -1161,7 +1187,7 @@ class SubtitleService:
                 )
 
             # ==================================================
-            # NLLB
+            # Translation 
             # ==================================================
 
             if translate_required:
@@ -1181,7 +1207,7 @@ class SubtitleService:
 
                 self._progress(
                     (
-                        "Starting offline NLLB CTranslate2 "
+                        "Starting offline Translation CTranslate2 "
                         "translation "
                         f"{self.source_language} -> "
                         f"{self.target_language}"
@@ -1200,7 +1226,7 @@ class SubtitleService:
                 if not translator.is_available:
 
                     raise RuntimeError(
-                        "NLLB CTranslate2 failed to initialize.\n"
+                        "Translation CTranslate2 failed to initialize.\n"
                         f"Model path: "
                         f"{translator.model_path}\n"
                         f"Source: "
@@ -1210,7 +1236,7 @@ class SubtitleService:
                     )
 
                 self._progress(
-                    "Translating subtitles offline with NLLB",
+                    "Translating subtitles offline with Translation ",
                     filename,
                     70,
                 )
@@ -1226,7 +1252,7 @@ class SubtitleService:
                 ):
 
                     raise RuntimeError(
-                        "NLLB CTranslate2 returned an "
+                        "Translation CTranslate2 returned an "
                         "invalid number of subtitle lines."
                     )
 
@@ -1245,7 +1271,7 @@ class SubtitleService:
                     if not translated:
 
                         raise RuntimeError(
-                            "NLLB returned an empty translation "
+                            "Translation returned an empty translation "
                             f"for subtitle line: {original!r}"
                         )
 
@@ -1326,7 +1352,6 @@ class SubtitleService:
             self._error(exc)
 
             raise
-
     # ==========================================================
     # RESULT
     # ==========================================================
@@ -1372,11 +1397,6 @@ class SubtitleService:
 
             "transcription_task": "transcribe",
 
-            "translation_engine": (
-                "NLLB"
-                if self.target_language
-                else None
-            ),
         }
 
     # ==========================================================
@@ -1441,7 +1461,7 @@ class SubtitleService:
         # translate_callback is NOT required.
         #
         # If supplied, use it as an optional confirmation hook.
-        # If absent, continue directly to NLLB.
+        # If absent, continue directly to Translation .
         # ------------------------------------------------------
 
         if self.translate_callback:
@@ -1486,7 +1506,7 @@ class SubtitleService:
                         self._progress(
                             (
                                 "Translation callback failed; "
-                                "continuing with NLLB"
+                                "continuing with Translation "
                             ),
                             filename,
                             63,
@@ -1501,7 +1521,7 @@ class SubtitleService:
                     self._progress(
                         (
                             "Translation callback failed; "
-                            "continuing with NLLB"
+                            "continuing with Translation "
                         ),
                         filename,
                         63,
@@ -1516,7 +1536,7 @@ class SubtitleService:
                 self._progress(
                     (
                         "Translation callback failed; "
-                        "continuing with NLLB"
+                        "continuing with Translation "
                     ),
                     filename,
                     63,
@@ -1532,7 +1552,7 @@ class SubtitleService:
         self._progress(
             (
                 "No existing target subtitle; "
-                "automatic NLLB translation requested"
+                "automatic Translation requested"
             ),
             filename,
             62,

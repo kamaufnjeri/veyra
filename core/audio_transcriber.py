@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import audioop
 import math
 import os
 import wave
@@ -12,7 +11,6 @@ from concurrent.futures import (
 
 from typing import (
     Any,
-    Callable,
     List,
     Optional,
     Tuple,
@@ -21,216 +19,7 @@ from typing import (
 import speech_recognition as sr
 
 from core.wav_converter import WavConverter
-
-
-# ==============================================================
-# SPEECH REGION FINDER
-# ==============================================================
-
-class SpeechRegionFinder:
-    """
-    Detect speech regions using RMS energy analysis.
-
-    This is intentionally lightweight. It scans the WAV once
-    and avoids creating an FFmpeg process for every region.
-    """
-
-    def __init__(
-        self,
-        frame_width: int = 4096,
-        min_region_size: float = 0.5,
-        max_region_size: float = 6.0,
-        error_messages_callback=None,
-    ):
-        self.frame_width = frame_width
-        self.min_region_size = min_region_size
-        self.max_region_size = max_region_size
-        self.error_messages_callback = (
-            error_messages_callback
-        )
-
-    @staticmethod
-    def percentile(
-        arr: List[float],
-        percent: float,
-    ) -> float:
-
-        if not arr:
-            return 0.0
-
-        arr = sorted(arr)
-
-        k = (len(arr) - 1) * percent
-
-        f = math.floor(k)
-        c = math.ceil(k)
-
-        if f == c:
-            return arr[int(k)]
-
-        d0 = arr[int(f)] * (c - k)
-        d1 = arr[int(c)] * (k - f)
-
-        return d0 + d1
-
-    def __call__(
-        self,
-        wav_filepath: str,
-    ) -> List[Tuple[float, float]]:
-
-        try:
-
-            with wave.open(
-                wav_filepath,
-                "rb",
-            ) as reader:
-
-                sample_width = reader.getsampwidth()
-                rate = reader.getframerate()
-                total_frames = reader.getnframes()
-
-                if rate <= 0:
-                    return []
-
-                total_duration = (
-                    total_frames / float(rate)
-                )
-
-                chunk_duration = (
-                    float(self.frame_width)
-                    / float(rate)
-                )
-
-                n_chunks = int(
-                    math.ceil(
-                        total_duration
-                        / chunk_duration
-                    )
-                )
-
-                energies = []
-
-                for _ in range(n_chunks):
-
-                    chunk = reader.readframes(
-                        self.frame_width
-                    )
-
-                    if not chunk:
-                        break
-
-                    energy = audioop.rms(
-                        chunk,
-                        sample_width,
-                    )
-
-                    energies.append(energy)
-
-        except KeyboardInterrupt:
-
-            self._error(
-                "Cancelling speech detection"
-            )
-
-            raise
-
-        except Exception as exc:
-
-            self._error(exc)
-
-            return []
-
-        if not energies:
-            return []
-
-        threshold = self.percentile(
-            energies,
-            0.20,
-        )
-
-        elapsed_time = 0.0
-
-        regions = []
-
-        region_start = None
-
-        for energy in energies:
-
-            is_silence = (
-                energy <= threshold
-            )
-
-            max_exceeded = (
-                region_start is not None
-                and (
-                    elapsed_time
-                    - region_start
-                    >= self.max_region_size
-                )
-            )
-
-            if max_exceeded or is_silence:
-
-                if region_start is not None:
-
-                    duration = (
-                        elapsed_time
-                        - region_start
-                    )
-
-                    if duration >= self.min_region_size:
-
-                        regions.append(
-                            (
-                                region_start,
-                                elapsed_time,
-                            )
-                        )
-
-                    region_start = None
-
-            elif region_start is None:
-
-                region_start = elapsed_time
-
-            elapsed_time += chunk_duration
-
-        # Close final region.
-
-        if region_start is not None:
-
-            duration = (
-                elapsed_time
-                - region_start
-            )
-
-            if duration >= self.min_region_size:
-
-                regions.append(
-                    (
-                        region_start,
-                        min(
-                            elapsed_time,
-                            total_duration,
-                        ),
-                    )
-                )
-
-        return regions
-
-    def _error(self, error):
-
-        if self.error_messages_callback:
-
-            try:
-                self.error_messages_callback(
-                    error
-                )
-            except Exception:
-                pass
-
-        else:
-            print(error)
+from core.silero_vad import SileroVAD
 
 
 # ==============================================================
@@ -242,24 +31,31 @@ class AudioTranscriber:
     def __init__(
         self,
         language: str = "en",
-        model_size: str = "unused",
-        device: Optional[str] = None,
-        compute_type: Optional[str] = None,
-        cpu_threads: int = 4,
-        task: str = "transcribe",
         progress_callback=None,
         error_callback=None,
         error_messages_callback=None,
 
-        frame_width: int = 4096,
-        min_region_size: float = 0.5,
-        max_region_size: float = 6.0,
-
         include_before: float = 0.25,
         include_after: float = 0.25,
 
-        # Google requests running concurrently.
-        workers: int = 6,
+        # ------------------------------------------------------
+        # Google recognition concurrency.
+        # ------------------------------------------------------
+        workers: int = 4,
+
+        # ------------------------------------------------------
+        # Number of speech regions submitted to the executor
+        # at one time.
+        #
+        # IMPORTANT:
+        # This does NOT send multiple regions in one Google
+        # request. Google recognition is still performed one
+        # AudioData object at a time.
+        #
+        # batch_size simply prevents thousands of futures from
+        # being created simultaneously.
+        # ------------------------------------------------------
+        batch_size: int = 20,
     ):
 
         self.language = (
@@ -267,19 +63,6 @@ class AudioTranscriber:
                 language
             )
         )
-
-        self.task = (
-            task.strip().lower()
-            if task
-            else "transcribe"
-        )
-
-        if self.task != "transcribe":
-
-            raise ValueError(
-                "AudioTranscriber only supports "
-                "task='transcribe'."
-            )
 
         self.progress_callback = (
             progress_callback
@@ -298,9 +81,22 @@ class AudioTranscriber:
             include_after
         )
 
+        # ------------------------------------------------------
+        # Google worker count.
+        # ------------------------------------------------------
+
         self.workers = max(
             1,
             int(workers),
+        )
+
+        # ------------------------------------------------------
+        # Google recognition batch size.
+        # ------------------------------------------------------
+
+        self.batch_size = max(
+            1,
+            int(batch_size),
         )
 
         # ------------------------------------------------------
@@ -318,13 +114,28 @@ class AudioTranscriber:
         # Speech detector
         # ------------------------------------------------------
 
-        self.region_finder = (
-            SpeechRegionFinder(
-                frame_width=frame_width,
-                min_region_size=min_region_size,
-                max_region_size=max_region_size,
-                error_messages_callback=self._error,
-            )
+        self.region_finder = SileroVAD(
+            sampling_rate=16000,
+
+            threshold=0.5,
+
+            min_speech_duration_ms=250,
+
+            # Give natural dialogue pauses a little room.
+            min_silence_duration_ms=400,
+
+            speech_pad_ms=200,
+
+            # Merge nearby speech regions.
+            merge_gap=0.65,
+
+            # Ignore extremely short fragments.
+            min_segment_duration=0.80,
+
+            # Don't send huge chunks to ASR.
+            max_segment_duration=6.0,
+
+            error_callback=self._error,
         )
 
     # ==========================================================
@@ -455,7 +266,7 @@ class AudioTranscriber:
             )
 
             # ==================================================
-            # 3. PARALLEL GOOGLE RECOGNITION
+            # 3. BATCHED PARALLEL GOOGLE RECOGNITION
             # ==================================================
 
             workers = min(
@@ -463,81 +274,149 @@ class AudioTranscriber:
                 total_regions,
             )
 
+            batch_size = min(
+                self.batch_size,
+                total_regions,
+            )
+
+            total_batches = math.ceil(
+                total_regions
+                / batch_size
+            )
+
             self._progress(
                 (
                     f"Recognizing speech using "
-                    f"{workers} workers"
+                    f"{workers} workers "
+                    f"(batch size: {batch_size})"
                 ),
                 20,
             )
 
             results_by_index = {}
 
-            with ThreadPoolExecutor(
-                max_workers=workers
-            ) as executor:
+            completed = 0
 
-                futures = {}
+            # --------------------------------------------------
+            # Process regions in batches.
+            #
+            # Only one batch is submitted at a time.
+            # Within each batch, workers process regions
+            # concurrently.
+            # --------------------------------------------------
 
-                for index, region in enumerate(
-                    regions
-                ):
+            for batch_number, batch_start in enumerate(
+                range(
+                    0,
+                    total_regions,
+                    batch_size,
+                ),
+                start=1,
+            ):
 
-                    future = executor.submit(
-                        self._recognize_region,
-                        index,
-                        region,
-                        wav_path,
-                    )
+                batch_end = min(
+                    batch_start + batch_size,
+                    total_regions,
+                )
 
-                    futures[future] = index
+                batch = regions[
+                    batch_start:batch_end
+                ]
 
-                completed = 0
-
-                for future in as_completed(
-                    futures
-                ):
-
-                    completed += 1
-
-                    try:
-
-                        index, result = (
-                            future.result()
-                        )
-
-                        if result is not None:
-
-                            results_by_index[
-                                index
-                            ] = result
-
-                    except Exception as exc:
-
-                        self._error(
-                            exc
-                        )
-
-                    percentage = int(
+                self._progress(
+                    (
+                        f"Processing recognition "
+                        f"batch {batch_number}/"
+                        f"{total_batches}"
+                    ),
+                    20 + int(
                         (
                             completed
                             / total_regions
                         )
-                        * 100
-                    )
+                        * 40
+                    ),
+                )
 
-                    mapped = (
-                        20
-                        + int(
-                            percentage
-                            * 0.40
+                # ------------------------------------------------
+                # Executor exists only for this batch.
+                # ------------------------------------------------
+
+                with ThreadPoolExecutor(
+                    max_workers=workers
+                ) as executor:
+
+                    futures = {}
+
+                    for offset, region in enumerate(
+                        batch
+                    ):
+
+                        index = (
+                            batch_start
+                            + offset
                         )
-                    )
 
-                    self._progress(
-                        "Recognizing speech with Google",
-                        mapped,
-                    )
+                        future = executor.submit(
+                            self._recognize_region,
+                            index,
+                            region,
+                            wav_path,
+                        )
+
+                        futures[future] = index
+
+                    # --------------------------------------------
+                    # Collect completed requests.
+                    # --------------------------------------------
+
+                    for future in as_completed(
+                        futures
+                    ):
+
+                        try:
+
+                            index, result = (
+                                future.result()
+                            )
+
+                            if result is not None:
+
+                                results_by_index[
+                                    index
+                                ] = result
+
+                        except Exception as exc:
+
+                            self._error(
+                                exc
+                            )
+
+                        completed += 1
+
+                        percentage = int(
+                            (
+                                completed
+                                / total_regions
+                            )
+                            * 100
+                        )
+
+                        mapped = (
+                            20
+                            + int(
+                                percentage
+                                * 0.40
+                            )
+                        )
+
+                        self._progress(
+                            (
+                                "Recognizing speech "
+                                "with Google"
+                            ),
+                            mapped,
+                        )
 
             # ==================================================
             # 4. RESTORE ORIGINAL ORDER
@@ -557,6 +436,13 @@ class AudioTranscriber:
                     results.append(
                         result
                     )
+
+            if not results:
+
+                raise RuntimeError(
+                    "Google speech recognition "
+                    "produced no usable results."
+                )
 
             self._progress(
                 "Transcription complete",
@@ -586,9 +472,11 @@ class AudioTranscriber:
             if wav_path:
 
                 try:
+
                     os.unlink(
                         wav_path
                     )
+
                 except OSError:
                     pass
 
@@ -808,11 +696,14 @@ class AudioTranscriber:
         if self.error_callback:
 
             try:
+
                 self.error_callback(
                     error
                 )
+
             except Exception:
                 pass
 
         else:
+
             print(error)
