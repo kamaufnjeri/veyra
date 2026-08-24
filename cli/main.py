@@ -1,556 +1,261 @@
 from __future__ import annotations
 
-import argparse
-import os
-import signal
 import sys
-import time
-from datetime import timedelta
 
-from jobs.processor import JobProcessor
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QApplication,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QStackedWidget,
+    QVBoxLayout,
+    QWidget,
+)
+
+from cli.ui.subtitle_page import SubtitlePage
+from cli.ui.download_page import VideoDownloadPage
+from cli.ui.sync_page import SubtitleSyncPage
 
 
-# ==============================================================
-# GLOBAL CANCELLATION
-# ==============================================================
+class VeyraWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
 
-cancelled = False
-processor_instance = None
+        self.setWindowTitle("Veyra")
+        self.resize(1200, 800)
 
+        self._build_ui()
 
-# ==============================================================
-# CTRL+C HANDLER
-# ==============================================================
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
 
-def handle_cancel(signum=None, frame=None):
-    """
-    Handle Ctrl+C.
+        main_layout = QHBoxLayout(central)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
 
-    First Ctrl+C:
-        - Marks the application as cancelled.
-        - Tells JobProcessor to stop.
+        # ======================================================
+        # SIDEBAR
+        # ======================================================
 
-    Second Ctrl+C:
-        - Immediately terminates the process.
-    """
+        self.sidebar = QFrame()
+        self.sidebar.setObjectName("Sidebar")
+        self.sidebar.setFixedWidth(230)
 
-    global cancelled
+        sidebar_layout = QVBoxLayout(self.sidebar)
+        sidebar_layout.setContentsMargins(15, 20, 15, 20)
+        sidebar_layout.setSpacing(10)
 
-    # ----------------------------------------------------------
-    # Second Ctrl+C -> force kill
-    # ----------------------------------------------------------
+        # Logo / application name
+        logo = QLabel("VEYRA")
+        logo.setObjectName("Logo")
 
-    if cancelled:
-        print(
-            "\n\nForce stopping Veyra...",
-            flush=True,
+        sidebar_layout.addWidget(logo)
+
+        subtitle = QLabel("Media Subtitle Tools")
+        subtitle.setObjectName("SidebarSubtitle")
+
+        sidebar_layout.addWidget(subtitle)
+
+        sidebar_layout.addSpacing(25)
+
+        # Navigation
+        self.navigation = QListWidget()
+        self.navigation.setObjectName("Navigation")
+
+        self._add_navigation_item(
+            "Subtitle Generation",
+            "subtitle",
         )
 
-        os._exit(130)
-
-    # ----------------------------------------------------------
-    # First Ctrl+C
-    # ----------------------------------------------------------
-
-    cancelled = True
-
-    print(
-        "\n\nCtrl+C received.",
-        flush=True,
-    )
-
-    print(
-        "Cancelling Veyra...",
-        flush=True,
-    )
-
-    processor = processor_instance
-
-    if processor is not None:
-
-        try:
-
-            cancel_method = getattr(
-                processor,
-                "cancel",
-                None,
-            )
-
-            if callable(cancel_method):
-                cancel_method()
-
-        except Exception as exc:
-
-            print(
-                f"Cancellation warning: {exc}",
-                file=sys.stderr,
-                flush=True,
-            )
-
-
-# ==============================================================
-# INSTALL SIGNAL HANDLERS
-# ==============================================================
-
-def install_signal_handlers():
-    """
-    Install Ctrl+C / SIGINT handler.
-
-    Ctrl+C sends SIGINT on normal terminals.
-    """
-
-    signal.signal(
-        signal.SIGINT,
-        handle_cancel,
-    )
-
-    # ----------------------------------------------------------
-    # SIGTERM is useful when the process is terminated externally.
-    # ----------------------------------------------------------
-
-    if hasattr(signal, "SIGTERM"):
-
-        signal.signal(
-            signal.SIGTERM,
-            handle_cancel,
+        self._add_navigation_item(
+            "Video Download",
+            "download",
         )
 
-
-# ==============================================================
-# PROGRESS
-# ==============================================================
-
-def show_progress(
-    info,
-    media_file_display_name,
-    progress,
-    start_time=None,
-):
-    """
-    Display CLI processing progress.
-    """
-
-    if cancelled:
-        return
-
-    progress = max(
-        0,
-        min(
-            100,
-            int(progress),
-        ),
-    )
-
-    if start_time is None:
-        start_time = time.time()
-
-    elapsed_time = (
-        time.time() - start_time
-    )
-
-    if progress > 0:
-
-        eta_seconds = (
-            elapsed_time / progress
-        ) * (
-            100 - progress
+        self._add_navigation_item(
+            "Subtitle Sync",
+            "sync",
         )
 
-    else:
-
-        eta_seconds = 0
-
-    eta = timedelta(
-        seconds=int(eta_seconds)
-    )
-
-    elapsed = timedelta(
-        seconds=int(elapsed_time)
-    )
-
-    print(
-        f"\r"
-        f"[{progress:3d}%] "
-        f"{media_file_display_name} - "
-        f"{info} | "
-        f"Elapsed: {elapsed} | "
-        f"ETA: {eta}",
-        end="",
-        flush=True,
-    )
-
-    if progress >= 100:
-        print(
-            flush=True
+        sidebar_layout.addWidget(
+            self.navigation,
+            1,
         )
 
+        version = QLabel("Veyra")
+        version.setObjectName("Version")
 
-# ==============================================================
-# OVERWRITE
-# ==============================================================
+        sidebar_layout.addWidget(version)
 
-def ask_overwrite(filepath: str, type) -> bool:
-    """
-    Ask the user whether an existing subtitle should be overwritten.
-    """
+        main_layout.addWidget(self.sidebar)
 
-    if cancelled:
-        return False
+        # ======================================================
+        # PAGE AREA
+        # ======================================================
 
-    while True:
+        self.pages = QStackedWidget()
+        self.pages.setObjectName("Pages")
 
-        print()
-
-        print(
-            f"{type} subtitle file already exists:"
+        main_layout.addWidget(
+            self.pages,
+            1,
         )
 
-        print(
-            f"  {filepath}"
+        # ======================================================
+        # PAGES
+        # ======================================================
+
+        self.subtitle_page = SubtitlePage()
+
+        self.video_download_page = VideoDownloadPage()
+
+        self.subtitle_sync_page = SubtitleSyncPage()
+
+        self.pages.addWidget(
+            self.subtitle_page
         )
 
-        try:
-
-            answer = input(
-                "Overwrite it? [y]es / [n]o: "
-            ).strip().lower()
-
-        except KeyboardInterrupt:
-
-            handle_cancel()
-
-            return False
-
-        if answer in (
-            "y",
-            "yes",
-        ):
-
-            return True
-
-        if answer in (
-            "n",
-            "no",
-        ):
-
-            return False
-
-        print(
-            "Please enter 'y' or 'n'."
+        self.pages.addWidget(
+            self.video_download_page
         )
 
+        self.pages.addWidget(
+            self.subtitle_sync_page
+        )
 
-# ==============================================================
-# ERRORS
-# ==============================================================
+        # ======================================================
+        # NAVIGATION
+        # ======================================================
 
-def show_error_messages(message):
-    """
-    Display an error message in the CLI.
-    """
+        self.navigation.currentRowChanged.connect(
+            self.change_page
+        )
 
-    if cancelled:
-        return
+        # Open first page
+        self.navigation.setCurrentRow(0)
 
-    print(
-        f"\nERROR: {message}",
-        file=sys.stderr,
-        flush=True,
-    )
+        # ======================================================
+        # STYLE
+        # ======================================================
+
+        self._apply_style()
+
+    # ==========================================================
+    # NAVIGATION ITEM
+    # ==========================================================
+
+    def _add_navigation_item(
+        self,
+        text: str,
+        page_id: str,
+    ):
+        item = QListWidgetItem(text)
+
+        item.setData(
+            Qt.UserRole,
+            page_id,
+        )
+
+        self.navigation.addItem(item)
+
+    # ==========================================================
+    # CHANGE PAGE
+    # ==========================================================
+
+    def change_page(
+        self,
+        index: int,
+    ):
+        if index < 0:
+            return
+
+        self.pages.setCurrentIndex(index)
+
+    # ==========================================================
+    # STYLE
+    # ==========================================================
+
+    def _apply_style(self):
+        self.setStyleSheet(
+            """
+            QMainWindow {
+                background: #111827;
+            }
+
+            #Sidebar {
+                background: #0b1220;
+                border-right: 1px solid #1f2937;
+            }
+
+            #Logo {
+                color: #ffffff;
+                font-size: 26px;
+                font-weight: 800;
+                padding-left: 8px;
+            }
+
+            #SidebarSubtitle {
+                color: #6b7280;
+                font-size: 12px;
+                padding-left: 8px;
+            }
+
+            #Navigation {
+                background: transparent;
+                border: none;
+                outline: none;
+            }
+
+            #Navigation::item {
+                color: #9ca3af;
+                padding: 14px 12px;
+                margin: 2px 0;
+                border-radius: 8px;
+            }
+
+            #Navigation::item:hover {
+                background: #172033;
+                color: #ffffff;
+            }
+
+            #Navigation::item:selected {
+                background: #2563eb;
+                color: #ffffff;
+                font-weight: 600;
+            }
+
+            #Version {
+                color: #4b5563;
+                padding-left: 8px;
+            }
+
+            #Pages {
+                background: #111827;
+            }
+            """
+        )
 
 
 # ==============================================================
 # MAIN
 # ==============================================================
 
-def main():
-    """
-    Main Veyra CLI entry point.
-    """
+def main() -> int:
+    app = QApplication(sys.argv)
 
-    global processor_instance
-    global cancelled
+    app.setApplicationName("Veyra")
+    app.setOrganizationName("Veyra")
 
-    cancelled = False
+    window = VeyraWindow()
+    window.show()
 
-    # ----------------------------------------------------------
-    # Install Ctrl+C handler BEFORE doing any work.
-    # ----------------------------------------------------------
+    return app.exec()
 
-    install_signal_handlers()
-
-    # ==========================================================
-    # ARGUMENT PARSER
-    # ==========================================================
-
-    parser = argparse.ArgumentParser(
-        description="Veyra subtitle generator"
-    )
-
-    # ----------------------------------------------------------
-    # Input files
-    # ----------------------------------------------------------
-
-    parser.add_argument(
-        "files",
-        nargs="+",
-        help="Media files to process",
-    )
-
-    # ----------------------------------------------------------
-    # Source language
-    # ----------------------------------------------------------
-
-    parser.add_argument(
-        "-s",
-        "--source",
-        "--source-language",
-        dest="source",
-        default="en",
-        help="Source language (default: en)",
-    )
-
-    # ----------------------------------------------------------
-    # Target language
-    # ----------------------------------------------------------
-
-    parser.add_argument(
-        "-t",
-        "--target",
-        "--target-language",
-        dest="target",
-        default=None,
-        help="Target translation language",
-    )
-
-    # ----------------------------------------------------------
-    # Subtitle format
-    # ----------------------------------------------------------
-
-    parser.add_argument(
-        "-f",
-        "--format",
-        default="srt",
-        choices=[
-            "srt",
-            "vtt",
-            "json",
-            "raw",
-        ],
-        help="Subtitle format",
-    )
-
-    args = parser.parse_args()
-
-    # ==========================================================
-    # VALIDATE FILES
-    # ==========================================================
-
-    valid_files = []
-
-    for filepath in args.files:
-
-        filepath = os.path.abspath(
-            filepath
-        )
-
-        if not os.path.isfile(filepath):
-
-            print(
-                f"File not found: {filepath}",
-                file=sys.stderr,
-            )
-
-            continue
-
-        valid_files.append(
-            filepath
-        )
-
-    if not valid_files:
-
-        print(
-            "No valid media files were supplied.",
-            file=sys.stderr,
-        )
-
-        return 1
-
-    # ==========================================================
-    # START TIME
-    # ==========================================================
-
-    start_time = time.time()
-
-    # ==========================================================
-    # PROGRESS CALLBACK
-    # ==========================================================
-
-    def progress_callback(
-        info,
-        filename,
-        percentage,
-        *_,
-    ):
-
-        show_progress(
-            info,
-            filename,
-            percentage,
-            start_time,
-        )
-
-    # ==========================================================
-    # CREATE PROCESSOR
-    # ==========================================================
-
-    try:
-
-        processor = JobProcessor(
-            source_language=args.source,
-            target_language=args.target,
-            subtitle_format=args.format,
-            progress_callback=progress_callback,
-            error_callback=show_error_messages,
-            overwrite_callback=ask_overwrite,
-        )
-
-        # Store globally so Ctrl+C can reach it.
-        processor_instance = processor
-
-    except KeyboardInterrupt:
-
-        handle_cancel()
-
-        return 130
-
-    except Exception as error:
-
-        show_error_messages(
-            str(error)
-        )
-
-        return 1
-
-    # ==========================================================
-    # PROCESS FILES
-    # ==========================================================
-
-    try:
-
-        results = processor.process_files(
-            valid_files
-        )
-
-    except KeyboardInterrupt:
-
-        handle_cancel(
-            processor
-        )
-
-        return 130
-
-    except Exception as error:
-
-        if cancelled:
-            return 130
-
-        show_error_messages(
-            str(error)
-        )
-
-        return 1
-
-    finally:
-
-        # ------------------------------------------------------
-        # Give processor a chance to clean up.
-        # ------------------------------------------------------
-
-        if cancelled:
-
-            try:
-
-                cleanup = getattr(
-                    processor,
-                    "cleanup",
-                    None,
-                )
-
-                if callable(cleanup):
-                    cleanup()
-
-            except Exception:
-                pass
-
-    # ==========================================================
-    # CHECK CANCELLATION
-    # ==========================================================
-
-    if cancelled:
-        return 130
-
-    # ==========================================================
-    # DISPLAY RESULTS
-    # ==========================================================
-
-    print(
-        "\n",
-        flush=True,
-    )
-
-    for result in results:
-
-        if cancelled:
-            return 130
-
-        print(
-            f"Media: "
-            f"{result['media']}"
-        )
-
-        print(
-            f"Source subtitle: "
-            f"{result['source_subtitle']}"
-        )
-
-        if result.get(
-            "translated_subtitle"
-        ):
-
-            print(
-                f"Translated subtitle: "
-                f"{result['translated_subtitle']}"
-            )
-
-        print()
-
-    return 0
-
-
-# ==============================================================
-# ENTRY POINT
-# ==============================================================
 
 if __name__ == "__main__":
-
-    try:
-
-        exit_code = main()
-
-        sys.exit(
-            exit_code
-        )
-
-    except KeyboardInterrupt:
-
-        # ------------------------------------------------------
-        # This is a final safety net.
-        # ------------------------------------------------------
-
-        print(
-            "\n\nVeyra cancelled.",
-            flush=True,
-        )
-
-        sys.exit(130)
+    sys.exit(main())

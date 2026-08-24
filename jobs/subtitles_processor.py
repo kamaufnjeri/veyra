@@ -13,7 +13,7 @@ class JobCancelled(Exception):
     """Raised when a subtitle job is cancelled."""
 
 
-class JobProcessor:
+class SubtitleJobProcessor:
     """
     Processes subtitle jobs.
 
@@ -514,7 +514,7 @@ def process(
     Compatibility helper for processing one file.
     """
 
-    processor = JobProcessor(
+    processor = SubtitleJobProcessor(
         source_language=source_language,
         target_language=target_language,
         subtitle_format=subtitle_format,

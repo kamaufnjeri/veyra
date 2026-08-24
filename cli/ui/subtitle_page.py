@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import os
-import sys
 import time
 import traceback
+import re
+
 from typing import Any, List, Optional
 
 from PySide6.QtCore import (
@@ -13,10 +14,11 @@ from PySide6.QtCore import (
     Signal,
     Slot,
     QEventLoop,
+
 )
-from PySide6.QtGui import QCloseEvent
+
 from PySide6.QtWidgets import (
-    QApplication,
+    QWidget,
     QComboBox,
     QFileDialog,
     QGroupBox,
@@ -24,16 +26,15 @@ from PySide6.QtWidgets import (
     QLabel,
     QListWidget,
     QListWidgetItem,
-    QMainWindow,
     QMessageBox,
     QPushButton,
     QProgressBar,
     QPlainTextEdit,
     QVBoxLayout,
-    QWidget,
+    QScrollArea
 )
 
-from jobs.processor import JobProcessor
+from jobs.subtitles_processor import SubtitleJobProcessor
 
 
 # ==============================================================
@@ -81,7 +82,6 @@ LANGUAGES = {
 # ==============================================================
 
 class ProcessingWorker(QObject):
-    """Runs JobProcessor in a background QThread."""
 
     progress = Signal(str, str, int)
     error = Signal(str)
@@ -112,6 +112,7 @@ class ProcessingWorker(QObject):
         super().__init__()
 
         self.files = files
+
         self.source_language = source_language
         self.target_language = target_language
         self.subtitle_format = subtitle_format
@@ -119,7 +120,7 @@ class ProcessingWorker(QObject):
         self.overwrite_mode = overwrite_mode
         self.translation_mode = translation_mode
 
-        self.processor: Optional[JobProcessor] = None
+        self.processor: Optional[SubtitleJobProcessor] = None
 
         self._cancel_requested = False
 
@@ -128,7 +129,7 @@ class ProcessingWorker(QObject):
     # ==========================================================
 
     @Slot()
-    def request_cancel(self) -> None:
+    def request_cancel(self):
         self._cancel_requested = True
 
         if self.processor is not None:
@@ -138,7 +139,7 @@ class ProcessingWorker(QObject):
                 pass
 
     # ==========================================================
-    # ASK OVERWRITE
+    # OVERWRITE
     # ==========================================================
 
     def ask_overwrite(
@@ -156,9 +157,7 @@ class ProcessingWorker(QObject):
             "value": False,
         }
 
-        def receive_answer(
-            value: bool,
-        ) -> None:
+        def receive_answer(value: bool):
             result["value"] = bool(value)
             loop.quit()
 
@@ -184,7 +183,7 @@ class ProcessingWorker(QObject):
         return result["value"]
 
     # ==========================================================
-    # ASK TRANSLATION
+    # TRANSLATION
     # ==========================================================
 
     def ask_translation(
@@ -204,9 +203,7 @@ class ProcessingWorker(QObject):
             "value": False,
         }
 
-        def receive_answer(
-            value: bool,
-        ) -> None:
+        def receive_answer(value: bool):
             result["value"] = bool(value)
             loop.quit()
 
@@ -238,9 +235,11 @@ class ProcessingWorker(QObject):
     # ==========================================================
 
     @Slot()
-    def run(self) -> None:
+    def run(self):
+
         try:
-            self.processor = JobProcessor(
+
+            self.processor = SubtitleJobProcessor(
                 source_language=self.source_language,
                 target_language=self.target_language,
                 subtitle_format=self.subtitle_format,
@@ -271,6 +270,7 @@ class ProcessingWorker(QObject):
             self.finished.emit(results)
 
         except Exception as exc:
+
             if (
                 self._cancel_requested
                 or (
@@ -296,7 +296,7 @@ class ProcessingWorker(QObject):
         filename: Any,
         percentage: Any,
         *_,
-    ) -> None:
+    ):
 
         try:
             percentage = int(percentage)
@@ -321,48 +321,32 @@ class ProcessingWorker(QObject):
     def _error_callback(
         self,
         error: Any,
-    ) -> None:
+    ):
 
         if not self._cancel_requested:
             self.error.emit(str(error))
 
 
 # ==============================================================
-# MAIN WINDOW
+# SUBTITLE PAGE
 # ==============================================================
 
-class VeyraWindow(QMainWindow):
+class SubtitlePage(QWidget):
 
-    def __init__(self):
-        super().__init__()
+    def __init__(self, parent=None):
+        super().__init__(parent)
 
         self.worker: Optional[ProcessingWorker] = None
         self.thread: Optional[QThread] = None
 
         self.processing = False
 
-        self._close_after_cancel = False
-
-        # ======================================================
-        # ETA / TIMING STATE
-        # ======================================================
-
         self.processing_start_time: Optional[float] = None
 
         self.total_files = 0
         self.current_file_number = 0
         self.current_file_percentage = 0
-
         self.last_overall_percentage = 0
-
-        self.setWindowTitle(
-            "Veyra Subtitle Generator"
-        )
-
-        self.resize(
-            1050,
-            750,
-        )
 
         self._build_ui()
 
@@ -370,12 +354,87 @@ class VeyraWindow(QMainWindow):
     # UI
     # ==========================================================
 
-    def _build_ui(self) -> None:
+    def _build_ui(self):
 
-        central = QWidget()
-        self.setCentralWidget(central)
+        # ==========================================================
+        # SCROLL AREA
+        # ==========================================================
 
-        main_layout = QVBoxLayout(central)
+        scroll = QScrollArea(self)
+
+        scroll.setWidgetResizable(True)
+
+        scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarAlwaysOff
+        )
+
+        scroll.setVerticalScrollBarPolicy(
+            Qt.ScrollBarAsNeeded
+        )
+
+        # ==========================================================
+        # SCROLL CONTENT
+        # ==========================================================
+
+        content = QWidget()
+
+        main_layout = QVBoxLayout(content)
+
+        main_layout.setContentsMargins(
+            30,
+            25,
+            30,
+            25,
+        )
+
+        main_layout.setSpacing(15)
+
+        # Put the content inside the scroll area
+        scroll.setWidget(content)
+
+        # Put the scroll area on SubtitlePage
+        page_layout = QVBoxLayout(self)
+
+        page_layout.setContentsMargins(
+            0,
+            0,
+            0,
+            0,
+        )
+
+        page_layout.addWidget(scroll)
+
+        # ======================================================
+        # HEADER
+        # ======================================================
+
+        title = QLabel(
+            "Subtitle Generation"
+        )
+
+        title.setStyleSheet(
+            """
+            font-size: 28px;
+            font-weight: 700;
+            color: white;
+            """
+        )
+
+        main_layout.addWidget(title)
+
+        description = QLabel(
+            "Generate subtitles from your video files "
+            "and optionally translate them."
+        )
+
+        description.setStyleSheet(
+            """
+            color: #9ca3af;
+            font-size: 14px;
+            """
+        )
+
+        main_layout.addWidget(description)
 
         # ======================================================
         # LANGUAGE
@@ -436,7 +495,7 @@ class VeyraWindow(QMainWindow):
         )
 
         # ======================================================
-        # TRANSLATION MODE
+        # TRANSLATION
         # ======================================================
 
         translation_layout = QHBoxLayout()
@@ -533,8 +592,6 @@ class VeyraWindow(QMainWindow):
             "overwrite",
         )
 
-        self.overwrite_mode_combo.setCurrentIndex(0)
-
         overwrite_layout.addWidget(
             self.overwrite_mode_combo,
             1,
@@ -558,7 +615,7 @@ class VeyraWindow(QMainWindow):
             files_group
         )
 
-        buttons_layout = QHBoxLayout()
+        buttons = QHBoxLayout()
 
         self.add_files_button = QPushButton(
             "Add Files"
@@ -576,27 +633,25 @@ class VeyraWindow(QMainWindow):
             "Clear"
         )
 
-        buttons_layout.addWidget(
+        buttons.addWidget(
             self.add_files_button
         )
 
-        buttons_layout.addWidget(
+        buttons.addWidget(
             self.add_folder_button
         )
 
-        buttons_layout.addWidget(
+        buttons.addWidget(
             self.remove_file_button
         )
 
-        buttons_layout.addWidget(
+        buttons.addWidget(
             self.clear_files_button
         )
 
-        buttons_layout.addStretch()
+        buttons.addStretch()
 
-        files_layout.addLayout(
-            buttons_layout
-        )
+        files_layout.addLayout(buttons)
 
         self.file_list = QListWidget()
 
@@ -609,9 +664,11 @@ class VeyraWindow(QMainWindow):
             1,
         )
 
+        files_group.setMinimumHeight(180)
+        files_group.setMaximumHeight(260)
+
         main_layout.addWidget(
-            files_group,
-            1,
+            files_group
         )
 
         # ======================================================
@@ -622,8 +679,8 @@ class VeyraWindow(QMainWindow):
             "Ready."
         )
 
-        self.current_file_label.setTextInteractionFlags(
-            Qt.TextSelectableByMouse
+        self.current_file_label.setStyleSheet(
+            "color: #d1d5db;"
         )
 
         main_layout.addWidget(
@@ -640,8 +697,6 @@ class VeyraWindow(QMainWindow):
             0,
             100,
         )
-
-        self.progress_bar.setValue(0)
 
         main_layout.addWidget(
             self.progress_bar
@@ -660,7 +715,7 @@ class VeyraWindow(QMainWindow):
         )
 
         # ======================================================
-        # TIME / ETA
+        # TIME
         # ======================================================
 
         timing_layout = QHBoxLayout()
@@ -707,18 +762,20 @@ class VeyraWindow(QMainWindow):
 
         self.log.setReadOnly(True)
 
+        self.log.setMinimumHeight(180)
+        self.log.setMaximumHeight(250)
+
         main_layout.addWidget(
-            self.log,
-            1,
+            self.log
         )
 
         # ======================================================
         # CONTROLS
         # ======================================================
 
-        controls_layout = QHBoxLayout()
+        controls = QHBoxLayout()
 
-        controls_layout.addStretch()
+        controls.addStretch()
 
         self.start_button = QPushButton(
             "Generate Subtitles"
@@ -734,16 +791,16 @@ class VeyraWindow(QMainWindow):
 
         self.cancel_button.setEnabled(False)
 
-        controls_layout.addWidget(
+        controls.addWidget(
             self.start_button
         )
 
-        controls_layout.addWidget(
+        controls.addWidget(
             self.cancel_button
         )
 
         main_layout.addLayout(
-            controls_layout
+            controls
         )
 
         # ======================================================
@@ -775,24 +832,26 @@ class VeyraWindow(QMainWindow):
         )
 
     # ==========================================================
-    # LANGUAGE COMBO
+    # LANGUAGE
     # ==========================================================
 
     @staticmethod
     def _populate_language_combo(
         combo: QComboBox,
         include_none: bool,
-    ) -> None:
+    ):
 
         combo.clear()
 
         if include_none:
+
             combo.addItem(
                 "No translation",
                 None,
             )
 
         for code, name in LANGUAGES.items():
+
             combo.addItem(
                 f"{name} ({code})",
                 code,
@@ -803,7 +862,7 @@ class VeyraWindow(QMainWindow):
     # ==========================================================
 
     @Slot()
-    def add_files(self) -> None:
+    def add_files(self):
 
         if self.processing:
             return
@@ -825,7 +884,7 @@ class VeyraWindow(QMainWindow):
             self._add_files(files)
 
     @Slot()
-    def add_folder(self) -> None:
+    def add_folder(self):
 
         if self.processing:
             return
@@ -859,6 +918,7 @@ class VeyraWindow(QMainWindow):
         files = []
 
         for root, _, filenames in os.walk(folder):
+
             for filename in filenames:
 
                 extension = os.path.splitext(
@@ -866,6 +926,7 @@ class VeyraWindow(QMainWindow):
                 )[1].lower()
 
                 if extension in extensions:
+
                     files.append(
                         os.path.join(
                             root,
@@ -880,7 +941,7 @@ class VeyraWindow(QMainWindow):
     def _add_files(
         self,
         files: List[str],
-    ) -> None:
+    ):
 
         existing = {
             self.file_list.item(i).data(Qt.UserRole)
@@ -911,12 +972,13 @@ class VeyraWindow(QMainWindow):
         self._update_file_count()
 
     @Slot()
-    def remove_selected_files(self) -> None:
+    def remove_selected_files(self):
 
         if self.processing:
             return
 
         for item in self.file_list.selectedItems():
+
             self.file_list.takeItem(
                 self.file_list.row(item)
             )
@@ -924,7 +986,7 @@ class VeyraWindow(QMainWindow):
         self._update_file_count()
 
     @Slot()
-    def clear_files(self) -> None:
+    def clear_files(self):
 
         if self.processing:
             return
@@ -933,7 +995,7 @@ class VeyraWindow(QMainWindow):
 
         self._update_file_count()
 
-    def _update_file_count(self) -> None:
+    def _update_file_count(self):
 
         count = self.file_list.count()
 
@@ -945,7 +1007,9 @@ class VeyraWindow(QMainWindow):
 
         files = []
 
-        for index in range(self.file_list.count()):
+        for index in range(
+            self.file_list.count()
+        ):
 
             filepath = self.file_list.item(
                 index
@@ -959,11 +1023,11 @@ class VeyraWindow(QMainWindow):
         return files
 
     # ==========================================================
-    # START
+    # START PROCESSING
     # ==========================================================
 
     @Slot()
-    def start_processing(self) -> None:
+    def start_processing(self):
 
         if self.processing:
             return
@@ -971,11 +1035,13 @@ class VeyraWindow(QMainWindow):
         files = self.get_files()
 
         if not files:
+
             QMessageBox.warning(
                 self,
                 "No Media Files",
                 "Please add at least one media file.",
             )
+
             return
 
         source_language = (
@@ -999,76 +1065,44 @@ class VeyraWindow(QMainWindow):
         )
 
         if not source_language:
+
             QMessageBox.warning(
                 self,
                 "Source Language",
                 "Please select a source language.",
             )
+
             return
 
         if (
             target_language
             and target_language == source_language
         ):
+
             QMessageBox.warning(
                 self,
                 "Invalid Languages",
-                (
-                    "Source and target languages "
-                    "cannot be the same."
-                ),
+                "Source and target languages cannot be the same.",
             )
+
             return
 
         if not target_language:
             translation_mode = "skip"
-
-        source_name = LANGUAGES.get(
-            source_language,
-            source_language,
-        )
-
-        if target_language:
-
-            target_name = LANGUAGES.get(
-                target_language,
-                target_language,
-            )
-
-            translation_text = (
-                f"{target_name} ({target_language})"
-            )
-
-        else:
-            translation_text = "Disabled"
-
-        overwrite_names = {
-            "ask": "Ask me",
-            "overwrite": "Overwrite existing",
-            "keep": "Keep existing",
-        }
-
-        translation_names = {
-            "ask": "Ask when needed",
-            "translate": "Always translate",
-            "skip": "Never translate",
-        }
 
         answer = QMessageBox.question(
             self,
             "Start Processing",
             (
                 f"Files: {len(files)}\n"
-                f"Source: {source_name} ({source_language})\n"
-                f"Target: {translation_text}\n"
-                f"Format: {subtitle_format.upper()}\n"
-                f"Existing subtitles: "
-                f"{overwrite_names[overwrite_mode]}\n"
-                f"Translation: "
-                f"{translation_names[translation_mode]}\n\n"
+                f"Source: {source_language}\n"
+                f"Target: "
+                f"{target_language or 'disabled'}\n"
+                f"Format: {subtitle_format.upper()}\n\n"
                 "Start subtitle generation?"
             ),
-            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes
+            | QMessageBox.No,
             QMessageBox.Yes,
         )
 
@@ -1076,15 +1110,24 @@ class VeyraWindow(QMainWindow):
             return
 
         # ======================================================
-        # RESET ETA STATE
+        # RESET
         # ======================================================
 
         self.total_files = len(files)
+
         self.current_file_number = 1
+
         self.current_file_percentage = 0
+
         self.last_overall_percentage = 0
 
         self.processing_start_time = time.monotonic()
+
+        self.progress_bar.setValue(0)
+
+        self.progress_detail_label.setText(
+            "0%"
+        )
 
         self.elapsed_label.setText(
             "Elapsed: 00:00"
@@ -1093,14 +1136,6 @@ class VeyraWindow(QMainWindow):
         self.eta_label.setText(
             "ETA: calculating..."
         )
-
-        self.progress_detail_label.setText(
-            "0%"
-        )
-
-        self._set_processing(True)
-
-        self.progress_bar.setValue(0)
 
         self.current_file_label.setText(
             "Starting..."
@@ -1113,35 +1148,10 @@ class VeyraWindow(QMainWindow):
         self.log.clear()
 
         self.log_message(
-            "Starting Veyra..."
+            "Starting subtitle generation..."
         )
 
-        self.log_message(
-            f"Files: {len(files)}"
-        )
-
-        self.log_message(
-            f"Source language: {source_language}"
-        )
-
-        self.log_message(
-            f"Target language: "
-            f"{target_language or 'disabled'}"
-        )
-
-        self.log_message(
-            f"Format: {subtitle_format}"
-        )
-
-        self.log_message(
-            f"Existing subtitles: "
-            f"{overwrite_names[overwrite_mode]}"
-        )
-
-        self.log_message(
-            f"Translation: "
-            f"{translation_names[translation_mode]}"
-        )
+        self._set_processing(True)
 
         # ======================================================
         # THREAD
@@ -1163,16 +1173,12 @@ class VeyraWindow(QMainWindow):
         )
 
         # ======================================================
-        # START
+        # CONNECTIONS
         # ======================================================
 
         self.thread.started.connect(
             self.worker.run
         )
-
-        # ======================================================
-        # WORKER -> GUI
-        # ======================================================
 
         self.worker.progress.connect(
             self.update_progress
@@ -1190,10 +1196,6 @@ class VeyraWindow(QMainWindow):
             self.processing_cancelled
         )
 
-        # ======================================================
-        # QUESTIONS
-        # ======================================================
-
         self.worker.overwrite_requested.connect(
             self.show_overwrite_dialog,
             Qt.QueuedConnection,
@@ -1205,7 +1207,7 @@ class VeyraWindow(QMainWindow):
         )
 
         # ======================================================
-        # THREAD CLEANUP
+        # CLEANUP
         # ======================================================
 
         self.worker.finished.connect(
@@ -1239,19 +1241,10 @@ class VeyraWindow(QMainWindow):
     # ==========================================================
 
     @Slot()
-    def thread_finished(self) -> None:
+    def thread_finished(self):
 
         self.thread = None
         self.worker = None
-
-        if self._close_after_cancel:
-
-            self._close_after_cancel = False
-
-            app = QApplication.instance()
-
-            if app is not None:
-                app.quit()
 
     # ==========================================================
     # PROCESSING STATE
@@ -1260,7 +1253,7 @@ class VeyraWindow(QMainWindow):
     def _set_processing(
         self,
         processing: bool,
-    ) -> None:
+    ):
 
         self.processing = processing
 
@@ -1284,14 +1277,16 @@ class VeyraWindow(QMainWindow):
             enabled
         )
 
-        self.start_button.setEnabled(enabled)
+        self.start_button.setEnabled(
+            enabled
+        )
 
         self.cancel_button.setEnabled(
             processing
         )
 
     # ==========================================================
-    # TIME FORMAT
+    # TIME
     # ==========================================================
 
     @staticmethod
@@ -1299,8 +1294,10 @@ class VeyraWindow(QMainWindow):
         seconds: float,
     ) -> str:
 
-        if seconds < 0:
-            seconds = 0
+        seconds = max(
+            0,
+            seconds,
+        )
 
         total_seconds = int(seconds)
 
@@ -1313,6 +1310,7 @@ class VeyraWindow(QMainWindow):
         secs = total_seconds % 60
 
         if hours > 0:
+
             return (
                 f"{hours:02d}:"
                 f"{minutes:02d}:"
@@ -1325,7 +1323,7 @@ class VeyraWindow(QMainWindow):
         )
 
     # ==========================================================
-    # CALCULATE OVERALL PROGRESS
+    # OVERALL PROGRESS
     # ==========================================================
 
     def calculate_overall_progress(
@@ -1346,10 +1344,15 @@ class VeyraWindow(QMainWindow):
 
         percentage = max(
             0,
-            min(100, percentage),
+            min(
+                100,
+                percentage,
+            ),
         )
 
-        completed_files = current_file - 1
+        completed_files = (
+            current_file - 1
+        )
 
         overall = (
             (
@@ -1360,7 +1363,6 @@ class VeyraWindow(QMainWindow):
 
         overall = int(overall)
 
-        # Never allow the displayed progress to move backwards.
         overall = max(
             self.last_overall_percentage,
             overall,
@@ -1376,13 +1378,13 @@ class VeyraWindow(QMainWindow):
         return overall
 
     # ==========================================================
-    # ETA UPDATE
+    # TIMING
     # ==========================================================
 
     def update_timing(
         self,
         overall_percentage: int,
-    ) -> None:
+    ):
 
         if self.processing_start_time is None:
             return
@@ -1401,11 +1403,10 @@ class VeyraWindow(QMainWindow):
             f"{overall_percentage}%"
         )
 
-        # ------------------------------------------------------
-        # ETA
-        # ------------------------------------------------------
-
-        if overall_percentage <= 0 or elapsed <= 0:
+        if (
+            overall_percentage <= 0
+            or elapsed <= 0
+        ):
 
             self.eta_label.setText(
                 "ETA: calculating..."
@@ -1424,7 +1425,7 @@ class VeyraWindow(QMainWindow):
         estimated_total_time = (
             elapsed
             * 100.0
-            / float(overall_percentage)
+            / overall_percentage
         )
 
         remaining = (
@@ -1432,14 +1433,11 @@ class VeyraWindow(QMainWindow):
             - elapsed
         )
 
-        remaining = max(
-            0,
-            remaining,
-        )
-
         self.eta_label.setText(
             "ETA: "
-            + self.format_duration(remaining)
+            + self.format_duration(
+                max(0, remaining)
+            )
         )
 
     # ==========================================================
@@ -1452,24 +1450,15 @@ class VeyraWindow(QMainWindow):
         info: str,
         filename: str,
         percentage: int,
-    ) -> None:
+    ):
 
         percentage = max(
             0,
-            min(100, int(percentage)),
+            min(
+                100,
+                int(percentage),
+            ),
         )
-
-        # ------------------------------------------------------
-        # Determine current file number
-        #
-        # JobProcessor sends:
-        #
-        # Processing file 1 of 5
-        # Processing file 2 of 5
-        # ...
-        # ------------------------------------------------------
-
-        import re
 
         match = re.search(
             r"Processing\s+file\s+(\d+)\s+of\s+(\d+)",
@@ -1480,6 +1469,7 @@ class VeyraWindow(QMainWindow):
         if match:
 
             try:
+
                 self.current_file_number = int(
                     match.group(1)
                 )
@@ -1488,28 +1478,23 @@ class VeyraWindow(QMainWindow):
                     match.group(2)
                 )
 
-            except (ValueError, TypeError):
+            except (
+                ValueError,
+                TypeError,
+            ):
                 pass
 
         self.current_file_percentage = percentage
 
-        # ------------------------------------------------------
-        # Overall progress
-        # ------------------------------------------------------
-
-        overall_percentage = (
+        overall = (
             self.calculate_overall_progress(
                 percentage
             )
         )
 
         self.progress_bar.setValue(
-            overall_percentage
+            overall
         )
-
-        # ------------------------------------------------------
-        # Current file
-        # ------------------------------------------------------
 
         if filename:
 
@@ -1521,39 +1506,26 @@ class VeyraWindow(QMainWindow):
                 f"{filename}"
             )
 
-        # ------------------------------------------------------
-        # Status
-        # ------------------------------------------------------
-
         self.status_label.setText(
             info
         )
 
-        # ------------------------------------------------------
-        # ETA / ELAPSED
-        # ------------------------------------------------------
-
         self.update_timing(
-            overall_percentage
+            overall
         )
 
-        # ------------------------------------------------------
-        # LOG
-        # ------------------------------------------------------
-
-        text = (
-            f"[{overall_percentage:3d}%]"
-            f" "
+        self.log_message(
+            f"[{overall:3d}%] "
             f"[File "
             f"{self.current_file_number}/"
             f"{self.total_files}] "
             f"{info}"
+            + (
+                f" — {filename}"
+                if filename
+                else ""
+            )
         )
-
-        if filename:
-            text += f" — {filename}"
-
-        self.log_message(text)
 
     # ==========================================================
     # ERROR
@@ -1563,10 +1535,7 @@ class VeyraWindow(QMainWindow):
     def processing_error(
         self,
         message: str,
-    ) -> None:
-
-        if not self.processing:
-            return
+    ):
 
         self.log_message(
             f"ERROR: {message}"
@@ -1592,23 +1561,7 @@ class VeyraWindow(QMainWindow):
     def processing_finished(
         self,
         results: list,
-    ) -> None:
-
-        # ------------------------------------------------------
-        # FINAL TIMING
-        # ------------------------------------------------------
-
-        if self.processing_start_time is not None:
-
-            elapsed = (
-                time.monotonic()
-                - self.processing_start_time
-            )
-
-            self.elapsed_label.setText(
-                "Elapsed: "
-                + self.format_duration(elapsed)
-            )
+    ):
 
         self.progress_bar.setValue(100)
 
@@ -1637,20 +1590,21 @@ class VeyraWindow(QMainWindow):
             f"{len(results)} file(s)"
         )
 
-        # ------------------------------------------------------
-        # FINAL ELAPSED TIME IN LOG
-        # ------------------------------------------------------
-
-        if self.processing_start_time is not None:
+        if self.processing_start_time:
 
             elapsed = (
                 time.monotonic()
                 - self.processing_start_time
             )
 
+            self.elapsed_label.setText(
+                "Elapsed: "
+                + self.format_duration(elapsed)
+            )
+
             self.log_message(
-                f"Total elapsed time: "
-                f"{self.format_duration(elapsed)}"
+                "Total elapsed time: "
+                + self.format_duration(elapsed)
             )
 
         for result in results:
@@ -1701,19 +1655,7 @@ class VeyraWindow(QMainWindow):
     # ==========================================================
 
     @Slot()
-    def processing_cancelled(self) -> None:
-
-        if self.processing_start_time is not None:
-
-            elapsed = (
-                time.monotonic()
-                - self.processing_start_time
-            )
-
-            self.elapsed_label.setText(
-                "Elapsed: "
-                + self.format_duration(elapsed)
-            )
+    def processing_cancelled(self):
 
         self.eta_label.setText(
             "ETA: cancelled"
@@ -1734,7 +1676,7 @@ class VeyraWindow(QMainWindow):
     # ==========================================================
 
     @Slot()
-    def cancel_processing(self) -> None:
+    def cancel_processing(self):
 
         if not self.processing:
             return
@@ -1765,6 +1707,7 @@ class VeyraWindow(QMainWindow):
         self.cancel_button.setEnabled(False)
 
         if self.worker is not None:
+
             self.worker.request_cancel()
 
     # ==========================================================
@@ -1776,7 +1719,7 @@ class VeyraWindow(QMainWindow):
         self,
         filepath: str,
         subtitle_type: str,
-    ) -> None:
+    ):
 
         if not self.processing:
             return
@@ -1795,7 +1738,7 @@ class VeyraWindow(QMainWindow):
             QMessageBox.No,
         )
 
-        if self.worker is not None:
+        if self.worker:
 
             self.worker.overwrite_answer.emit(
                 answer == QMessageBox.Yes
@@ -1812,7 +1755,7 @@ class VeyraWindow(QMainWindow):
         target_language: str,
         source_subtitle: str,
         translated_subtitle: str,
-    ) -> None:
+    ):
 
         if not self.processing:
             return
@@ -1846,7 +1789,7 @@ class VeyraWindow(QMainWindow):
             QMessageBox.Yes,
         )
 
-        if self.worker is not None:
+        if self.worker:
 
             self.worker.translation_answer.emit(
                 answer == QMessageBox.Yes
@@ -1859,77 +1802,14 @@ class VeyraWindow(QMainWindow):
     def log_message(
         self,
         message: str,
-    ) -> None:
+    ):
 
         self.log.appendPlainText(
             str(message)
         )
 
-    # ==========================================================
-    # CLOSE
-    # ==========================================================
+        scrollbar = self.log.verticalScrollBar()
 
-    def closeEvent(
-        self,
-        event: QCloseEvent,
-    ) -> None:
-
-        if not self.processing:
-            event.accept()
-            return
-
-        answer = QMessageBox.question(
-            self,
-            "Veyra Is Processing",
-            (
-                "Subtitle processing is still running.\n\n"
-                "Cancel the current job and exit?"
-            ),
-            QMessageBox.Yes
-            | QMessageBox.No,
-            QMessageBox.No,
+        scrollbar.setValue(
+            scrollbar.maximum()
         )
-
-        if answer != QMessageBox.Yes:
-
-            event.ignore()
-            return
-
-        self._close_after_cancel = True
-
-        self.status_label.setText(
-            "Cancelling before exit..."
-        )
-
-        self.eta_label.setText(
-            "ETA: cancelling..."
-        )
-
-        self.cancel_button.setEnabled(False)
-
-        if self.worker is not None:
-            self.worker.request_cancel()
-
-        event.ignore()
-
-
-# ==============================================================
-# MAIN
-# ==============================================================
-
-def main() -> int:
-
-    app = QApplication(sys.argv)
-
-    app.setApplicationName("Veyra")
-    app.setOrganizationName("Veyra")
-
-    window = VeyraWindow()
-
-    window.show()
-
-    return app.exec()
-
-
-if __name__ == "__main__":
-    sys.exit(main())

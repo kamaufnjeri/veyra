@@ -265,7 +265,6 @@ Veyra also uses **Silero VAD** for local voice activity detection.
 
 Veyra is an independent project and is not affiliated with or endorsed by PyAutoSRT, Silero, or Google.
 
-## License
 
 ## License
 
