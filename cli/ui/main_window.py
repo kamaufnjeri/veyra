@@ -5,7 +5,7 @@ from PySide6.QtWidgets import (
 
 from ui.subtitle_page import SubtitlePage
 from cli.ui.media_download_page import DownloadPage
-from ui.sync_page import SyncPage
+from cli.ui.subtitle_sync_page import SyncPage
 
 
 class VeyraWindow(QMainWindow):
