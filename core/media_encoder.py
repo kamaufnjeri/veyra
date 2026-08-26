@@ -6,14 +6,21 @@ import shutil
 import subprocess
 import threading
 import time
-from typing import Any, Callable, Dict, List, Optional
+
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Optional,
+)
 
 
 class MediaEncoder:
     """
-    Intelligent MP4 processor.
+    Intelligent media processor.
 
-    TARGET MP4
+    MP4 TARGET
     ----------
     Video:
         H.264 / AVC1
@@ -24,8 +31,19 @@ class MediaEncoder:
 
     SUBTITLES
     ----------
-    Never copied.
-    Never embedded.
+    Subtitle behavior is controlled by MediaService.
+
+    preserve_subtitles=False
+        Do not copy/embed subtitle streams.
+
+    preserve_subtitles=True
+        Preserve embedded subtitle streams when possible.
+
+    IMPORTANT
+    ---------
+    MediaEncoder does NOT delete the original input file.
+
+    MediaService owns source-file cleanup.
 
     DECISION TREE
     -------------
@@ -33,7 +51,7 @@ class MediaEncoder:
         -> NOTHING
 
     H264 + AAC + yuv420p + non-MP4
-        -> REMUX ONLY
+        -> REMUX
 
     H264 + AAC + wrong pixel format
         -> VIDEO ENCODE ONLY
@@ -49,7 +67,8 @@ class MediaEncoder:
     wrong video + wrong audio
         -> ENCODE BOTH
 
-    The goal is to avoid unnecessary encoding.
+    Subtitles are never independently downloaded or selected here.
+    They are handled by yt-dlp / MediaService.
     """
 
     VIDEO_FORMATS = {
@@ -80,14 +99,23 @@ class MediaEncoder:
 
     def __init__(
         self,
-        progress_callback: Optional[Callable[..., None]] = None,
-        error_callback: Optional[Callable[[Any], None]] = None,
+        progress_callback: Optional[
+            Callable[..., None]
+        ] = None,
+        error_callback: Optional[
+            Callable[[Any], None]
+        ] = None,
         ffmpeg_path: Optional[str] = None,
         ffprobe_path: Optional[str] = None,
     ) -> None:
 
-        self.progress_callback = progress_callback
-        self.error_callback = error_callback
+        self.progress_callback = (
+            progress_callback
+        )
+
+        self.error_callback = (
+            error_callback
+        )
 
         self.ffmpeg_path = (
             ffmpeg_path
@@ -99,8 +127,13 @@ class MediaEncoder:
             or shutil.which("ffprobe")
         )
 
-        self._cancel_event = threading.Event()
-        self._process: Optional[subprocess.Popen] = None
+        self._cancel_event = (
+            threading.Event()
+        )
+
+        self._process: Optional[
+            subprocess.Popen
+        ] = None
 
         self._duration = 0.0
         self._started_at = 0.0
@@ -115,16 +148,20 @@ class MediaEncoder:
         input_filepath: str,
         output_format: str = "mp4",
         force_reencode: Optional[bool] = None,
+        preserve_subtitles: bool = False,
     ) -> Optional[str]:
 
         self.reset_cancel()
+
         self._require_ffmpeg()
 
         input_filepath = os.path.abspath(
-            input_filepath
+            str(input_filepath)
         )
 
-        if not os.path.isfile(input_filepath):
+        if not os.path.isfile(
+            input_filepath
+        ):
             raise FileNotFoundError(
                 input_filepath
             )
@@ -133,54 +170,81 @@ class MediaEncoder:
             output_format or ""
         ).strip().lower().lstrip(".")
 
-        if output_format not in self.VIDEO_FORMATS:
+        if (
+            output_format
+            not in self.VIDEO_FORMATS
+        ):
             raise ValueError(
-                f"Unsupported output format: {output_format}"
+                f"Unsupported output format: "
+                f"{output_format}"
             )
 
         if output_format == "mp4":
+
             return self._prepare_mp4(
-                input_filepath,
-                force_reencode,
+                input_filepath=input_filepath,
+                force_reencode=force_reencode,
+                preserve_subtitles=(
+                    bool(preserve_subtitles)
+                ),
             )
 
-        output_filepath = self._change_extension(
-            input_filepath,
-            output_format,
+        output_filepath = (
+            self._change_extension(
+                input_filepath,
+                output_format,
+            )
         )
 
         if (
-            os.path.abspath(output_filepath)
-            == os.path.abspath(input_filepath)
+            os.path.abspath(
+                output_filepath
+            )
+            == os.path.abspath(
+                input_filepath
+            )
         ):
             return input_filepath
 
         if force_reencode is True:
+
             return self._encode_video(
                 input_filepath,
                 output_filepath,
                 output_format,
             )
 
-        # First attempt a stream copy.
+        # ------------------------------------------------------
+        # Try stream copy first.
+        # ------------------------------------------------------
+
         try:
+
             self._remux(
                 input_filepath,
                 output_filepath,
                 output_format,
             )
 
-            if os.path.isfile(output_filepath):
-                self._safe_remove(input_filepath)
+            if os.path.isfile(
+                output_filepath
+            ):
                 return output_filepath
 
         except Exception:
+
             if self._cancel_event.is_set():
                 raise
 
-            self._safe_remove(output_filepath)
+            self._safe_remove(
+                output_filepath
+            )
 
-        # Only encode if remux isn't possible.
+        # ------------------------------------------------------
+        # Remux failed.
+        # Encode instead.
+        # ------------------------------------------------------
+
         return self._encode_video(
             input_filepath,
             output_filepath,
@@ -195,34 +259,52 @@ class MediaEncoder:
         self,
         input_filepath: str,
         force_reencode: Optional[bool],
+        preserve_subtitles: bool,
     ) -> Optional[str]:
 
         self._check_cancelled()
 
-        info = self._probe(input_filepath)
-
-        video_codec = self._normalize_codec(
-            info.get("video_codec")
+        info = self._probe(
+            input_filepath
         )
 
-        audio_codec = self._normalize_codec(
-            info.get("audio_codec")
+        video_codec = (
+            self._normalize_codec(
+                info.get(
+                    "video_codec"
+                )
+            )
+        )
+
+        audio_codec = (
+            self._normalize_codec(
+                info.get(
+                    "audio_codec"
+                )
+            )
         )
 
         pixel_format = str(
-            info.get("pixel_format", "")
+            info.get(
+                "pixel_format",
+                "",
+            )
             or ""
         ).strip().lower()
 
         duration = self._safe_float(
-            info.get("duration"),
+            info.get(
+                "duration"
+            ),
             0.0,
         )
 
         self._duration = duration
 
         extension = (
-            os.path.splitext(input_filepath)[1]
+            os.path.splitext(
+                input_filepath
+            )[1]
             .lower()
         )
 
@@ -240,10 +322,11 @@ class MediaEncoder:
         )
 
         # ------------------------------------------------------
-        # FORCE
+        # FORCE RE-ENCODE
         # ------------------------------------------------------
 
         if force_reencode is True:
+
             self._progress(
                 "Encoding H.264/AAC",
                 filename,
@@ -253,23 +336,28 @@ class MediaEncoder:
             return self._encode_mp4(
                 input_filepath,
                 output_filepath,
+                preserve_subtitles,
             )
 
         # ------------------------------------------------------
         # PERFECT MP4
         #
-        # ZERO FFMPEG.
+        # Zero FFmpeg.
         # ------------------------------------------------------
 
         if (
             extension == ".mp4"
-            and video_codec in self.H264_CODECS
-            and audio_codec in self.AAC_CODECS
-            and pixel_format == "yuv420p"
+            and video_codec
+            in self.H264_CODECS
+            and audio_codec
+            in self.AAC_CODECS
+            and pixel_format
+            == "yuv420p"
         ):
 
             self._progress(
-                "MP4 already compatible - no encoding",
+                "MP4 already compatible - "
+                "no encoding",
                 filename,
                 100,
             )
@@ -277,74 +365,87 @@ class MediaEncoder:
             return input_filepath
 
         # ------------------------------------------------------
-        # COMPATIBLE STREAMS, WRONG CONTAINER
+        # H264 + AAC + yuv420p
         #
-        # REMUX ONLY.
+        # Wrong container only.
+        # Remux.
         # ------------------------------------------------------
 
         if (
-            video_codec in self.H264_CODECS
-            and audio_codec in self.AAC_CODECS
-            and pixel_format == "yuv420p"
+            video_codec
+            in self.H264_CODECS
+            and audio_codec
+            in self.AAC_CODECS
+            and pixel_format
+            == "yuv420p"
         ):
 
             self._progress(
-                "Remuxing to MP4 - no re-encoding",
+                "Remuxing to MP4 - "
+                "no re-encoding",
                 filename,
                 0,
             )
 
             self._remux_video_audio(
-                input_filepath,
-                output_filepath,
+                input_filepath=input_filepath,
+                output_filepath=output_filepath,
                 copy_video=True,
                 copy_audio=True,
-            )
-
-            self._safe_remove(
-                input_filepath
+                preserve_subtitles=(
+                    preserve_subtitles
+                ),
             )
 
             self._progress(
                 "MP4 ready - no re-encoding",
-                os.path.basename(output_filepath),
+                os.path.basename(
+                    output_filepath
+                ),
                 100,
             )
 
             return output_filepath
 
         # ------------------------------------------------------
-        # H264 VIDEO + AAC AUDIO
-        # WRONG PIXEL FORMAT
+        # H264 + AAC
+        # Wrong pixel format.
         #
-        # Only video.
+        # Encode video.
+        # Copy audio.
         # ------------------------------------------------------
 
         if (
-            video_codec in self.H264_CODECS
-            and audio_codec in self.AAC_CODECS
-            and pixel_format != "yuv420p"
+            video_codec
+            in self.H264_CODECS
+            and audio_codec
+            in self.AAC_CODECS
+            and pixel_format
+            != "yuv420p"
         ):
 
             self._progress(
-                "Converting video pixel format only",
+                "Converting video pixel "
+                "format only",
                 filename,
                 0,
             )
 
             self._encode_video_only(
-                input_filepath,
-                output_filepath,
+                input_filepath=input_filepath,
+                output_filepath=output_filepath,
                 copy_audio=True,
-            )
-
-            self._safe_remove(
-                input_filepath
+                preserve_subtitles=(
+                    preserve_subtitles
+                ),
             )
 
             self._progress(
-                "MP4 ready - audio was not re-encoded",
-                os.path.basename(output_filepath),
+                "MP4 ready - audio was "
+                "not re-encoded",
+                os.path.basename(
+                    output_filepath
+                ),
                 100,
             )
 
@@ -352,34 +453,40 @@ class MediaEncoder:
 
         # ------------------------------------------------------
         # H264 VIDEO
-        # WRONG AUDIO
+        # Wrong audio.
         #
         # Copy video.
         # Encode audio.
         # ------------------------------------------------------
 
-        if video_codec in self.H264_CODECS:
+        if (
+            video_codec
+            in self.H264_CODECS
+        ):
 
             self._progress(
-                "H.264 detected - converting audio only",
+                "H.264 detected - "
+                "converting audio only",
                 filename,
                 0,
             )
 
             self._remux_video_audio(
-                input_filepath,
-                output_filepath,
+                input_filepath=input_filepath,
+                output_filepath=output_filepath,
                 copy_video=True,
                 copy_audio=False,
-            )
-
-            self._safe_remove(
-                input_filepath
+                preserve_subtitles=(
+                    preserve_subtitles
+                ),
             )
 
             self._progress(
-                "MP4 ready - video was not re-encoded",
-                os.path.basename(output_filepath),
+                "MP4 ready - video was "
+                "not re-encoded",
+                os.path.basename(
+                    output_filepath
+                ),
                 100,
             )
 
@@ -387,33 +494,39 @@ class MediaEncoder:
 
         # ------------------------------------------------------
         # AAC AUDIO
-        # WRONG VIDEO
+        # Wrong video.
         #
-        # Copy audio.
         # Encode video.
+        # Copy audio.
         # ------------------------------------------------------
 
-        if audio_codec in self.AAC_CODECS:
+        if (
+            audio_codec
+            in self.AAC_CODECS
+        ):
 
             self._progress(
-                "AAC detected - converting video only",
+                "AAC detected - "
+                "converting video only",
                 filename,
                 0,
             )
 
             self._encode_video_only(
-                input_filepath,
-                output_filepath,
+                input_filepath=input_filepath,
+                output_filepath=output_filepath,
                 copy_audio=True,
-            )
-
-            self._safe_remove(
-                input_filepath
+                preserve_subtitles=(
+                    preserve_subtitles
+                ),
             )
 
             self._progress(
-                "MP4 ready - audio was not re-encoded",
-                os.path.basename(output_filepath),
+                "MP4 ready - audio was "
+                "not re-encoded",
+                os.path.basename(
+                    output_filepath
+                ),
                 100,
             )
 
@@ -422,11 +535,12 @@ class MediaEncoder:
         # ------------------------------------------------------
         # BOTH WRONG
         #
-        # Only here do we encode both.
+        # Encode video + audio.
         # ------------------------------------------------------
 
         self._progress(
-            "Converting video to H.264 and audio to AAC",
+            "Converting video to H.264 "
+            "and audio to AAC",
             filename,
             0,
         )
@@ -434,6 +548,7 @@ class MediaEncoder:
         return self._encode_mp4(
             input_filepath,
             output_filepath,
+            preserve_subtitles,
         )
 
     # ==========================================================
@@ -446,6 +561,7 @@ class MediaEncoder:
         output_filepath: str,
         copy_video: bool,
         copy_audio: bool,
+        preserve_subtitles: bool = False,
     ) -> None:
 
         temp_filepath = self._temp_path(
@@ -461,57 +577,115 @@ class MediaEncoder:
 
             "-map",
             "0:v:0",
+
             "-map",
             "0:a:0?",
         ]
 
+        # ------------------------------------------------------
+        # Embedded subtitles are preserved only when explicitly
+        # requested.
+        # ------------------------------------------------------
+
+        if preserve_subtitles:
+
+            command += [
+                "-map",
+                "0:s:0?",
+            ]
+
+        # ------------------------------------------------------
+        # VIDEO
+        # ------------------------------------------------------
+
         if copy_video:
+
             command += [
                 "-c:v",
                 "copy",
             ]
+
         else:
+
             command += [
                 "-c:v",
                 "libx264",
+
                 "-preset",
                 "ultrafast",
+
                 "-crf",
                 "23",
+
                 "-pix_fmt",
                 "yuv420p",
             ]
 
+        # ------------------------------------------------------
+        # AUDIO
+        # ------------------------------------------------------
+
         if copy_audio:
+
             command += [
                 "-c:a",
                 "copy",
             ]
+
         else:
+
             command += [
                 "-c:a",
                 "aac",
+
                 "-b:a",
                 "160k",
             ]
 
+        # ------------------------------------------------------
+        # SUBTITLES
+        # ------------------------------------------------------
+
+        if preserve_subtitles:
+
+            command += [
+                "-c:s",
+                "mov_text",
+            ]
+
+        else:
+
+            command += [
+                "-sn",
+            ]
+
         command += [
-            "-sn",
             "-dn",
+
             "-movflags",
             "+faststart",
+
             "-progress",
             "pipe:1",
+
             "-nostats",
+
             temp_filepath,
         ]
 
         try:
-            self._run(command)
 
-            if not os.path.isfile(temp_filepath):
+            self._run(
+                command
+            )
+
+            if not os.path.isfile(
+                temp_filepath
+            ):
+
                 raise RuntimeError(
-                    "FFmpeg did not create the MP4."
+                    "FFmpeg did not create "
+                    "the MP4."
                 )
 
             self._safe_remove(
@@ -524,6 +698,7 @@ class MediaEncoder:
             )
 
         finally:
+
             self._safe_remove(
                 temp_filepath
             )
@@ -537,6 +712,7 @@ class MediaEncoder:
         input_filepath: str,
         output_filepath: str,
         copy_audio: bool = True,
+        preserve_subtitles: bool = False,
     ) -> None:
 
         temp_filepath = self._temp_path(
@@ -552,13 +728,13 @@ class MediaEncoder:
 
             "-map",
             "0:v:0",
+
             "-map",
             "0:a:0?",
 
             "-c:v",
             "libx264",
 
-            # Fast encoding.
             "-preset",
             "ultrafast",
 
@@ -569,36 +745,74 @@ class MediaEncoder:
             "yuv420p",
         ]
 
+        # ------------------------------------------------------
+        # AUDIO
+        # ------------------------------------------------------
+
         if copy_audio:
+
             command += [
                 "-c:a",
                 "copy",
             ]
+
         else:
+
             command += [
                 "-c:a",
                 "aac",
+
                 "-b:a",
                 "160k",
             ]
 
+        # ------------------------------------------------------
+        # SUBTITLES
+        # ------------------------------------------------------
+
+        if preserve_subtitles:
+
+            command += [
+                "-map",
+                "0:s:0?",
+
+                "-c:s",
+                "mov_text",
+            ]
+
+        else:
+
+            command += [
+                "-sn",
+            ]
+
         command += [
-            "-sn",
             "-dn",
+
             "-movflags",
             "+faststart",
+
             "-progress",
             "pipe:1",
+
             "-nostats",
+
             temp_filepath,
         ]
 
         try:
-            self._run(command)
 
-            if not os.path.isfile(temp_filepath):
+            self._run(
+                command
+            )
+
+            if not os.path.isfile(
+                temp_filepath
+            ):
+
                 raise RuntimeError(
-                    "FFmpeg failed to encode the video."
+                    "FFmpeg failed to "
+                    "encode the video."
                 )
 
             self._safe_remove(
@@ -611,6 +825,7 @@ class MediaEncoder:
             )
 
         finally:
+
             self._safe_remove(
                 temp_filepath
             )
@@ -623,6 +838,7 @@ class MediaEncoder:
         self,
         input_filepath: str,
         output_filepath: str,
+        preserve_subtitles: bool = False,
     ) -> Optional[str]:
 
         temp_filepath = self._temp_path(
@@ -638,6 +854,7 @@ class MediaEncoder:
 
             "-map",
             "0:v:0",
+
             "-map",
             "0:a:0?",
 
@@ -658,8 +875,29 @@ class MediaEncoder:
 
             "-b:a",
             "160k",
+        ]
 
-            "-sn",
+        # ------------------------------------------------------
+        # SUBTITLES
+        # ------------------------------------------------------
+
+        if preserve_subtitles:
+
+            command += [
+                "-map",
+                "0:s:0?",
+
+                "-c:s",
+                "mov_text",
+            ]
+
+        else:
+
+            command += [
+                "-sn",
+            ]
+
+        command += [
             "-dn",
 
             "-movflags",
@@ -667,17 +905,25 @@ class MediaEncoder:
 
             "-progress",
             "pipe:1",
+
             "-nostats",
 
             temp_filepath,
         ]
 
         try:
-            self._run(command)
 
-            if not os.path.isfile(temp_filepath):
+            self._run(
+                command
+            )
+
+            if not os.path.isfile(
+                temp_filepath
+            ):
+
                 raise RuntimeError(
-                    "FFmpeg did not create the H.264 MP4."
+                    "FFmpeg did not create "
+                    "the H.264/AAC MP4."
                 )
 
             self._safe_remove(
@@ -689,19 +935,18 @@ class MediaEncoder:
                 output_filepath,
             )
 
-            self._safe_remove(
-                input_filepath
-            )
-
             self._progress(
                 "H.264/AAC MP4 complete",
-                os.path.basename(output_filepath),
+                os.path.basename(
+                    output_filepath
+                ),
                 100,
             )
 
             return output_filepath
 
         finally:
+
             self._safe_remove(
                 temp_filepath
             )
@@ -717,8 +962,17 @@ class MediaEncoder:
         output_format: str,
     ) -> Optional[str]:
 
-        self._duration = self._probe_duration(
-            input_filepath
+        self._duration = (
+            self._probe_duration(
+                input_filepath
+            )
+        )
+
+        temp_filepath = (
+            self._temp_path_generic(
+                output_filepath,
+                "veyra-encode",
+            )
         )
 
         command = [
@@ -729,10 +983,12 @@ class MediaEncoder:
 
             "-map",
             "0:v:0",
+
             "-map",
             "0:a:0?",
 
             "-sn",
+
             "-dn",
         ]
 
@@ -743,34 +999,59 @@ class MediaEncoder:
         command += [
             "-progress",
             "pipe:1",
+
             "-nostats",
-            output_filepath,
+
+            temp_filepath,
         ]
 
         self._progress(
             "Encoding media",
-            os.path.basename(input_filepath),
+            os.path.basename(
+                input_filepath
+            ),
             0,
         )
 
-        self._run(command)
+        try:
 
-        if not os.path.isfile(output_filepath):
-            raise RuntimeError(
-                "FFmpeg output was not created."
+            self._run(
+                command
             )
 
-        self._safe_remove(
-            input_filepath
-        )
+            if not os.path.isfile(
+                temp_filepath
+            ):
 
-        self._progress(
-            "Media encoding complete",
-            os.path.basename(output_filepath),
-            100,
-        )
+                raise RuntimeError(
+                    "FFmpeg output was "
+                    "not created."
+                )
 
-        return output_filepath
+            self._safe_remove(
+                output_filepath
+            )
+
+            os.replace(
+                temp_filepath,
+                output_filepath,
+            )
+
+            self._progress(
+                "Media encoding complete",
+                os.path.basename(
+                    output_filepath
+                ),
+                100,
+            )
+
+            return output_filepath
+
+        finally:
+
+            self._safe_remove(
+                temp_filepath
+            )
 
     # ==========================================================
     # REMUX
@@ -783,6 +1064,13 @@ class MediaEncoder:
         output_format: str,
     ) -> None:
 
+        temp_filepath = (
+            self._temp_path_generic(
+                output_filepath,
+                "veyra-remux",
+            )
+        )
+
         command = [
             self.ffmpeg_path,
             "-y",
@@ -791,6 +1079,7 @@ class MediaEncoder:
 
             "-map",
             "0:v:0",
+
             "-map",
             "0:a:0?",
 
@@ -798,10 +1087,12 @@ class MediaEncoder:
             "copy",
 
             "-sn",
+
             "-dn",
         ]
 
         if output_format == "mp4":
+
             command += [
                 "-movflags",
                 "+faststart",
@@ -810,11 +1101,41 @@ class MediaEncoder:
         command += [
             "-progress",
             "pipe:1",
+
             "-nostats",
-            output_filepath,
+
+            temp_filepath,
         ]
 
-        self._run(command)
+        try:
+
+            self._run(
+                command
+            )
+
+            if not os.path.isfile(
+                temp_filepath
+            ):
+
+                raise RuntimeError(
+                    "FFmpeg remux output "
+                    "was not created."
+                )
+
+            self._safe_remove(
+                output_filepath
+            )
+
+            os.replace(
+                temp_filepath,
+                output_filepath,
+            )
+
+        finally:
+
+            self._safe_remove(
+                temp_filepath
+            )
 
     # ==========================================================
     # PROBE
@@ -837,7 +1158,9 @@ class MediaEncoder:
             "-show_entries",
             (
                 "format=duration:"
-                "stream=codec_type,codec_name,pix_fmt"
+                "stream=codec_type,"
+                "codec_name,"
+                "pix_fmt"
             ),
 
             "-of",
@@ -847,6 +1170,7 @@ class MediaEncoder:
         ]
 
         try:
+
             result = subprocess.run(
                 command,
                 capture_output=True,
@@ -855,17 +1179,22 @@ class MediaEncoder:
                 errors="replace",
                 check=False,
             )
+
         except Exception:
+
             return {}
 
         if result.returncode != 0:
             return {}
 
         try:
+
             data = json.loads(
                 result.stdout
             )
+
         except Exception:
+
             return {}
 
         video_codec = None
@@ -877,7 +1206,10 @@ class MediaEncoder:
             [],
         ):
 
-            if not isinstance(stream, dict):
+            if not isinstance(
+                stream,
+                dict,
+            ):
                 continue
 
             codec_type = stream.get(
@@ -888,6 +1220,7 @@ class MediaEncoder:
                 codec_type == "video"
                 and video_codec is None
             ):
+
                 video_codec = stream.get(
                     "codec_name"
                 )
@@ -900,15 +1233,21 @@ class MediaEncoder:
                 codec_type == "audio"
                 and audio_codec is None
             ):
+
                 audio_codec = stream.get(
                     "codec_name"
                 )
 
-        duration = self._safe_float(
-            data.get("format", {}).get(
-                "duration"
-            ),
-            0.0,
+        duration = (
+            self._safe_float(
+                data.get(
+                    "format",
+                    {},
+                ).get(
+                    "duration"
+                ),
+                0.0,
+            )
         )
 
         return {
@@ -924,7 +1263,11 @@ class MediaEncoder:
     ) -> float:
 
         return self._safe_float(
-            self._probe(filepath).get("duration"),
+            self._probe(
+                filepath
+            ).get(
+                "duration"
+            ),
             0.0,
         )
 
@@ -940,13 +1283,17 @@ class MediaEncoder:
     ) -> Optional[str]:
 
         self.reset_cancel()
+
         self._require_ffmpeg()
 
         input_filepath = os.path.abspath(
-            input_filepath
+            str(input_filepath)
         )
 
-        if not os.path.isfile(input_filepath):
+        if not os.path.isfile(
+            input_filepath
+        ):
+
             raise FileNotFoundError(
                 input_filepath
             )
@@ -955,19 +1302,35 @@ class MediaEncoder:
             output_format
         ).strip().lower().lstrip(".")
 
-        if output_format not in self.AUDIO_FORMATS:
+        if (
+            output_format
+            not in self.AUDIO_FORMATS
+        ):
+
             raise ValueError(
-                f"Unsupported audio format: {output_format}"
+                f"Unsupported audio format: "
+                f"{output_format}"
             )
 
         output_filepath = (
-            os.path.splitext(input_filepath)[0]
+            os.path.splitext(
+                input_filepath
+            )[0]
             + "."
             + output_format
         )
 
-        self._duration = self._probe_duration(
-            input_filepath
+        temp_filepath = (
+            self._temp_path_generic(
+                output_filepath,
+                "veyra-audio",
+            )
+        )
+
+        self._duration = (
+            self._probe_duration(
+                input_filepath
+            )
         )
 
         command = [
@@ -983,35 +1346,58 @@ class MediaEncoder:
 
             "-progress",
             "pipe:1",
+
             "-nostats",
 
-            output_filepath,
+            temp_filepath,
         ]
 
         self._progress(
             "Encoding audio",
-            os.path.basename(input_filepath),
+            os.path.basename(
+                input_filepath
+            ),
             0,
         )
 
-        self._run(command)
+        try:
 
-        if not os.path.isfile(output_filepath):
-            raise RuntimeError(
-                "Audio encoding failed."
+            self._run(
+                command
             )
 
-        self._safe_remove(
-            input_filepath
-        )
+            if not os.path.isfile(
+                temp_filepath
+            ):
 
-        self._progress(
-            "Audio encoding complete",
-            os.path.basename(output_filepath),
-            100,
-        )
+                raise RuntimeError(
+                    "Audio encoding failed."
+                )
 
-        return output_filepath
+            self._safe_remove(
+                output_filepath
+            )
+
+            os.replace(
+                temp_filepath,
+                output_filepath,
+            )
+
+            self._progress(
+                "Audio encoding complete",
+                os.path.basename(
+                    output_filepath
+                ),
+                100,
+            )
+
+            return output_filepath
+
+        finally:
+
+            self._safe_remove(
+                temp_filepath
+            )
 
     # ==========================================================
     # FFMPEG ARGUMENTS
@@ -1023,18 +1409,23 @@ class MediaEncoder:
     ) -> List[str]:
 
         if output_format == "mp4":
+
             return [
                 "-c:v",
                 "libx264",
+
                 "-preset",
                 "ultrafast",
+
                 "-crf",
                 "23",
+
                 "-pix_fmt",
                 "yuv420p",
 
                 "-c:a",
                 "aac",
+
                 "-b:a",
                 "160k",
 
@@ -1043,43 +1434,55 @@ class MediaEncoder:
             ]
 
         if output_format == "webm":
+
             return [
                 "-c:v",
                 "libvpx-vp9",
+
                 "-deadline",
                 "realtime",
+
                 "-cpu-used",
                 "8",
+
                 "-crf",
                 "32",
+
                 "-b:v",
                 "0",
 
                 "-c:a",
                 "libopus",
+
                 "-b:a",
                 "128k",
             ]
 
         if output_format == "mkv":
+
             return [
                 "-c:v",
                 "libx264",
+
                 "-preset",
                 "ultrafast",
+
                 "-crf",
                 "23",
+
                 "-pix_fmt",
                 "yuv420p",
 
                 "-c:a",
                 "aac",
+
                 "-b:a",
                 "160k",
             ]
 
         raise ValueError(
-            f"Unsupported format: {output_format}"
+            f"Unsupported format: "
+            f"{output_format}"
         )
 
     # ==========================================================
@@ -1093,10 +1496,16 @@ class MediaEncoder:
 
         self._check_cancelled()
 
-        self._started_at = time.monotonic()
+        self._started_at = (
+            time.monotonic()
+        )
+
         self._last_emit = 0.0
 
-        process: Optional[subprocess.Popen] = None
+        process: Optional[
+            subprocess.Popen
+        ] = None
+
         return_code = -1
 
         stderr_lines: List[str] = []
@@ -1105,23 +1514,31 @@ class MediaEncoder:
 
             process = subprocess.Popen(
                 command,
+
                 stdout=subprocess.PIPE,
+
                 stderr=subprocess.PIPE,
+
                 text=True,
+
                 encoding="utf-8",
+
                 errors="replace",
+
                 bufsize=1,
             )
 
             self._process = process
 
-            stderr_thread = threading.Thread(
-                target=self._read_stderr,
-                args=(
-                    process,
-                    stderr_lines,
-                ),
-                daemon=True,
+            stderr_thread = (
+                threading.Thread(
+                    target=self._read_stderr,
+                    args=(
+                        process,
+                        stderr_lines,
+                    ),
+                    daemon=True,
+                )
             )
 
             stderr_thread.start()
@@ -1140,17 +1557,22 @@ class MediaEncoder:
                     ):
                         continue
 
-                    key, value = line.split(
-                        "=",
-                        1,
+                    key, value = (
+                        line.split(
+                            "=",
+                            1,
+                        )
                     )
 
                     if key == "out_time_ms":
+
                         self._ffmpeg_progress(
                             value
                         )
 
-            return_code = process.wait()
+            return_code = (
+                process.wait()
+            )
 
             stderr_thread.join(
                 timeout=2
@@ -1190,13 +1612,18 @@ class MediaEncoder:
             return
 
         try:
+
             for line in process.stderr:
+
                 line = line.strip()
 
                 if line:
-                    lines.append(line)
+                    lines.append(
+                        line
+                    )
 
         except Exception:
+
             pass
 
     # ==========================================================
@@ -1209,22 +1636,27 @@ class MediaEncoder:
     ) -> None:
 
         try:
+
             seconds = (
                 float(out_time_ms)
                 / 1_000_000.0
             )
+
         except (
             TypeError,
             ValueError,
         ):
+
             return
 
         if self._duration <= 0:
+
             self._progress(
                 "Processing media",
                 "Media",
                 0,
             )
+
             return
 
         percentage = int(
@@ -1247,12 +1679,14 @@ class MediaEncoder:
             now - self._last_emit
             < 0.20
         ):
+
             return
 
         self._last_emit = now
 
         elapsed = (
-            now - self._started_at
+            now
+            - self._started_at
         )
 
         speed = "--"
@@ -1267,13 +1701,17 @@ class MediaEncoder:
                 seconds / elapsed
             )
 
-            speed = f"{ratio:.2f}x"
+            speed = (
+                f"{ratio:.2f}x"
+            )
 
             if ratio > 0:
+
                 eta = int(
                     max(
                         0,
-                        self._duration - seconds,
+                        self._duration
+                        - seconds,
                     )
                     / ratio
                 )
@@ -1284,29 +1722,40 @@ class MediaEncoder:
             percentage,
             None,
             speed,
-            self._format_seconds(eta),
+            self._format_seconds(
+                eta
+            ),
         )
 
     # ==========================================================
     # CANCEL
     # ==========================================================
 
-    def cancel(self) -> None:
+    def cancel(
+        self,
+    ) -> None:
 
         self._cancel_event.set()
 
         process = self._process
 
         if process is not None:
+
             try:
                 process.terminate()
+
             except Exception:
                 pass
 
-    def reset_cancel(self) -> None:
+    def reset_cancel(
+        self,
+    ) -> None:
+
         self._cancel_event.clear()
 
-    def _check_cancelled(self) -> None:
+    def _check_cancelled(
+        self,
+    ) -> None:
 
         if not self._cancel_event.is_set():
             return
@@ -1314,8 +1763,10 @@ class MediaEncoder:
         process = self._process
 
         if process is not None:
+
             try:
                 process.kill()
+
             except Exception:
                 pass
 
@@ -1327,9 +1778,12 @@ class MediaEncoder:
     # VALIDATION
     # ==========================================================
 
-    def _require_ffmpeg(self) -> None:
+    def _require_ffmpeg(
+        self,
+    ) -> None:
 
         if not self.ffmpeg_path:
+
             raise RuntimeError(
                 "FFmpeg was not found. "
                 "Install FFmpeg and make sure "
@@ -1353,9 +1807,13 @@ class MediaEncoder:
             "avc",
             "avc1",
         }:
+
             return "h264"
 
-        if value.startswith("mp4a"):
+        if value.startswith(
+            "mp4a"
+        ):
+
             return "aac"
 
         return value
@@ -1375,17 +1833,46 @@ class MediaEncoder:
         )
 
     @staticmethod
+    def _temp_path_generic(
+        output_filepath: str,
+        suffix: str,
+    ) -> str:
+
+        extension = (
+            os.path.splitext(
+                output_filepath
+            )[1]
+        )
+
+        base = os.path.splitext(
+            output_filepath
+        )[0]
+
+        return (
+            f"{base}.{suffix}.tmp"
+            f"{extension}"
+        )
+
+    @staticmethod
     def _safe_remove(
         filepath: str,
     ) -> None:
 
         try:
+
             if (
                 filepath
-                and os.path.isfile(filepath)
+                and os.path.isfile(
+                    filepath
+                )
             ):
-                os.remove(filepath)
+
+                os.remove(
+                    filepath
+                )
+
         except OSError:
+
             pass
 
     @staticmethod
@@ -1395,7 +1882,9 @@ class MediaEncoder:
     ) -> str:
 
         return (
-            os.path.splitext(filepath)[0]
+            os.path.splitext(
+                filepath
+            )[0]
             + "."
             + extension
         )
@@ -1407,11 +1896,14 @@ class MediaEncoder:
     ) -> float:
 
         try:
+
             return float(value)
+
         except (
             TypeError,
             ValueError,
         ):
+
             return default
 
     # ==========================================================
@@ -1440,6 +1932,7 @@ class MediaEncoder:
         )
 
         try:
+
             self.progress_callback(
                 info,
                 filename,
@@ -1452,11 +1945,13 @@ class MediaEncoder:
         except TypeError:
 
             try:
+
                 self.progress_callback(
                     info,
                     filename,
                     percentage,
                 )
+
             except Exception:
                 pass
 
@@ -1476,14 +1971,17 @@ class MediaEncoder:
             return "--:--"
 
         try:
+
             value = max(
                 0,
                 int(value),
             )
+
         except (
             TypeError,
             ValueError,
         ):
+
             return "--:--"
 
         hours, remainder = divmod(
@@ -1497,6 +1995,7 @@ class MediaEncoder:
         )
 
         if hours:
+
             return (
                 f"{hours:02d}:"
                 f"{minutes:02d}:"

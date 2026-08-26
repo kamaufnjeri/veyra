@@ -1,9 +1,16 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Callable, Dict, Optional
 
-from core.video_downloader import VideoDownloader
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Optional,
+    Set,
+)
+
+from core.media_downloader import MediaDownloader
 from core.media_encoder import MediaEncoder
 from core.media_info import MediaInfo
 
@@ -24,40 +31,54 @@ class MediaService:
             Subtitles only.
 
         video_subtitles
-            Video + audio + separate subtitles.
+            Video + audio with optional subtitle handling.
 
-    Public progress:
+    Subtitle behavior:
 
-        percentage
-        downloaded
-        speed
-        eta
+        embed_subtitles=False
+        save_separate_subtitle=True
+            -> separate subtitle only
 
-    Overall progress:
+        embed_subtitles=True
+        save_separate_subtitle=True
+            -> embedded + separate
 
-        VIDEO
-            download   0 -> 90
-            processing 90 -> 100
+        embed_subtitles=True
+        save_separate_subtitle=False
+            -> embedded only
 
-        VIDEO + SUBTITLES
-            video       0 -> 85
-            subtitles  85 -> 90
-            processing  90 -> 100
+        embed_subtitles=False
+        save_separate_subtitle=False
+            -> no subtitles
 
-        AUDIO
-            download    0 -> 100
+    Defaults:
 
-        SUBTITLES
-            download    0 -> 100
+        embed_subtitles=False
+        save_separate_subtitle=True
 
-    Subtitles are NEVER embedded.
+    Processing flow:
+
+        Downloader
+            ↓
+        yt-dlp post-processing
+            ↓
+        final downloaded media
+            ↓
+        MediaEncoder compatibility check
+            ↓
+        final MP4
+            ↓
+        cleanup of temporary yt-dlp files
+
+    MediaEncoder remains responsible only for final
+    video compatibility/processing.
     """
 
     DOWNLOAD_MODES = {
-        "video_subtitles",
         "video",
         "audio",
         "subtitles",
+        "video_subtitles",
     }
 
     SUBTITLE_TYPES = {
@@ -94,7 +115,7 @@ class MediaService:
             Callable[..., None]
         ] = None,
         video_downloader: Optional[
-            VideoDownloader
+            MediaDownloader
         ] = None,
         encoder: Optional[
             MediaEncoder
@@ -125,12 +146,12 @@ class MediaService:
         self._progress_stage = "idle"
 
         # ------------------------------------------------------
-        # ONE downloader.
+        # Downloader
         # ------------------------------------------------------
 
         self.video_downloader = (
             video_downloader
-            or VideoDownloader(
+            or MediaDownloader(
                 progress_callback=(
                     self._core_progress
                 ),
@@ -141,7 +162,7 @@ class MediaService:
         )
 
         # ------------------------------------------------------
-        # ONE encoder owned by MediaService.
+        # Encoder
         # ------------------------------------------------------
 
         self.encoder = (
@@ -155,6 +176,10 @@ class MediaService:
                 ),
             )
         )
+
+        # ------------------------------------------------------
+        # Media information
+        # ------------------------------------------------------
 
         self.media_info = (
             media_info
@@ -263,8 +288,10 @@ class MediaService:
 
         self.reset_cancel()
 
-        settings = self._normalize_settings(
-            settings
+        settings = (
+            self._normalize_settings(
+                settings
+            )
         )
 
         self._validate_settings(
@@ -275,8 +302,10 @@ class MediaService:
             "download_mode"
         ]
 
-        filename = self._display_name(
-            settings
+        filename = (
+            self._display_name(
+                settings
+            )
         )
 
         self._progress_stage = (
@@ -294,8 +323,10 @@ class MediaService:
 
         if self.cancelled:
 
-            return self._cancelled_result(
-                settings
+            return (
+                self._cancelled_result(
+                    settings
+                )
             )
 
         try:
@@ -335,13 +366,20 @@ class MediaService:
             else:
 
                 raise ValueError(
-                    f"Unsupported download mode: {mode}"
+                    f"Unsupported download mode: "
+                    f"{mode}"
                 )
 
             if self.cancelled:
 
-                return self._cancelled_result(
+                self._cancelled(
                     settings
+                )
+
+                return (
+                    self._cancelled_result(
+                        settings
+                    )
                 )
 
             self._progress_stage = (
@@ -381,6 +419,12 @@ class MediaService:
                     settings
                 )
 
+                return (
+                    self._cancelled_result(
+                        settings
+                    )
+                )
+
             self._error(
                 exc
             )
@@ -396,8 +440,10 @@ class MediaService:
         settings: Dict[str, Any],
     ) -> Dict[str, Any]:
 
-        filename = self._display_name(
-            settings
+        filename = (
+            self._display_name(
+                settings
+            )
         )
 
         self._progress_stage = (
@@ -430,16 +476,17 @@ class MediaService:
         if not result:
 
             raise RuntimeError(
-                "Video downloader returned no result."
+                "Video downloader returned "
+                "no result."
             )
 
         if self.cancelled:
-
             return result
 
         return self._process_video(
             result,
             filename,
+            subtitle_mode=False,
         )
 
     # ==========================================================
@@ -451,22 +498,59 @@ class MediaService:
         settings: Dict[str, Any],
     ) -> Dict[str, Any]:
 
-        filename = self._display_name(
-            settings
+        filename = (
+            self._display_name(
+                settings
+            )
         )
 
-        # ------------------------------------------------------
-        # ONE yt-dlp operation.
-        #
-        # Video + audio + subtitles are downloaded together.
-        # ------------------------------------------------------
+        embed = bool(
+            settings.get(
+                "embed_subtitles",
+                False,
+            )
+        )
+
+        separate = bool(
+            settings.get(
+                "save_separate_subtitle",
+                True,
+            )
+        )
 
         self._progress_stage = (
             "video_subtitles_video"
         )
 
+        if embed and separate:
+
+            message = (
+                "Downloading video + audio "
+                "+ embedded + separate subtitles"
+            )
+
+        elif embed:
+
+            message = (
+                "Downloading video + audio "
+                "+ embedded subtitles"
+            )
+
+        elif separate:
+
+            message = (
+                "Downloading video + audio "
+                "+ separate subtitles"
+            )
+
+        else:
+
+            message = (
+                "Downloading video + audio"
+            )
+
         self._progress(
-            "Downloading video + audio + subtitles",
+            message,
             filename,
             0,
             "--",
@@ -487,74 +571,108 @@ class MediaService:
                 video_settings
             )
         )
+        
 
         if not result:
 
             raise RuntimeError(
-                "Video downloader returned no result."
+                "Video downloader returned "
+                "no result."
             )
 
+        result["embed_subtitles"] = embed
+        result["save_separate_subtitle"] = separate
         if self.cancelled:
-
             return result
 
         # ------------------------------------------------------
-        # Find out whether subtitles were actually created.
+        # yt-dlp has already completed subtitle processing
+        # before download() returns.
+        #
+        # Therefore this is a boundary notification only.
+        # We do NOT fake another 0-100 operation.
         # ------------------------------------------------------
 
-        has_subtitles = bool(
-            result.get(
-                "has_subtitles"
-            )
-            or result.get(
-                "subtitle_filepath"
-            )
-            or result.get(
-                "subtitles"
-            )
-        )
-
-        if has_subtitles:
+        if embed or separate:
 
             self._progress_stage = (
                 "video_subtitles_subtitles"
             )
 
-            self._progress(
-                "Subtitles downloaded",
-                filename,
-                90,
-                "Complete",
-                "--",
-                "00:00",
+            has_subtitles = bool(
+                result.get(
+                    "has_subtitles",
+                    False,
+                )
             )
 
-        else:
-
-            self._progress_stage = (
-                "video_subtitles_subtitles"
+            embedded = bool(
+                result.get(
+                    "subtitles_embedded",
+                    False,
+                )
             )
 
-            self._progress(
-                "No subtitles available",
-                filename,
-                90,
-                "--",
-                "--",
-                "00:00",
-            )
+            if (
+                embed
+                and separate
+                and has_subtitles
+            ):
+
+                self._progress(
+                    "Subtitles embedded and "
+                    "saved separately",
+                    filename,
+                    85,
+                    "Complete",
+                    "--",
+                    "--:--",
+                )
+
+            elif embed and embedded:
+
+                self._progress(
+                    "Subtitles embedded",
+                    filename,
+                    85,
+                    "Complete",
+                    "--",
+                    "--:--",
+                )
+
+            elif separate and has_subtitles:
+
+                self._progress(
+                    "Subtitles saved separately",
+                    filename,
+                    85,
+                    "Complete",
+                    "--",
+                    "--:--",
+                )
+
+            else:
+
+                self._progress(
+                    "No subtitles available",
+                    filename,
+                    85,
+                    "--",
+                    "--",
+                    "--:--",
+                )
 
         # ------------------------------------------------------
-        # Process video.
+        # Final video processing.
         # ------------------------------------------------------
 
-        result = self._process_video(
+        return self._process_video(
             result,
             filename,
-            subtitle_mode=True,
+            subtitle_mode=(
+                embed or separate
+            ),
         )
-
-        return result
 
     # ==========================================================
     # VIDEO PROCESSING
@@ -567,35 +685,19 @@ class MediaService:
         subtitle_mode: bool = False,
     ) -> Dict[str, Any]:
 
-        filepath = result.get(
-            "filepath"
-        )
+        filepath = result.get("filepath")
 
         if not filepath:
-
             raise RuntimeError(
                 "Downloaded video filepath was not returned."
             )
 
-        filepath = os.path.abspath(
-            str(filepath)
-        )
+        filepath = os.path.abspath(str(filepath))
 
-        if not os.path.isfile(
-            filepath
-        ):
-
+        if not os.path.isfile(filepath):
             raise RuntimeError(
-                f"Downloaded video was not found: "
-                f"{filepath}"
+                f"Downloaded video was not found: {filepath}"
             )
-
-        # ------------------------------------------------------
-        # Video processing occupies the final 10%.
-        #
-        # The encoder itself decides whether actual encoding,
-        # remuxing, audio conversion, or nothing is necessary.
-        # ------------------------------------------------------
 
         self._progress_stage = (
             "video_subtitles_processing"
@@ -612,28 +714,48 @@ class MediaService:
             "--:--",
         )
 
+        original_filepath = filepath
+
+        # Embedded subtitles are preserved ONLY when the
+        # user explicitly selected embed_subtitles=True.
+        preserve_subtitles = bool(
+            subtitle_mode
+            and result.get(
+                "embed_subtitles",
+                False,
+            )
+        )
+
         processed = self.encoder.encode(
             filepath,
             "mp4",
+            preserve_subtitles=preserve_subtitles,
         )
 
         if processed:
+            processed = os.path.abspath(str(processed))
 
-            processed = os.path.abspath(
-                str(processed)
-            )
+            if not os.path.isfile(processed):
+                raise RuntimeError(
+                    "MediaEncoder returned a file that does not exist: "
+                    f"{processed}"
+                )
 
-            result[
-                "filepath"
-            ] = processed
+            result["filepath"] = processed
+            result["path"] = processed
 
-            result[
-                "path"
-            ] = processed
+            # Only remove the original if the encoder produced
+            # a different file.
+            if (
+                processed != original_filepath
+                and os.path.isfile(original_filepath)
+            ):
+                self._safe_remove(original_filepath)
 
-        result[
-            "subtitles_embedded"
-        ] = False
+        self._cleanup_result_temporary_files(
+            result=result,
+            final_filepath=result.get("filepath"),
+        )
 
         return result
 
@@ -646,8 +768,10 @@ class MediaService:
         settings: Dict[str, Any],
     ) -> Dict[str, Any]:
 
-        filename = self._display_name(
-            settings
+        filename = (
+            self._display_name(
+                settings
+            )
         )
 
         self._progress_stage = (
@@ -680,8 +804,16 @@ class MediaService:
         if not result:
 
             raise RuntimeError(
-                "Audio downloader returned no result."
+                "Audio downloader returned "
+                "no result."
             )
+
+        self._cleanup_result_temporary_files(
+            result=result,
+            final_filepath=result.get(
+                "filepath"
+            ),
+        )
 
         return result
 
@@ -694,8 +826,10 @@ class MediaService:
         settings: Dict[str, Any],
     ) -> Dict[str, Any]:
 
-        filename = self._display_name(
-            settings
+        filename = (
+            self._display_name(
+                settings
+            )
         )
 
         self._progress_stage = (
@@ -719,6 +853,15 @@ class MediaService:
             "download_mode"
         ] = "subtitles"
 
+        # Subtitle-only mode is inherently separate.
+        subtitle_settings[
+            "embed_subtitles"
+        ] = False
+
+        subtitle_settings[
+            "save_separate_subtitle"
+        ] = True
+
         result = (
             self.video_downloader.download(
                 subtitle_settings
@@ -728,7 +871,8 @@ class MediaService:
         if not result:
 
             raise RuntimeError(
-                "Subtitle downloader returned no result."
+                "Subtitle downloader returned "
+                "no result."
             )
 
         if not result.get(
@@ -740,10 +884,130 @@ class MediaService:
                 "No subtitles were found."
             )
 
+        self._cleanup_result_temporary_files(
+            result=result,
+            final_filepath=None,
+        )
+
         return result
 
     # ==========================================================
-    # SETTINGS
+    # TEMPORARY FILE CLEANUP
+    # ==========================================================
+
+    def _cleanup_result_temporary_files(
+        self,
+        result: Dict[str, Any],
+        final_filepath: Optional[str],
+    ) -> None:
+
+        temporary_files = result.get(
+            "_temporary_files",
+            [],
+        )
+
+        if not isinstance(
+            temporary_files,
+            list,
+        ):
+
+            return
+
+        final_path = (
+            os.path.abspath(
+                str(final_filepath)
+            )
+            if final_filepath
+            else None
+        )
+
+        protected: Set[str] = set()
+
+        if final_path:
+            protected.add(
+                final_path
+            )
+
+        subtitle_filepath = result.get(
+            "subtitle_filepath"
+        )
+
+        if subtitle_filepath:
+
+            protected.add(
+                os.path.abspath(
+                    str(
+                        subtitle_filepath
+                    )
+                )
+            )
+
+        subtitles = result.get(
+            "subtitles",
+            [],
+        )
+
+        if isinstance(
+            subtitles,
+            list,
+        ):
+
+            for subtitle in subtitles:
+
+                if subtitle:
+
+                    protected.add(
+                        os.path.abspath(
+                            str(subtitle)
+                        )
+                    )
+
+        for temporary in temporary_files:
+
+            if not temporary:
+                continue
+
+            path = os.path.abspath(
+                str(temporary)
+            )
+
+            if path in protected:
+                continue
+
+            self._safe_remove(
+                path
+            )
+
+        # Remove internal metadata.
+        result.pop(
+            "_temporary_files",
+            None,
+        )
+
+    @staticmethod
+    def _safe_remove(
+        filepath: str,
+    ) -> None:
+
+        try:
+
+            filepath = os.path.abspath(
+                str(filepath)
+            )
+
+            if os.path.isfile(
+                filepath
+            ):
+
+                os.remove(
+                    filepath
+                )
+
+        except OSError:
+            pass
+
+    # ==========================================================
+    # NORMALIZATION
     # ==========================================================
 
     def _normalize_settings(
@@ -762,6 +1026,29 @@ class MediaService:
             )
             or "video_subtitles"
         ).strip().lower()
+
+        aliases = {
+            "video+subtitles": (
+                "video_subtitles"
+            ),
+            "video_subtitle": (
+                "video_subtitles"
+            ),
+            "video-with-subtitles": (
+                "video_subtitles"
+            ),
+            "video_with_subtitles": (
+                "video_subtitles"
+            ),
+            "subtitle": "subtitles",
+            "audio_only": "audio",
+            "video_only": "video",
+        }
+
+        mode = aliases.get(
+            mode,
+            mode,
+        )
 
         settings[
             "download_mode"
@@ -827,16 +1114,37 @@ class MediaService:
             or "best"
         ).strip().lower()
 
+        # ------------------------------------------------------
+        # SUBTITLE DEFAULTS
+        # ------------------------------------------------------
+
         settings[
-            "download_subtitles"
+            "embed_subtitles"
         ] = bool(
             settings.get(
-                "download_subtitles",
-                mode in {
-                    "video_subtitles",
-                    "subtitles",
-                },
+                "embed_subtitles",
+                False,
             )
+        )
+
+        settings[
+            "save_separate_subtitle"
+        ] = bool(
+            settings.get(
+                "save_separate_subtitle",
+                True,
+            )
+        )
+
+        settings[
+            "download_subtitles"
+        ] = (
+            settings[
+                "embed_subtitles"
+            ]
+            or settings[
+                "save_separate_subtitle"
+            ]
         )
 
         settings[
@@ -867,8 +1175,9 @@ class MediaService:
             or "srt"
         ).strip().lower().lstrip(".")
 
-        if subtitle_format not in (
-            self.SUBTITLE_FORMATS
+        if (
+            subtitle_format
+            not in self.SUBTITLE_FORMATS
         ):
 
             subtitle_format = "srt"
@@ -878,16 +1187,8 @@ class MediaService:
         ] = subtitle_format
 
         # ------------------------------------------------------
-        # NEVER EMBED.
+        # OTHER SETTINGS
         # ------------------------------------------------------
-
-        settings[
-            "embed_subtitles"
-        ] = False
-
-        settings[
-            "save_separate_subtitle"
-        ] = True
 
         settings[
             "playlist_folder"
@@ -980,9 +1281,7 @@ class MediaService:
             "download_mode"
         ]
 
-        if mode not in (
-            self.DOWNLOAD_MODES
-        ):
+        if mode not in self.DOWNLOAD_MODES:
 
             raise ValueError(
                 f"Invalid download mode: {mode}. "
@@ -991,12 +1290,8 @@ class MediaService:
             )
 
         if (
-            not settings[
-                "url"
-            ]
-            and not settings[
-                "videos"
-            ]
+            not settings["url"]
+            and not settings["videos"]
         ):
 
             raise ValueError(
@@ -1015,24 +1310,24 @@ class MediaService:
             "container"
         ]
 
-        if container not in (
-            self.CONTAINERS
-        ):
+        if container not in self.CONTAINERS:
 
             raise ValueError(
-                f"Unsupported container: {container}"
+                f"Unsupported container: "
+                f"{container}"
             )
 
         subtitle_type = settings[
             "subtitle_type"
         ]
 
-        if subtitle_type not in (
-            self.SUBTITLE_TYPES
+        if (
+            subtitle_type
+            not in self.SUBTITLE_TYPES
         ):
 
             raise ValueError(
-                f"Unsupported subtitle type: "
+                "Unsupported subtitle type: "
                 f"{subtitle_type}"
             )
 
@@ -1040,21 +1335,20 @@ class MediaService:
             "subtitle_format"
         ]
 
-        if subtitle_format not in (
-            self.SUBTITLE_FORMATS
+        if (
+            subtitle_format
+            not in self.SUBTITLE_FORMATS
         ):
 
             raise ValueError(
-                f"Unsupported subtitle format: "
+                "Unsupported subtitle format: "
                 f"{subtitle_format}"
             )
 
         try:
 
             os.makedirs(
-                settings[
-                    "output"
-                ],
+                settings["output"],
                 exist_ok=True,
             )
 
@@ -1066,7 +1360,7 @@ class MediaService:
             ) from exc
 
     # ==========================================================
-    # PROGRESS FROM DOWNLOADER
+    # DOWNLOADER PROGRESS
     # ==========================================================
 
     def _core_progress(
@@ -1091,50 +1385,52 @@ class MediaService:
         )
 
         # ------------------------------------------------------
-        # VIDEO
-        # 0 -> 90
+        # Normal video download
         # ------------------------------------------------------
 
-        if stage in {
-            "video_download",
-            "video_subtitles_video",
-        }:
+        if stage == "video_download":
 
             overall = (
                 percentage * 0.90
             )
 
         # ------------------------------------------------------
-        # VIDEO + SUBTITLES
-        # subtitle stage = 85 -> 90
+        # Video + subtitles:
         #
-        # We don't actually perform a second download.
-        # This stage is represented as the subtitle portion of
-        # the combined yt-dlp operation.
+        # Video/audio = 0–85%
+        # Subtitle boundary = 85%
+        # Processing = 90–100%
         # ------------------------------------------------------
 
-        elif stage == (
-            "video_subtitles_subtitles"
+        elif (
+            stage
+            == "video_subtitles_video"
         ):
 
             overall = (
-                85.0
-                + percentage * 0.05
+                percentage * 0.85
             )
 
+        elif (
+            stage
+            == "video_subtitles_subtitles"
+        ):
+
+            # Subtitle work has already happened inside
+            # yt-dlp by the time this callback is reached.
+            #
+            # Keep this as a boundary rather than pretending
+            # there is another real download operation.
+            overall = 85.0
+
         # ------------------------------------------------------
-        # AUDIO
+        # Audio/subtitle-only.
         # ------------------------------------------------------
 
-        elif stage == "audio":
-
-            overall = percentage
-
-        # ------------------------------------------------------
-        # SUBTITLES ONLY
-        # ------------------------------------------------------
-
-        elif stage == "subtitles":
+        elif stage in {
+            "audio",
+            "subtitles",
+        }:
 
             overall = percentage
 
@@ -1179,7 +1475,10 @@ class MediaService:
 
             overall = (
                 90.0
-                + percentage * 0.10
+                + (
+                    percentage
+                    * 0.10
+                )
             )
 
         else:
@@ -1237,47 +1536,42 @@ class MediaService:
             )
         )
 
-        # ------------------------------------------------------
-        # Keep precision.
-        # ------------------------------------------------------
-
-        if percentage.is_integer():
-
-            percentage_value = int(
-                percentage
-            )
-
-        else:
-
-            percentage_value = round(
+        percentage_value = (
+            int(percentage)
+            if percentage.is_integer()
+            else round(
                 percentage,
                 1,
             )
+        )
 
         downloaded = (
             str(downloaded)
-            if downloaded not in (
+            if downloaded
+            not in {
                 None,
                 "",
-            )
+            }
             else "--"
         )
 
         speed = (
             str(speed)
-            if speed not in (
+            if speed
+            not in {
                 None,
                 "",
-            )
+            }
             else "--"
         )
 
         eta = (
             str(eta)
-            if eta not in (
+            if eta
+            not in {
                 None,
                 "",
-            )
+            }
             else "--:--"
         )
 
@@ -1414,108 +1708,45 @@ class MediaService:
     ) -> Dict[str, Any]:
 
         return {
-
             "url": settings.get(
                 "url",
                 "",
             ),
 
             "cancelled": True,
+
             "completed": False,
 
             "filepath": None,
+
             "path": None,
 
             "subtitle": None,
+
             "subtitle_filepath": None,
 
             "subtitles": [],
 
             "has_subtitles": False,
+
             "subtitles_available": False,
+
             "subtitles_embedded": False,
+
+            "embed_subtitles": bool(
+                settings.get(
+                    "embed_subtitles",
+                    False,
+                )
+            ),
+
+            "save_separate_subtitle": bool(
+                settings.get(
+                    "save_separate_subtitle",
+                    True,
+                )
+            ),
         }
-
-    @staticmethod
-    def _merge_results(
-        video_result: Optional[
-            Dict[str, Any]
-        ],
-        subtitle_result: Optional[
-            Dict[str, Any]
-        ],
-    ) -> Dict[str, Any]:
-
-        result: Dict[str, Any] = {}
-
-        if video_result:
-
-            result.update(
-                video_result
-            )
-
-        result[
-            "subtitles_embedded"
-        ] = False
-
-        if subtitle_result:
-
-            result[
-                "subtitle"
-            ] = subtitle_result
-
-            result[
-                "subtitle_filepath"
-            ] = (
-                subtitle_result.get(
-                    "subtitle_filepath"
-                )
-                or subtitle_result.get(
-                    "filepath"
-                )
-                or subtitle_result.get(
-                    "path"
-                )
-            )
-
-            result[
-                "subtitles"
-            ] = subtitle_result.get(
-                "subtitles",
-                [],
-            )
-
-            result[
-                "has_subtitles"
-            ] = True
-
-            result[
-                "subtitles_available"
-            ] = True
-
-        else:
-
-            result[
-                "subtitle"
-            ] = None
-
-            result[
-                "subtitle_filepath"
-            ] = None
-
-            result[
-                "subtitles"
-            ] = []
-
-            result[
-                "has_subtitles"
-            ] = False
-
-            result[
-                "subtitles_available"
-            ] = False
-
-        return result
 
     # ==========================================================
     # CALLBACKS

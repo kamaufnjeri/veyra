@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from cli.ui.subtitle_page import SubtitlePage
-from cli.ui.download_page import VideoDownloadPage
+from cli.ui.media_download_page import VideoDownloadPage
 from cli.ui.sync_page import SubtitleSyncPage
 
 

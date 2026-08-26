@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
 from PySide6.QtCore import (
     QObject,
@@ -11,6 +13,7 @@ from PySide6.QtCore import (
     Slot,
     QMetaObject,
     QSize,
+    QItemSelectionModel,
 )
 
 from PySide6.QtGui import QColor
@@ -32,14 +35,16 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
-    QScrollArea,
-    QSpinBox,
     QSizePolicy,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
 
-from jobs.download_processor import MediaJobProcessor, JobCancelled
+from jobs.media_processor import (
+    MediaJobProcessor,
+    JobCancelled,
+)
 
 
 # ============================================================
@@ -60,7 +65,17 @@ def safe_int(value, default=0):
         return default
 
 
+def safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def media_title(media):
+    if not isinstance(media, dict):
+        return "Untitled"
+
     return str(
         media.get("title")
         or media.get("name")
@@ -70,15 +85,21 @@ def media_title(media):
 
 
 def media_url(media):
+    if not isinstance(media, dict):
+        return ""
+
     return str(
-        media.get("url")
-        or media.get("webpage_url")
+        media.get("webpage_url")
         or media.get("original_url")
+        or media.get("url")
         or ""
     )
 
 
 def format_bytes(value):
+    if value in (None, "", "--"):
+        return "--"
+
     try:
         value = float(value)
     except (TypeError, ValueError):
@@ -89,22 +110,39 @@ def format_bytes(value):
 
     for unit in ("B", "KB", "MB", "GB", "TB"):
         if value < 1024:
-            return (
-                f"{value:.0f} {unit}"
-                if unit == "B"
-                else f"{value:.1f} {unit}"
-            )
+            if unit == "B":
+                return f"{value:.0f} {unit}"
+
+            return f"{value:.1f} {unit}"
 
         value /= 1024
 
     return f"{value:.1f} PB"
 
 
+def format_speed(value):
+    if value in (None, "", "--"):
+        return "--"
+
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+    if value < 0:
+        return "--"
+
+    return f"{format_bytes(value)}/s"
+
+
 def format_eta(value):
+    if value in (None, "", "--", "--:--"):
+        return "--:--"
+
     try:
         value = max(0, int(float(value)))
     except (TypeError, ValueError):
-        return "--:--"
+        return str(value)
 
     minutes, seconds = divmod(value, 60)
     hours, minutes = divmod(minutes, 60)
@@ -113,6 +151,174 @@ def format_eta(value):
         return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
     return f"{minutes:02d}:{seconds:02d}"
+
+
+def normalize_stage(value):
+    """Return a stable, lowercase stage key from processor progress text."""
+    text = str(value or "").strip().lower()
+
+    if any(token in text for token in (
+        "download",
+        "downloading",
+        "fetching",
+    )):
+        return "download"
+
+    if any(token in text for token in (
+        "merge",
+        "merging",
+        "remux",
+        "remuxing",
+        "mux",
+        "muxing",
+    )):
+        return "merge"
+
+    if any(token in text for token in (
+        "subtitle",
+        "subtitles",
+        "embed",
+        "embedding",
+    )):
+        return "subtitle"
+
+    if any(token in text for token in (
+        "encode",
+        "encoding",
+        "convert",
+        "converting",
+        "transcod",
+    )):
+        return "encode"
+
+    if any(token in text for token in (
+        "final",
+        "finish",
+        "saving",
+        "save",
+        "writing",
+    )):
+        return "finalize"
+
+    return "other"
+
+
+class QueueListWidget(QListWidget):
+    """QListWidget with reliable click/Ctrl/Shift/drag selection."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._selection_anchor = None
+        self._dragging_selection = False
+
+    def _index_from_global(self, global_pos):
+        return self.indexAt(
+            self.viewport().mapFromGlobal(global_pos)
+        )
+
+    def _select_range(self, first_row, last_row, clear=True):
+        if self.count() == 0:
+            return
+
+        first_row = max(0, min(self.count() - 1, first_row))
+        last_row = max(0, min(self.count() - 1, last_row))
+
+        top = min(first_row, last_row)
+        bottom = max(first_row, last_row)
+
+        model = self.model()
+        selection_model = self.selectionModel()
+
+        if clear:
+            selection_model.clearSelection()
+
+        for row in range(top, bottom + 1):
+            selection_model.select(
+                model.index(row, 0),
+                QItemSelectionModel.Select,
+            )
+
+        selection_model.setCurrentIndex(
+            model.index(last_row, 0),
+            QItemSelectionModel.NoUpdate,
+        )
+        self.setCurrentRow(last_row)
+
+    def select_from_global(self, global_pos, modifiers=Qt.NoModifier):
+        index = self._index_from_global(global_pos)
+        if not index.isValid():
+            return False
+
+        row = index.row()
+        shift = bool(modifiers & Qt.ShiftModifier)
+        ctrl = bool(modifiers & Qt.ControlModifier)
+
+        if shift and self._selection_anchor is not None:
+            self._select_range(
+                self._selection_anchor,
+                row,
+                clear=True,
+            )
+        elif ctrl:
+            self.selectionModel().select(
+                index,
+                QItemSelectionModel.Toggle,
+            )
+            self.setCurrentIndex(index)
+        else:
+            self.selectionModel().clearSelection()
+            self.selectionModel().select(
+                index,
+                QItemSelectionModel.Select,
+            )
+            self.setCurrentIndex(index)
+            self._selection_anchor = row
+
+        if not shift:
+            self._selection_anchor = row
+
+        self._dragging_selection = True
+        return True
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            if self.select_from_global(
+                event.globalPosition().toPoint(),
+                event.modifiers(),
+            ):
+                event.accept()
+                return
+
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (
+            self._dragging_selection
+            and event.buttons() & Qt.LeftButton
+            and self._selection_anchor is not None
+        ):
+            index = self._index_from_global(
+                event.globalPosition().toPoint()
+            )
+            if index.isValid():
+                self._select_range(
+                    self._selection_anchor,
+                    index.row(),
+                    clear=True,
+                )
+                event.accept()
+                return
+
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._dragging_selection = False
+        super().mouseReleaseEvent(event)
+
+    def clearSelection(self):
+        super().clearSelection()
+        self._selection_anchor = None
+        self._dragging_selection = False
 
 
 def set_combo_data(combo, value):
@@ -125,6 +331,7 @@ def set_combo_data(combo, value):
 DEFAULT_OUTPUT = os.path.join(
     os.path.expanduser("~"),
     "Downloads",
+    "Videos",
 )
 
 
@@ -432,7 +639,7 @@ class MediaDownloadWorker(QObject):
         int,
         str,
         str,
-        int,
+        float,
         object,
     )
 
@@ -445,7 +652,11 @@ class MediaDownloadWorker(QObject):
 
         self.index = index
         self.settings = dict(settings)
-        self.processor = None
+        self.processor: Optional[MediaJobProcessor] = None
+
+    # --------------------------------------------------------
+    # RUN
+    # --------------------------------------------------------
 
     @Slot()
     def run(self):
@@ -464,7 +675,9 @@ class MediaDownloadWorker(QObject):
                 "cancelled",
                 False,
             ):
-                self.cancelled.emit(self.index)
+                self.cancelled.emit(
+                    self.index
+                )
                 return
 
             self.finished.emit(
@@ -473,7 +686,9 @@ class MediaDownloadWorker(QObject):
             )
 
         except JobCancelled:
-            self.cancelled.emit(self.index)
+            self.cancelled.emit(
+                self.index
+            )
 
         except Exception as exc:
             self.error.emit(
@@ -481,33 +696,148 @@ class MediaDownloadWorker(QObject):
                 exc,
             )
 
+    # --------------------------------------------------------
+    # CANCEL
+    # --------------------------------------------------------
+
     @Slot()
     def cancel(self):
-        if self.processor is None:
+        processor = self.processor
+
+        if processor is None:
             return
 
         try:
-            self.processor.cancel()
+            processor.cancel()
         except Exception:
             pass
+
+    # --------------------------------------------------------
+    # PROGRESS
+    #
+    # IMPORTANT:
+    #
+    # This matches the callback used by test.py:
+    #
+    # progress_callback(
+    #     info,
+    #     filename,
+    #     percentage,
+    #     downloaded,
+    #     speed,
+    #     eta,
+    #     **kwargs,
+    # )
+    #
+    # We additionally support the old:
+    #
+    # progress_callback(
+    #     info,
+    #     filename,
+    #     percentage,
+    #     details,
+    # )
+    #
+    # so this worker is tolerant of either MediaJobProcessor
+    # callback implementation.
+    # --------------------------------------------------------
 
     def on_progress(
         self,
         info,
         filename,
         percentage,
-        details,
+        downloaded=None,
+        speed=None,
+        eta=None,
+        **kwargs,
     ):
+        details: Dict[str, Any] = {}
+
+        # ----------------------------------------------------
+        # NEW CALLBACK FORMAT
+        # ----------------------------------------------------
+
+        if isinstance(
+            downloaded,
+            dict,
+        ):
+            # Old callback format:
+            #
+            # info, filename, percentage, details
+            #
+            details.update(downloaded)
+
+            downloaded = (
+                details.get("downloaded")
+                or details.get("downloaded_bytes")
+                or details.get("bytes_downloaded")
+            )
+
+            speed = (
+                details.get("speed")
+                or details.get("speed_bytes")
+            )
+
+            eta = details.get("eta")
+
+        # ----------------------------------------------------
+        # EXTRA DETAILS
+        # ----------------------------------------------------
+
+        if kwargs:
+            details.update(kwargs)
+
+        # ----------------------------------------------------
+        # STANDARDIZE VALUES
+        # ----------------------------------------------------
+
+        try:
+            percentage = float(
+                percentage
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            percentage = 0.0
+
         percentage = max(
-            0,
+            0.0,
             min(
-                100,
-                safe_int(percentage),
+                100.0,
+                percentage,
             ),
         )
 
-        if not isinstance(details, dict):
-            details = {}
+        if downloaded is not None:
+            details["downloaded"] = downloaded
+
+        if speed is not None:
+            details["speed"] = speed
+
+        if eta is not None:
+            details["eta"] = eta
+
+        # ----------------------------------------------------
+        # STAGE
+        # ----------------------------------------------------
+
+        stage = (
+            details.get("stage")
+            or details.get("status")
+            or details.get("message")
+            or info
+            or ""
+        )
+
+        details["stage"] = str(
+            stage or ""
+        ).strip()
+
+        # ----------------------------------------------------
+        # EMIT TO GUI
+        # ----------------------------------------------------
 
         self.progress.emit(
             self.index,
@@ -516,6 +846,10 @@ class MediaDownloadWorker(QObject):
             percentage,
             details,
         )
+
+    # --------------------------------------------------------
+    # ERROR
+    # --------------------------------------------------------
 
     def on_error(self, error):
         self.error.emit(
@@ -542,6 +876,7 @@ class MediaSelectionDialog(QDialog):
 
         self.media_items = []
         self.selected_media = []
+        self._last_selected_rows = set()
         self.download_mode = download_mode
 
         self.setWindowTitle("Select Media")
@@ -550,9 +885,15 @@ class MediaSelectionDialog(QDialog):
         self.build_ui()
 
         if media_items:
-            self.set_media_items(media_items)
+            self.set_media_items(
+                media_items
+            )
         else:
             self.set_loading(True)
+
+    # ========================================================
+    # UI
+    # ========================================================
 
     def build_ui(self):
         layout = QVBoxLayout(self)
@@ -619,6 +960,14 @@ class MediaSelectionDialog(QDialog):
         self.list.setSelectionMode(
             QAbstractItemView.ExtendedSelection
         )
+        self.list.setDragEnabled(False)
+        self.list.setDragDropMode(
+            QAbstractItemView.NoDragDrop
+        )
+        self.list.setDefaultDropAction(
+            Qt.IgnoreAction
+        )
+        self.list.setSelectionRectVisible(True)
 
         self.list.setAlternatingRowColors(True)
 
@@ -738,6 +1087,10 @@ class MediaSelectionDialog(QDialog):
             self.show_details
         )
 
+        self.list.itemSelectionChanged.connect(
+            self.sync_row_selection_to_checks
+        )
+
         self.buttons.accepted.connect(
             self.accept_selection
         )
@@ -746,9 +1099,9 @@ class MediaSelectionDialog(QDialog):
             self.reject
         )
 
-    # --------------------------------------------------------
+    # ========================================================
     # SETTINGS
-    # --------------------------------------------------------
+    # ========================================================
 
     def build_settings(self):
         self.video_quality = QComboBox()
@@ -766,7 +1119,7 @@ class MediaSelectionDialog(QDialog):
                 name,
                 value,
             )
-        # Default video quality: 480p
+
         set_combo_data(
             self.video_quality,
             "480",
@@ -784,6 +1137,7 @@ class MediaSelectionDialog(QDialog):
                 name,
                 value,
             )
+
         set_combo_data(
             self.container,
             "mp4",
@@ -802,6 +1156,7 @@ class MediaSelectionDialog(QDialog):
                 name,
                 value,
             )
+
         set_combo_data(
             self.audio_quality,
             "192",
@@ -821,6 +1176,7 @@ class MediaSelectionDialog(QDialog):
                 value.upper(),
                 value,
             )
+
         set_combo_data(
             self.audio_format,
             "mp3",
@@ -875,14 +1231,26 @@ class MediaSelectionDialog(QDialog):
                 value,
             )
 
-        self.save_subtitles = QCheckBox(
-            "Save subtitle file"
+        self.subtitle_output = QComboBox()
+
+        self.subtitle_output.addItem(
+            "Save subtitle separately",
+            "separate",
         )
 
-        self.save_subtitles.setChecked(True)
+        self.subtitle_output.addItem(
+            "Embed subtitles",
+            "embed",
+        )
 
-        self.embed_subtitles = QCheckBox(
-            "Embed subtitles"
+        self.subtitle_output.addItem(
+            "Don't save subtitles",
+            "none",
+        )
+
+        set_combo_data(
+            self.subtitle_output,
+            "separate",
         )
 
         self.update_mode()
@@ -958,23 +1326,18 @@ class MediaSelectionDialog(QDialog):
             )
 
             self.settings_grid.addWidget(
-                self.save_subtitles,
+                QLabel("Output"),
                 row,
                 2,
-                1,
-                2,
+            )
+
+            self.settings_grid.addWidget(
+                self.subtitle_output,
+                row,
+                3,
             )
 
             row += 1
-
-        if mode == "video_subtitles":
-            self.settings_grid.addWidget(
-                self.embed_subtitles,
-                row,
-                0,
-                1,
-                4,
-            )
 
     def add_setting(
         self,
@@ -995,9 +1358,9 @@ class MediaSelectionDialog(QDialog):
             column + 1,
         )
 
-    # --------------------------------------------------------
+    # ========================================================
     # LOADING
-    # --------------------------------------------------------
+    # ========================================================
 
     def set_loading(self, value):
         self.loading.setVisible(value)
@@ -1005,9 +1368,9 @@ class MediaSelectionDialog(QDialog):
         self.settings_group.setVisible(not value)
         self.buttons.setEnabled(not value)
 
-    # --------------------------------------------------------
+    # ========================================================
     # MEDIA
-    # --------------------------------------------------------
+    # ========================================================
 
     def set_media_items(self, items):
         self.media_items = [
@@ -1066,8 +1429,8 @@ class MediaSelectionDialog(QDialog):
         self.set_loading(False)
         self.update_count()
 
-        if self.list.count():
-            self.list.setCurrentRow(0)
+        self.list.clearSelection()
+        self._last_selected_rows.clear()
 
     def show_details(self):
         selected = self.list.selectedItems()
@@ -1134,15 +1497,17 @@ class MediaSelectionDialog(QDialog):
             "<br>".join(lines)
         )
 
-    # --------------------------------------------------------
+    # ========================================================
     # SELECTION
-    # --------------------------------------------------------
+    # ========================================================
 
     def select_all(self):
         self.set_all(Qt.Checked)
+        self.list.selectAll()
 
     def deselect_all(self):
         self.set_all(Qt.Unchecked)
+        self.list.clearSelection()
 
     def invert(self):
         self.list.blockSignals(True)
@@ -1157,6 +1522,7 @@ class MediaSelectionDialog(QDialog):
             )
 
         self.list.blockSignals(False)
+
         self.update_count()
 
     def set_all(self, state):
@@ -1168,6 +1534,7 @@ class MediaSelectionDialog(QDialog):
             )
 
         self.list.blockSignals(False)
+
         self.update_count()
 
     def update_count(self, *_):
@@ -1183,9 +1550,39 @@ class MediaSelectionDialog(QDialog):
             f"{selected} selected / {total}"
         )
 
-    # --------------------------------------------------------
+    def sync_row_selection_to_checks(self):
+        """Synchronize row selection gestures with the existing check state."""
+        current_rows = {
+            self.list.row(item)
+            for item in self.list.selectedItems()
+        }
+
+        # If there was an actual previous user selection, rows removed from
+        # it were deselected with Ctrl-click or by replacing the selection.
+        # Keep the checkbox state in sync with that action.
+        removed_rows = self._last_selected_rows - current_rows
+        added_rows = current_rows - self._last_selected_rows
+
+        self.list.blockSignals(True)
+        try:
+            for row in removed_rows:
+                item = self.list.item(row)
+                if item is not None:
+                    item.setCheckState(Qt.Unchecked)
+
+            for row in added_rows:
+                item = self.list.item(row)
+                if item is not None:
+                    item.setCheckState(Qt.Checked)
+        finally:
+            self.list.blockSignals(False)
+
+        self._last_selected_rows = current_rows
+        self.update_count()
+
+    # ========================================================
     # OUTPUT
-    # --------------------------------------------------------
+    # ========================================================
 
     def browse_output(self):
         folder = QFileDialog.getExistingDirectory(
@@ -1203,6 +1600,12 @@ class MediaSelectionDialog(QDialog):
         subtitles = mode in (
             "video_subtitles",
             "subtitles",
+        )
+
+        subtitle_output = (
+            self.subtitle_output.currentData()
+            if subtitles
+            else "none"
         )
 
         return {
@@ -1232,13 +1635,15 @@ class MediaSelectionDialog(QDialog):
             "subtitle_format":
                 self.subtitle_format.currentData(),
 
-            "save_separate_subtitle":
+            "save_separate_subtitle": bool(
                 subtitles
-                and self.save_subtitles.isChecked(),
+                and subtitle_output == "separate"
+            ),
 
-            "embed_subtitles":
-                mode == "video_subtitles"
-                and self.embed_subtitles.isChecked(),
+            "embed_subtitles": bool(
+                subtitles
+                and subtitle_output == "embed"
+            ),
 
             "output":
                 self.output.text().strip(),
@@ -1264,7 +1669,9 @@ class MediaSelectionDialog(QDialog):
             )
 
             if isinstance(media, dict):
-                selected.append(dict(media))
+                selected.append(
+                    dict(media)
+                )
 
         if not selected:
             QMessageBox.warning(
@@ -1293,6 +1700,9 @@ class MediaSelectionDialog(QDialog):
 # ============================================================
 # QUEUE ITEM WIDGET
 # ============================================================
+# ============================================================
+# QUEUE ITEM WIDGET
+# ============================================================
 
 class DownloadQueueItemWidget(QWidget):
 
@@ -1308,17 +1718,10 @@ class DownloadQueueItemWidget(QWidget):
         super().__init__(parent)
 
         self.index = index
+
         self.media_title = str(
             title or "Untitled"
         )
-
-        # ====================================================
-        # IMPORTANT:
-        # HARD FIXED HEIGHT.
-        #
-        # This prevents the QListWidget row from expanding
-        # when status/details/progress are updated.
-        # ====================================================
 
         self.setFixedHeight(
             QUEUE_ITEM_HEIGHT
@@ -1327,6 +1730,23 @@ class DownloadQueueItemWidget(QWidget):
         self.setSizePolicy(
             QSizePolicy.Expanding,
             QSizePolicy.Fixed,
+        )
+
+        self.setMouseTracking(True)
+
+        self.setStyleSheet(
+            """
+            DownloadQueueItemWidget {
+                background: transparent;
+                border: 1px solid transparent;
+                border-radius: 6px;
+            }
+
+            DownloadQueueItemWidget[selected="true"] {
+                background: rgba(59, 130, 246, 0.12);
+                border: 1px solid rgba(59, 130, 246, 0.35);
+            }
+            """
         )
 
         layout = QVBoxLayout(self)
@@ -1369,7 +1789,6 @@ class DownloadQueueItemWidget(QWidget):
             self.media_title
         )
 
-        # Prevent title from forcing the row wider.
         self.title.setSizePolicy(
             QSizePolicy.Ignored,
             QSizePolicy.Fixed,
@@ -1418,7 +1837,9 @@ class DownloadQueueItemWidget(QWidget):
             self.cancel
         )
 
-        layout.addLayout(top)
+        layout.addLayout(
+            top
+        )
 
         # ----------------------------------------------------
         # PROGRESS
@@ -1431,11 +1852,17 @@ class DownloadQueueItemWidget(QWidget):
             100,
         )
 
-        self.progress.setValue(0)
+        self.progress.setValue(
+            0
+        )
 
-        self.progress.setTextVisible(True)
+        self.progress.setTextVisible(
+            True
+        )
 
-        self.progress.setFixedHeight(18)
+        self.progress.setFixedHeight(
+            18
+        )
 
         self.progress.setSizePolicy(
             QSizePolicy.Expanding,
@@ -1454,10 +1881,17 @@ class DownloadQueueItemWidget(QWidget):
             "Waiting..."
         )
 
-        self.details.setWordWrap(False)
+        self.details.setWordWrap(
+            False
+        )
 
-        self.details.setMinimumHeight(18)
-        self.details.setMaximumHeight(18)
+        self.details.setMinimumHeight(
+            18
+        )
+
+        self.details.setMaximumHeight(
+            18
+        )
 
         self.details.setSizePolicy(
             QSizePolicy.Ignored,
@@ -1470,6 +1904,25 @@ class DownloadQueueItemWidget(QWidget):
 
         layout.addWidget(
             self.details
+        )
+
+        # ----------------------------------------------------
+        # MOUSE BEHAVIOUR
+        # ----------------------------------------------------
+
+        self.title.setAttribute(
+            Qt.WA_TransparentForMouseEvents,
+            True,
+        )
+
+        self.progress.setAttribute(
+            Qt.WA_TransparentForMouseEvents,
+            True,
+        )
+
+        self.details.setAttribute(
+            Qt.WA_TransparentForMouseEvents,
+            True,
         )
 
         # ----------------------------------------------------
@@ -1492,19 +1945,89 @@ class DownloadQueueItemWidget(QWidget):
             "Queued"
         )
 
-    # --------------------------------------------------------
-    # SIZE HINT
-    # --------------------------------------------------------
+    # ========================================================
+    # QUEUE LIST
+    # ========================================================
+
+    def _queue_list(self):
+        parent = self.parentWidget()
+
+        while parent is not None:
+            if isinstance(
+                parent,
+                QListWidget,
+            ):
+                return parent
+
+            parent = parent.parentWidget()
+
+        return None
+
+    # ========================================================
+    # MOUSE
+    # ========================================================
+
+    def mousePressEvent(
+        self,
+        event,
+    ):
+        if event.button() == Qt.LeftButton:
+
+            queue_list = self._queue_list()
+
+            if queue_list is not None:
+
+                if queue_list.select_from_global(
+                    event.globalPosition().toPoint(),
+                    event.modifiers(),
+                ):
+                    event.accept()
+                    return
+
+        super().mousePressEvent(
+            event
+        )
+
+    def mouseMoveEvent(
+        self,
+        event,
+    ):
+        queue_list = self._queue_list()
+
+        if (
+            queue_list is not None
+            and (
+                event.buttons()
+                & Qt.LeftButton
+            )
+            and queue_list._selection_anchor
+            is not None
+        ):
+
+            index = queue_list._index_from_global(
+                event.globalPosition().toPoint()
+            )
+
+            if index.isValid():
+
+                queue_list._select_range(
+                    queue_list._selection_anchor,
+                    index.row(),
+                    clear=True,
+                )
+
+                event.accept()
+                return
+
+        super().mouseMoveEvent(
+            event
+        )
+
+    # ========================================================
+    # SIZE
+    # ========================================================
 
     def sizeHint(self):
-        """
-        Always report the exact same size.
-
-        QListWidget can ask child widgets for a new size hint
-        whenever their contents change. Returning a fixed height
-        prevents progress/status/details changes from expanding
-        the row.
-        """
         return QSize(
             0,
             QUEUE_ITEM_HEIGHT,
@@ -1516,11 +2039,37 @@ class DownloadQueueItemWidget(QWidget):
             QUEUE_ITEM_HEIGHT,
         )
 
-    # --------------------------------------------------------
-    # STATUS
-    # --------------------------------------------------------
+    # ========================================================
+    # SELECTION
+    # ========================================================
 
-    def set_status(self, status):
+    def set_selected(
+        self,
+        selected,
+    ):
+        self.setProperty(
+            "selected",
+            bool(selected),
+        )
+
+        self.style().unpolish(
+            self
+        )
+
+        self.style().polish(
+            self
+        )
+
+        self.update()
+
+    # ========================================================
+    # STATUS
+    # ========================================================
+
+    def set_status(
+        self,
+        status,
+    ):
         status = str(
             status or "Queued"
         )
@@ -1544,36 +2093,77 @@ class DownloadQueueItemWidget(QWidget):
         )
 
         if status == "Queued":
+
             self.set_details(
                 "Waiting in queue..."
             )
 
         elif status == "Downloading":
-            if not self.details.text():
-                self.set_details(
-                    "Starting download..."
-                )
+
+            self.set_details(
+                "Starting download..."
+            )
+
+        elif status == "Cancelling...":
+
+            self.set_details(
+                "Cancelling download..."
+            )
+
+            self.cancel.setVisible(
+                False
+            )
+
+            self.retry.setVisible(
+                False
+            )
 
         elif status == "Completed":
+
             self.set_details(
                 "Download completed."
             )
 
+            self.cancel.setVisible(
+                False
+            )
+
+            self.retry.setVisible(
+                False
+            )
+
         elif status == "Failed":
-            self.set_details(
-                "Download failed."
+
+            self.cancel.setVisible(
+                False
+            )
+
+            self.retry.setVisible(
+                True
             )
 
         elif status == "Cancelled":
+
+            self.cancel.setVisible(
+                False
+            )
+
+            self.retry.setVisible(
+                True
+            )
+
             self.set_details(
                 "Download cancelled."
             )
 
-    # --------------------------------------------------------
+    # ========================================================
     # DETAILS
-    # --------------------------------------------------------
+    # ========================================================
 
-    def set_details(self, text):
+    def set_details(
+        self,
+        text,
+    ):
         text = str(
             text or ""
         ).strip()
@@ -1589,9 +2179,9 @@ class DownloadQueueItemWidget(QWidget):
             text
         )
 
-    # --------------------------------------------------------
+    # ========================================================
     # PROGRESS
-    # --------------------------------------------------------
+    # ========================================================
 
     def set_progress(
         self,
@@ -1600,24 +2190,33 @@ class DownloadQueueItemWidget(QWidget):
         speed="--",
         eta="--:--",
         details=None,
+        filename=None,
     ):
         percentage = max(
-            0,
+            0.0,
             min(
-                100,
-                safe_int(percentage),
+                100.0,
+                safe_float(
+                    percentage,
+                    0.0,
+                ),
             ),
         )
 
-        # Progress bar
         self.progress.setValue(
-            percentage
+            round(percentage)
         )
 
-        # Build media-service style status
-        parts = [
-            f"{percentage}%"
-        ]
+        parts = []
+
+        if details:
+            parts.append(
+                str(details)
+            )
+
+        parts.append(
+            f"{percentage:.2f}%"
+        )
 
         if downloaded not in (
             None,
@@ -1643,21 +2242,17 @@ class DownloadQueueItemWidget(QWidget):
             "--:--",
         ):
             parts.append(
-                f"Remaining: {eta}"
+                f"ETA: {eta}"
             )
 
-        status_text = "  •  ".join(parts)
-
-        if details:
-            status_text = (
-                f"{details}  •  "
-                f"{status_text}"
+        if filename:
+            parts.append(
+                str(filename)
             )
 
         self.set_details(
-            status_text
+            "  •  ".join(parts)
         )
-
 
 # ============================================================
 # QUEUE DATA
@@ -1668,6 +2263,8 @@ class QueueItem:
     data: dict
     widget: DownloadQueueItemWidget
     status: str = "Queued"
+    progress: float = 0.0
+    stage: str = ""
     thread: QThread | None = None
     worker: MediaDownloadWorker | None = None
 
@@ -1681,18 +2278,24 @@ class VideoDownloadPage(QWidget):
     download_requested = Signal(dict)
     cancel_requested = Signal()
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
+    def __init__(
+        self,
+        parent=None,
+    ):
+        super().__init__(
+            parent
+        )
 
         self.downloading = False
+        self.cancel_requested = False
 
-        self.info_thread = None
-        self.info_worker = None
-        self.info_processor = None
+        self.info_thread: Optional[QThread] = None
+        self.info_worker: Optional[MediaInfoWorker] = None
+        self.info_processor: Optional[MediaJobProcessor] = None
 
         self.selection_dialog = None
 
-        self.queue = []
+        self.queue: List[QueueItem] = []
 
         self.running = 0
         self.completed = 0
@@ -1715,7 +2318,10 @@ class VideoDownloadPage(QWidget):
     # ========================================================
 
     def build_ui(self):
-        root = QVBoxLayout(self)
+
+        root = QVBoxLayout(
+            self
+        )
 
         root.setContentsMargins(
             8,
@@ -1724,17 +2330,23 @@ class VideoDownloadPage(QWidget):
             8,
         )
 
-        root.setSpacing(6)
+        root.setSpacing(
+            6
+        )
 
-        # ----------------------------------------------------
+        # ====================================================
         # TOP
-        # ----------------------------------------------------
+        # ====================================================
 
         top = QWidget()
 
-        top.setFixedHeight(60)
+        top.setFixedHeight(
+            60
+        )
 
-        top_layout = QHBoxLayout(top)
+        top_layout = QHBoxLayout(
+            top
+        )
 
         top_layout.setContentsMargins(
             0,
@@ -1767,6 +2379,7 @@ class VideoDownloadPage(QWidget):
                 "subtitles",
             ),
         ):
+
             self.mode.addItem(
                 name,
                 value,
@@ -1776,16 +2389,64 @@ class VideoDownloadPage(QWidget):
             self.mode
         )
 
+        # ====================================================
+        # URL
+        # ====================================================
+
         self.url = QLineEdit()
 
         self.url.setPlaceholderText(
-            "Paste video or playlist URL..."
+            "Paste video or playlist URL here..."
+        )
+
+        self.url.setMinimumHeight(
+            36
+        )
+
+        self.url.setSizePolicy(
+            QSizePolicy.Expanding,
+            QSizePolicy.Fixed,
+        )
+
+        self.url.setStyleSheet(
+            """
+            QLineEdit {
+                border: 2px solid #3b82f6;
+                border-radius: 7px;
+                padding: 6px 10px;
+                background: palette(base);
+                color: palette(text);
+                font-size: 14px;
+            }
+
+            QLineEdit:hover {
+                border: 2px solid #60a5fa;
+            }
+
+            QLineEdit:focus {
+                border: 2px solid #2563eb;
+                background: palette(base);
+            }
+
+            QLineEdit:disabled {
+                border: 2px solid #9ca3af;
+            }
+            """
+        )
+
+        # Press Enter = Fetch.
+        self.url.returnPressed.connect(
+            self._fetch_from_enter
         )
 
         top_layout.addWidget(
             self.url,
             1,
         )
+
+        # ====================================================
+        # MULTIPLE
+        # ====================================================
 
         self.multiple = QCheckBox(
             "Multiple URLs"
@@ -1794,6 +2455,10 @@ class VideoDownloadPage(QWidget):
         top_layout.addWidget(
             self.multiple
         )
+
+        # ====================================================
+        # FETCH
+        # ====================================================
 
         self.fetch = QPushButton(
             "Fetch"
@@ -1807,9 +2472,9 @@ class VideoDownloadPage(QWidget):
             top
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # MIDDLE
-        # ----------------------------------------------------
+        # ====================================================
 
         middle = QGroupBox(
             "Selected Media / Download Queue"
@@ -1850,25 +2515,29 @@ class VideoDownloadPage(QWidget):
             100,
         )
 
-        self.overall.setValue(0)
+        self.overall.setValue(
+            0
+        )
 
-        self.overall.setFixedHeight(18)
+        self.overall.setFixedHeight(
+            18
+        )
 
         middle_layout.addWidget(
             self.overall
         )
 
         self.overall_label = QLabel(
-            "Completed: 0 / 0"
+            "Completed: 0 / 0    Overall: 0%"
         )
 
         middle_layout.addWidget(
             self.overall_label
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # QUEUE CONTROLS
-        # ----------------------------------------------------
+        # ====================================================
 
         controls = QHBoxLayout()
 
@@ -1877,7 +2546,7 @@ class VideoDownloadPage(QWidget):
         )
 
         self.clear_selection = QPushButton(
-            "Clear Selection"
+            "Remove Selected"
         )
 
         self.clear_queue = QPushButton(
@@ -1910,11 +2579,11 @@ class VideoDownloadPage(QWidget):
             controls
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # QUEUE LIST
-        # ----------------------------------------------------
+        # ====================================================
 
-        self.queue_list = QListWidget()
+        self.queue_list = QueueListWidget()
 
         self.queue_list.setSelectionMode(
             QAbstractItemView.ExtendedSelection
@@ -1924,16 +2593,10 @@ class VideoDownloadPage(QWidget):
             True
         )
 
-        # ====================================================
-        # IMPORTANT FIX
-        # ====================================================
-
-        # Tell QListWidget that every item has the same size.
         self.queue_list.setUniformItemSizes(
             True
         )
 
-        # Do not resize the list based on its children.
         self.queue_list.setSizeAdjustPolicy(
             QAbstractItemView.SizeAdjustPolicy.AdjustIgnored
         )
@@ -1946,8 +2609,6 @@ class VideoDownloadPage(QWidget):
             Qt.ScrollBarAlwaysOff
         )
 
-        # Never allow the queue itself to request a larger
-        # height from the parent when download widgets change.
         self.queue_list.setSizePolicy(
             QSizePolicy.Expanding,
             QSizePolicy.Expanding,
@@ -1963,13 +2624,15 @@ class VideoDownloadPage(QWidget):
             1,
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # BOTTOM
-        # ----------------------------------------------------
+        # ====================================================
 
         bottom = QWidget()
 
-        bottom.setFixedHeight(60)
+        bottom.setFixedHeight(
+            60
+        )
 
         bottom_layout = QHBoxLayout(
             bottom
@@ -2008,7 +2671,9 @@ class VideoDownloadPage(QWidget):
             "Cancel All"
         )
 
-        self.cancel.setEnabled(False)
+        self.cancel.setEnabled(
+            False
+        )
 
         bottom_layout.addWidget(
             self.settings
@@ -2026,9 +2691,9 @@ class VideoDownloadPage(QWidget):
             bottom
         )
 
-        # ----------------------------------------------------
+        # ====================================================
         # SIGNALS
-        # ----------------------------------------------------
+        # ====================================================
 
         self.fetch.clicked.connect(
             self.fetch_information
@@ -2046,23 +2711,60 @@ class VideoDownloadPage(QWidget):
             self.open_settings
         )
 
+        # Keep Select All as a normal Select All operation.
         self.select_queue.clicked.connect(
             self.queue_list.selectAll
         )
 
         self.clear_selection.clicked.connect(
-            self.queue_list.clearSelection
+            self.clear_queue_selection
         )
 
         self.clear_queue.clicked.connect(
             self.clear_queue_items
         )
 
+        self.queue_list.itemSelectionChanged.connect(
+            self.update_queue_widget_selection
+        )
+
+    # ========================================================
+    # ENTER -> FETCH
+    # ========================================================
+
+    @Slot()
+    def _fetch_from_enter(self):
+
+        if self.downloading:
+            return
+
+        self.fetch_information()
+
+    # ========================================================
+    # SELECTION VISUALS
+    # ========================================================
+
+    def update_queue_widget_selection(self):
+
+        selected_rows = {
+            self.queue_list.row(item)
+            for item in self.queue_list.selectedItems()
+        }
+
+        for row, queue_item in enumerate(
+            self.queue
+        ):
+
+            queue_item.widget.set_selected(
+                row in selected_rows
+            )
+
     # ========================================================
     # SETTINGS
     # ========================================================
 
     def open_settings(self):
+
         if self.downloading:
             return
 
@@ -2088,6 +2790,7 @@ class VideoDownloadPage(QWidget):
 
     @Slot()
     def fetch_information(self):
+
         if self.downloading:
             return
 
@@ -2100,11 +2803,15 @@ class VideoDownloadPage(QWidget):
         url = self.url.text().strip()
 
         if not url:
+
             QMessageBox.warning(
                 self,
                 "URL Required",
                 "Paste a video or playlist URL.",
             )
+
+            self.url.setFocus()
+
             return
 
         self.close_selection()
@@ -2123,12 +2830,17 @@ class VideoDownloadPage(QWidget):
         dialog.show()
 
         try:
+
             self.info_processor = (
                 MediaJobProcessor()
             )
 
         except Exception as exc:
-            self.info_error(exc)
+
+            self.info_error(
+                exc
+            )
+
             return
 
         settings = {
@@ -2203,14 +2915,27 @@ class VideoDownloadPage(QWidget):
             "Fetching media information..."
         )
 
+    # ========================================================
+    # INFO FINISHED
+    # ========================================================
+
     @Slot(object)
-    def info_finished(self, result):
-        if not isinstance(result, dict):
+    def info_finished(
+        self,
+        result,
+    ):
+
+        if not isinstance(
+            result,
+            dict,
+        ):
+
             self.info_error(
                 ValueError(
                     "Invalid media information."
                 )
             )
+
             return
 
         items = result.get(
@@ -2221,40 +2946,60 @@ class VideoDownloadPage(QWidget):
             items,
             dict,
         ):
-            items = [items]
+
+            items = [
+                items
+            ]
 
         if not items:
-            items = [result]
+            items = [
+                result
+            ]
 
         normalized = []
 
         for item in items:
+
             if not isinstance(
                 item,
                 dict,
             ):
                 continue
 
-            item = dict(item)
+            item = dict(
+                item
+            )
 
-            if not item.get("url"):
+            if not item.get(
+                "url"
+            ):
+
                 item["url"] = (
-                    item.get("webpage_url")
-                    or item.get("original_url")
+                    item.get(
+                        "webpage_url"
+                    )
+                    or item.get(
+                        "original_url"
+                    )
                     or ""
                 )
 
-            if item.get("url"):
+            if item.get(
+                "url"
+            ):
+
                 normalized.append(
                     item
                 )
 
         if not normalized:
+
             self.info_error(
                 ValueError(
                     "No downloadable media found."
                 )
             )
+
             return
 
         self.current.setText(
@@ -2266,18 +3011,32 @@ class VideoDownloadPage(QWidget):
         )
 
         if self.selection_dialog:
+
             self.selection_dialog.set_media_items(
                 normalized
             )
 
+    # ========================================================
+    # INFO CANCELLED
+    # ========================================================
+
     @Slot()
     def info_cancelled(self):
+
         self.current.setText(
             "Information fetch cancelled."
         )
 
+    # ========================================================
+    # INFO ERROR
+    # ========================================================
+
     @Slot(object)
-    def info_error(self, error):
+    def info_error(
+        self,
+        error,
+    ):
+
         message = (
             str(error).strip()
             or "Unknown error."
@@ -2292,6 +3051,7 @@ class VideoDownloadPage(QWidget):
         )
 
         if self.selection_dialog:
+
             self.selection_dialog.info.setText(
                 f"Error: {message}"
             )
@@ -2306,8 +3066,13 @@ class VideoDownloadPage(QWidget):
             message,
         )
 
+    # ========================================================
+    # INFO THREAD CLEANUP
+    # ========================================================
+
     @Slot()
     def info_thread_finished(self):
+
         thread = self.info_thread
 
         self.info_thread = None
@@ -2322,7 +3087,11 @@ class VideoDownloadPage(QWidget):
     # ========================================================
 
     @Slot(object)
-    def add_selected(self, selected):
+    def add_selected(
+        self,
+        selected,
+    ):
+
         if self.downloading:
             return
 
@@ -2333,17 +3102,29 @@ class VideoDownloadPage(QWidget):
             return
 
         for media in selected:
+
             if isinstance(
                 media,
                 dict,
             ):
+
                 self.add_queue_item(
                     media
                 )
 
         self.update_queue_count()
 
-    def add_queue_item(self, data):
+        self.update_queue_widget_selection()
+
+    # ========================================================
+    # ADD QUEUE ITEM
+    # ========================================================
+
+    def add_queue_item(
+        self,
+        data,
+    ):
+
         index = len(
             self.queue
         )
@@ -2363,10 +3144,6 @@ class VideoDownloadPage(QWidget):
 
         item = QListWidgetItem()
 
-        # ====================================================
-        # HARD FIXED ROW HEIGHT
-        # ====================================================
-
         item.setSizeHint(
             QSize(
                 0,
@@ -2383,7 +3160,6 @@ class VideoDownloadPage(QWidget):
             widget,
         )
 
-        # Re-apply after assigning the widget.
         item.setSizeHint(
             QSize(
                 0,
@@ -2400,7 +3176,86 @@ class VideoDownloadPage(QWidget):
 
         self.update_overall()
 
+    # ========================================================
+    # REMOVE SELECTED
+    # ========================================================
+
+    def clear_queue_selection(self):
+
+        if self.downloading:
+            return
+
+        selected_items = (
+            self.queue_list.selectedItems()
+        )
+
+        if not selected_items:
+            return
+
+        # Work backwards so removing one row
+        # does not invalidate the rows above it.
+        rows = sorted(
+            (
+                self.queue_list.row(item)
+                for item in selected_items
+            ),
+            reverse=True,
+        )
+
+        for row in rows:
+
+            if not (
+                0 <= row < len(self.queue)
+            ):
+                continue
+
+            # Remove data item.
+            self.queue.pop(
+                row
+            )
+
+            # Remove QListWidgetItem.
+            list_item = (
+                self.queue_list.takeItem(
+                    row
+                )
+            )
+
+            if list_item is not None:
+                del list_item
+
+        # Re-number widgets because their indexes
+        # are used by download worker signals.
+        for index, queue_item in enumerate(
+            self.queue
+        ):
+
+            queue_item.widget.index = index
+
+        self.queue_list.clearSelection()
+
+        self.update_queue_widget_selection()
+
+        self.update_queue_count()
+
+        self.update_overall()
+
+        if not self.queue:
+
+            self.current.setText(
+                "Ready."
+            )
+
+            self.log(
+                "Queue cleared."
+            )
+
+    # ========================================================
+    # CLEAR ENTIRE QUEUE
+    # ========================================================
+
     def clear_queue_items(self):
+
         if self.downloading:
             return
 
@@ -2419,7 +3274,20 @@ class VideoDownloadPage(QWidget):
 
         self.update_overall()
 
+        self.current.setText(
+            "Ready."
+        )
+
+        self.log(
+            "Queue cleared."
+        )
+
+    # ========================================================
+    # QUEUE COUNT
+    # ========================================================
+
     def update_queue_count(self):
+
         total = len(
             self.queue
         )
@@ -2444,24 +3312,34 @@ class VideoDownloadPage(QWidget):
 
     @Slot()
     def start_downloads(self):
+
         if self.downloading:
             return
 
         if not self.queue:
+
             QMessageBox.warning(
                 self,
                 "No Media",
                 "Fetch and select media first.",
             )
+
             return
 
+        self.cancel_requested = False
+
+        # Reset failed/cancelled items for another run.
         for item in self.queue:
+
             if item.status in (
                 "Completed",
                 "Failed",
                 "Cancelled",
             ):
+
                 item.status = "Queued"
+                item.progress = 0.0
+                item.stage = ""
 
                 item.widget.progress.setValue(
                     0
@@ -2472,7 +3350,11 @@ class VideoDownloadPage(QWidget):
                 )
 
         self.running = 0
-        self.completed = 0
+
+        self.completed = sum(
+            item.status == "Completed"
+            for item in self.queue
+        )
 
         self.set_downloading(
             True
@@ -2484,7 +3366,18 @@ class VideoDownloadPage(QWidget):
 
         self.start_more()
 
+    # ========================================================
+    # START MORE
+    # ========================================================
+
     def start_more(self):
+
+        if self.cancel_requested:
+
+            self.check_finished()
+
+            return
+
         limit = max(
             1,
             safe_int(
@@ -2497,6 +3390,7 @@ class VideoDownloadPage(QWidget):
         )
 
         while self.running < limit:
+
             item = next(
                 (
                     x
@@ -2519,10 +3413,20 @@ class VideoDownloadPage(QWidget):
     # ONE DOWNLOAD
     # ========================================================
 
-    def start_item(self, item):
+    def start_item(
+        self,
+        item,
+    ):
+
         index = item.widget.index
 
         item.status = "Downloading"
+        item.progress = 0.0
+        item.stage = ""
+
+        item.widget.progress.setValue(
+            0
+        )
 
         item.widget.set_status(
             "Downloading"
@@ -2617,6 +3521,8 @@ class VideoDownloadPage(QWidget):
             f"{media_title(item.data)}"
         )
 
+        self.update_overall()
+
     # ========================================================
     # PROGRESS
     # ========================================================
@@ -2625,7 +3531,7 @@ class VideoDownloadPage(QWidget):
         int,
         str,
         str,
-        int,
+        float,
         object,
     )
     def download_progress(
@@ -2636,99 +3542,174 @@ class VideoDownloadPage(QWidget):
         percentage,
         details,
     ):
-        item = self.get_item(
-            index
-        )
+        item = self.get_item(index)
 
         if not item:
             return
 
-        if item.status != "Downloading":
+        if item.status not in (
+            "Downloading",
+            "Cancelling...",
+        ):
             return
 
-        if not isinstance(
-            details,
-            dict,
-        ):
+        if not isinstance(details, dict):
             details = {}
 
+        # --------------------------------------------------------
+        # REAL DOWNLOAD PERCENTAGE
+        # --------------------------------------------------------
+
+        percentage = safe_float(
+            percentage,
+            0.0,
+        )
+
         percentage = max(
-            0,
+            0.0,
             min(
-                100,
-                safe_int(
-                    percentage
-                ),
+                100.0,
+                percentage,
             ),
         )
 
-        downloaded = (
-            details.get("downloaded")
-            or details.get("downloaded_bytes")
-            or "--"
-        )
+        item.progress = percentage
 
-        if isinstance(
-            downloaded,
-            (int, float),
-        ):
-            downloaded = format_bytes(
-                downloaded
-            )
-
-        speed = (
-            details.get("speed")
-            or "--"
-        )
-
-        if isinstance(
-            speed,
-            (int, float),
-        ):
-            speed = (
-                f"{format_bytes(speed)}/s"
-            )
-
-        eta = (
-            details.get("eta")
-            or "--:--"
-        )
-
-        if isinstance(
-            eta,
-            (int, float),
-        ):
-            eta = format_eta(
-                eta
-            )
+        # --------------------------------------------------------
+        # STAGE
+        # --------------------------------------------------------
 
         stage = (
             details.get("stage")
             or details.get("status")
+            or details.get("message")
             or info
             or ""
         )
 
-        stage = str(
-            stage
+        stage = str(stage).strip()
+        item.stage = stage
+
+        # --------------------------------------------------------
+        # DOWNLOADED
+        # --------------------------------------------------------
+
+        downloaded = (
+            details.get("downloaded")
+            or details.get("downloaded_bytes")
+            or details.get("bytes_downloaded")
+            or "--"
+        )
+
+        if isinstance(downloaded, (int, float)):
+            downloaded = format_bytes(downloaded)
+
+        # --------------------------------------------------------
+        # SPEED
+        # --------------------------------------------------------
+
+        speed = (
+            details.get("speed")
+            or details.get("speed_bytes")
+            or details.get("download_speed")
+            or "--"
+        )
+
+        if isinstance(speed, (int, float)):
+            speed = format_speed(speed)
+
+        # --------------------------------------------------------
+        # ETA
+        # --------------------------------------------------------
+
+        eta = (
+            details.get("eta")
+            or details.get("ETA")
+            or "--:--"
+        )
+
+        if isinstance(eta, (int, float)):
+            eta = format_eta(eta)
+
+        # --------------------------------------------------------
+        # FILENAME
+        # --------------------------------------------------------
+
+        filename = str(
+            filename or ""
         ).strip()
 
-        # IMPORTANT:
-        # The original media title is never replaced.
-        item.widget.set_progress(
-            percentage,
-            downloaded,
-            speed,
-            eta,
-            details=stage if stage else None,
-        )
-        self.update_overall()
+        # --------------------------------------------------------
+        # UPDATE WIDGET
+        # --------------------------------------------------------
 
-        if info:
-            self.log(
-                f"[{media_title(item.data)}] "
-                f"{info}"
+        item.widget.set_progress(
+            percentage=percentage,
+            downloaded=downloaded,
+            speed=speed,
+            eta=eta,
+            details=stage if stage else None,
+            filename=filename if filename else None,
+        )
+
+        # --------------------------------------------------------
+        # CURRENT
+        # --------------------------------------------------------
+
+        title = media_title(
+            item.data
+        )
+
+        if stage:
+            self.current.setText(
+                f"{stage}: {title}"
             )
+        else:
+            self.current.setText(
+                f"Downloading: {title}"
+            )
+
+        # --------------------------------------------------------
+        # LOG
+        # --------------------------------------------------------
+
+        log_parts = [
+            f"{percentage:.2f}%",
+        ]
+
+        if downloaded not in (
+            None,
+            "",
+            "--",
+        ):
+            log_parts.append(
+                str(downloaded)
+            )
+
+        if speed not in (
+            None,
+            "",
+            "--",
+        ):
+            log_parts.append(
+                str(speed)
+            )
+
+        if eta not in (
+            None,
+            "",
+            "--:--",
+        ):
+            log_parts.append(
+                f"ETA {eta}"
+            )
+
+        self.log(
+            f"[{title}] "
+            + " | ".join(log_parts)
+        )
+
+        self.update_overall()
 
     # ========================================================
     # FINISHED
@@ -2743,6 +3724,7 @@ class VideoDownloadPage(QWidget):
         index,
         result,
     ):
+
         item = self.get_item(
             index
         )
@@ -2754,6 +3736,10 @@ class VideoDownloadPage(QWidget):
             return
 
         item.status = "Completed"
+
+        item.progress = 100.0
+
+        item.stage = "Completed"
 
         item.widget.progress.setValue(
             100
@@ -2768,7 +3754,10 @@ class VideoDownloadPage(QWidget):
             self.running - 1,
         )
 
-        self.completed += 1
+        self.completed = sum(
+            x.status == "Completed"
+            for x in self.queue
+        )
 
         self.current.setText(
             f"Completed: "
@@ -2784,18 +3773,29 @@ class VideoDownloadPage(QWidget):
     # ========================================================
 
     @Slot(int)
-    def download_cancelled(self, index):
-        item = self.get_item(index)
+    def download_cancelled(
+        self,
+        index,
+    ):
+
+        item = self.get_item(
+            index
+        )
 
         if not item:
             return
 
-        if item.status != "Downloading":
+        if item.status not in (
+            "Downloading",
+            "Cancelling...",
+        ):
             return
 
         item.status = "Cancelled"
 
-        item.widget.set_status("Cancelled")
+        item.widget.set_status(
+            "Cancelled"
+        )
 
         self.running = max(
             0,
@@ -2804,19 +3804,28 @@ class VideoDownloadPage(QWidget):
 
         self.update_overall()
 
-        self.start_more()
+        if not self.cancel_requested:
+            self.start_more()
+
         self.check_finished()
+
     # ========================================================
     # ERROR
     # ========================================================
 
-    @Slot(int, object)
+    @Slot(
+        int,
+        object,
+    )
     def download_error(
         self,
         index,
         error,
     ):
-        item = self.get_item(index)
+
+        item = self.get_item(
+            index
+        )
 
         if not item:
             return
@@ -2831,7 +3840,9 @@ class VideoDownloadPage(QWidget):
 
         item.status = "Failed"
 
-        item.widget.set_status("Failed")
+        item.widget.set_status(
+            "Failed"
+        )
 
         item.widget.set_details(
             f"Error: {message}"
@@ -2850,7 +3861,9 @@ class VideoDownloadPage(QWidget):
 
         self.update_overall()
 
-        self.start_more()
+        if not self.cancel_requested:
+            self.start_more()
+
         self.check_finished()
 
     # ========================================================
@@ -2859,6 +3872,7 @@ class VideoDownloadPage(QWidget):
 
     @Slot()
     def download_thread_finished(self):
+
         thread = self.sender()
 
         if not isinstance(
@@ -2868,9 +3882,12 @@ class VideoDownloadPage(QWidget):
             return
 
         for item in self.queue:
+
             if item.thread is thread:
+
                 item.thread = None
                 item.worker = None
+
                 break
 
         thread.deleteLater()
@@ -2884,6 +3901,7 @@ class VideoDownloadPage(QWidget):
         self,
         index,
     ):
+
         item = self.get_item(
             index
         )
@@ -2899,6 +3917,9 @@ class VideoDownloadPage(QWidget):
 
         item.status = "Queued"
 
+        item.progress = 0.0
+        item.stage = ""
+
         item.widget.progress.setValue(
             0
         )
@@ -2912,6 +3933,9 @@ class VideoDownloadPage(QWidget):
         )
 
         if not self.downloading:
+
+            self.cancel_requested = False
+
             self.set_downloading(
                 True
             )
@@ -2929,6 +3953,7 @@ class VideoDownloadPage(QWidget):
         self,
         index,
     ):
+
         item = self.get_item(
             index
         )
@@ -2936,7 +3961,12 @@ class VideoDownloadPage(QWidget):
         if not item:
             return
 
+        # ----------------------------------------------------
+        # QUEUED
+        # ----------------------------------------------------
+
         if item.status == "Queued":
+
             item.status = "Cancelled"
 
             item.widget.set_status(
@@ -2949,15 +3979,41 @@ class VideoDownloadPage(QWidget):
 
             return
 
+        # ----------------------------------------------------
+        # NOT ACTIVE
+        # ----------------------------------------------------
+
         if item.status != "Downloading":
             return
 
+        # ----------------------------------------------------
+        # ACTIVE
+        # ----------------------------------------------------
+
         if item.worker:
-            QMetaObject.invokeMethod(
-                item.worker,
-                "cancel",
-                Qt.QueuedConnection,
+
+            item.status = "Cancelling..."
+
+            item.widget.set_status(
+                "Cancelling..."
             )
+
+            self.current.setText(
+                f"Cancelling: "
+                f"{media_title(item.data)}"
+            )
+
+            self.log(
+                f"Cancelling: "
+                f"{media_title(item.data)}"
+            )
+
+            try:
+
+                item.worker.cancel()
+
+            except Exception:
+                pass
 
     # ========================================================
     # CANCEL ALL
@@ -2965,6 +4021,7 @@ class VideoDownloadPage(QWidget):
 
     @Slot()
     def cancel_all(self):
+
         if not self.downloading:
             return
 
@@ -2980,27 +4037,57 @@ class VideoDownloadPage(QWidget):
         if answer != QMessageBox.Yes:
             return
 
+        self.cancel_requested = True
+
+        # ----------------------------------------------------
+        # Cancel queued
+        # ----------------------------------------------------
+
         for item in self.queue:
+
             if item.status == "Queued":
+
                 item.status = "Cancelled"
 
                 item.widget.set_status(
                     "Cancelled"
                 )
 
+        # ----------------------------------------------------
+        # Cancel active
+        # ----------------------------------------------------
+
         for item in self.queue:
+
             if (
                 item.status == "Downloading"
                 and item.worker
             ):
-                QMetaObject.invokeMethod(
-                    item.worker,
-                    "cancel",
-                    Qt.QueuedConnection,
+
+                item.status = "Cancelling..."
+
+                item.widget.set_status(
+                    "Cancelling..."
                 )
+
+                try:
+
+                    item.worker.cancel()
+
+                except Exception:
+                    pass
+
+        self.current.setText(
+            "Cancelling downloads..."
+        )
+
+        self.log(
+            "Cancelling all downloads..."
+        )
 
         self.update_overall()
 
+        # Do not start another queued item.
         self.check_finished()
 
     # ========================================================
@@ -3008,11 +4095,13 @@ class VideoDownloadPage(QWidget):
     # ========================================================
 
     def update_overall(self):
+
         total = len(
             self.queue
         )
 
         if not total:
+
             self.overall.setValue(
                 0
             )
@@ -3027,45 +4116,78 @@ class VideoDownloadPage(QWidget):
 
             return
 
-        total_percentage = 0
+        total_percentage = 0.0
 
         for item in self.queue:
 
             if item.status == "Completed":
-                total_percentage += 100
 
-            elif item.status == "Downloading":
-                total_percentage += (
-                    item.widget.progress.value()
-                )
+                total_percentage += 100.0
 
             elif item.status in (
-                "Queued",
-                "Cancelled",
-                "Failed",
+                "Downloading",
+                "Cancelling...",
             ):
-                total_percentage += 0
 
-        percentage = int(
+                total_percentage += max(
+                    0.0,
+                    min(
+                        100.0,
+                        float(
+                            item.progress
+                        ),
+                    ),
+                )
+
+            # Failed / Cancelled / Queued
+            # contribute their current progress.
+            #
+            # Normally these are 0, but retaining the
+            # current value makes the overall bar accurate
+            # if cancellation happens mid-download.
+            elif item.status in (
+                "Failed",
+                "Cancelled",
+            ):
+
+                total_percentage += max(
+                    0.0,
+                    min(
+                        100.0,
+                        float(
+                            item.progress
+                        ),
+                    ),
+                )
+
+        percentage = (
             total_percentage / total
         )
 
         percentage = max(
-            0,
+            0.0,
             min(
-                100,
+                100.0,
                 percentage,
             ),
         )
 
         self.overall.setValue(
-            percentage
+            round(percentage)
         )
+
+        completed = sum(
+            item.status == "Completed"
+            for item in self.queue
+        )
+
+        self.completed = completed
 
         self.overall_label.setText(
             f"Completed: "
-            f"{self.completed} / {total}"
-            f"    Overall: {percentage}%"
+            f"{completed} / {total}"
+            f"    Overall: "
+            f"{percentage:.2f}%"
         )
 
         queued = sum(
@@ -3082,6 +4204,7 @@ class VideoDownloadPage(QWidget):
     # ========================================================
 
     def check_finished(self):
+
         if not self.downloading:
             return
 
@@ -3108,19 +4231,28 @@ class VideoDownloadPage(QWidget):
             for item in self.queue
         )
 
-        if failed:
+        if self.cancel_requested:
+
+            message = (
+                "Downloads cancelled."
+            )
+
+        elif failed:
+
             message = (
                 f"Finished with "
                 f"{failed} failed item(s)."
             )
 
         elif cancelled:
+
             message = (
                 f"Finished with "
                 f"{cancelled} cancelled item(s)."
             )
 
         else:
+
             message = (
                 "All downloads completed."
             )
@@ -3133,6 +4265,8 @@ class VideoDownloadPage(QWidget):
             message
         )
 
+        self.cancel_requested = False
+
     # ========================================================
     # STATE
     # ========================================================
@@ -3141,6 +4275,7 @@ class VideoDownloadPage(QWidget):
         self,
         value,
     ):
+
         self.downloading = bool(
             value
         )
@@ -3195,9 +4330,11 @@ class VideoDownloadPage(QWidget):
         self,
         index,
     ):
+
         if 0 <= index < len(
             self.queue
         ):
+
             return self.queue[index]
 
         return None
@@ -3206,15 +4343,18 @@ class VideoDownloadPage(QWidget):
         self,
         message,
     ):
+
         self.log_label.setText(
             str(message)
         )
 
     def close_selection(self):
+
         if not self.selection_dialog:
             return
 
         try:
+
             self.selection_dialog.close()
             self.selection_dialog.deleteLater()
 
@@ -3231,6 +4371,7 @@ class VideoDownloadPage(QWidget):
         self,
         event,
     ):
+
         # ----------------------------------------------------
         # Cancel information worker safely.
         # ----------------------------------------------------
@@ -3239,7 +4380,9 @@ class VideoDownloadPage(QWidget):
             self.info_thread
             and self.info_thread.isRunning()
         ):
+
             if self.info_worker:
+
                 QMetaObject.invokeMethod(
                     self.info_worker,
                     "cancel",
@@ -3249,7 +4392,9 @@ class VideoDownloadPage(QWidget):
             if not self.info_thread.wait(
                 3000
             ):
+
                 event.ignore()
+
                 return
 
         # ----------------------------------------------------
@@ -3257,6 +4402,7 @@ class VideoDownloadPage(QWidget):
         # ----------------------------------------------------
 
         if self.downloading:
+
             answer = QMessageBox.question(
                 self,
                 "Downloads Running",
@@ -3267,28 +4413,42 @@ class VideoDownloadPage(QWidget):
             )
 
             if answer != QMessageBox.Yes:
+
                 event.ignore()
+
                 return
 
             for item in self.queue:
+
                 if (
-                    item.status == "Downloading"
+                    item.status
+                    in (
+                        "Downloading",
+                        "Cancelling...",
+                    )
                     and item.worker
                 ):
-                    QMetaObject.invokeMethod(
-                        item.worker,
-                        "cancel",
-                        Qt.QueuedConnection,
-                    )
+
+                    try:
+
+                        item.worker.cancel()
+
+                    except Exception:
+                        pass
 
             for item in self.queue:
+
                 if item.thread:
+
                     if not item.thread.wait(
                         5000
                     ):
+
                         event.ignore()
+
                         return
 
         self.close_selection()
 
         event.accept()
+

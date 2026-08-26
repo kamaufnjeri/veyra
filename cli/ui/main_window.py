@@ -4,7 +4,7 @@ from PySide6.QtWidgets import (
 )
 
 from ui.subtitle_page import SubtitlePage
-from ui.download_page import DownloadPage
+from cli.ui.media_download_page import DownloadPage
 from ui.sync_page import SyncPage
 
 
