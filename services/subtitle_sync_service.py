@@ -8,12 +8,10 @@ from typing import (
     Dict,
     List,
     Optional,
-    Sequence,
 )
 
 from core.subtitle_sync import (
     SubtitleFile,
-    SubtitleJoiner,
     SubtitleSynchronizer,
     SubtitleProcessor,
     SyncPoint,
@@ -24,27 +22,48 @@ class SubtitleSyncService:
     """
     Subtitle orchestration service.
 
-    This service sits above subtitle_processor.py and uses the
-    existing subtitle classes without modifying them.
+    Supported operations:
 
-    Responsibilities:
+        join_parts
+        merge_tracks
+        offset
+        two_point
+        multi_point
+        start_end
+        fit
+        clamp
+        validate
 
-        - settings normalization
-        - validation
-        - progress reporting
-        - cancellation
-        - callback handling
-        - orchestration
-        - result formatting
+    JOIN / MERGE support one to four subtitle files.
 
-    Core subtitle operations remain delegated to:
+    JOIN:
+        Files are placed sequentially on the timeline.
 
-        SubtitleFile
-        SubtitleJoiner
-        SubtitleSynchronizer
-        SubtitleProcessor
-        SyncPoint
+    MERGE:
+        Files are combined while preserving their timestamps.
+
+    Preferred JOIN / MERGE settings:
+
+        {
+            "operation": "join_parts",
+            "subtitle_files": [
+                "/path/one.srt",
+                "/path/two.srt",
+                "/path/three.srt",
+                "/path/four.srt",
+            ],
+            "output": "/path/output.srt",
+        }
+
+    Backwards compatibility:
+
+        first_file
+        second_file
+
+    are still accepted.
     """
+
+    MAX_SUBTITLE_FILES = 4
 
     OPERATIONS = {
         "join_parts",
@@ -65,18 +84,10 @@ class SubtitleSyncService:
 
     def __init__(
         self,
-        progress_callback: Optional[
-            Callable[..., None]
-        ] = None,
-        error_callback: Optional[
-            Callable[[Any], None]
-        ] = None,
-        finished_callback: Optional[
-            Callable[..., None]
-        ] = None,
-        cancelled_callback: Optional[
-            Callable[..., None]
-        ] = None,
+        progress_callback: Optional[Callable[..., None]] = None,
+        error_callback: Optional[Callable[[Any], None]] = None,
+        finished_callback: Optional[Callable[..., None]] = None,
+        cancelled_callback: Optional[Callable[..., None]] = None,
     ) -> None:
 
         self.progress_callback = progress_callback
@@ -87,6 +98,11 @@ class SubtitleSyncService:
         self.cancelled = False
         self._progress_stage = "idle"
 
+        # FIX:
+        # The old code referenced self.subtitle_format without
+        # ever creating the attribute.
+        self.subtitle_format = "srt"
+
     # ==========================================================
     # PUBLIC
     # ==========================================================
@@ -95,21 +111,156 @@ class SubtitleSyncService:
         self,
         settings: Dict[str, Any],
     ) -> Dict[str, Any]:
-
+        """Process a subtitle operation."""
         return self.create_subtitles(settings)
 
     def start(
         self,
         settings: Dict[str, Any],
     ) -> Dict[str, Any]:
-
+        """Start a subtitle operation."""
         return self.create_subtitles(settings)
+
+    def process_subtitle_operation(
+        self,
+        settings: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Compatibility wrapper.
+
+        Some callers use process_subtitle_operation()
+        directly. Keep it as an alias to the main processing
+        entry point.
+        """
+        return self.create_subtitles(settings)
+
+    # ==========================================================
+    # CONVENIENCE JOIN API
+    # ==========================================================
+
+    def join_subtitles(
+        self,
+        subtitle_files: Optional[List[str]] = None,
+        output_path: str = "",
+        first_path: Optional[str] = None,
+        second_path: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Sequentially join one to four subtitle files.
+
+        Preferred API:
+
+            subtitle_files=[...]
+
+        Backwards-compatible API:
+
+            first_path=...
+            second_path=...
+        """
+
+        files = self._build_compatibility_file_list(
+            subtitle_files=subtitle_files,
+            first_path=first_path,
+            second_path=second_path,
+        )
+
+        return self.create_subtitles(
+            {
+                "operation": "join_parts",
+                "subtitle_files": files,
+                "output": output_path,
+            }
+        )
+
+    # ==========================================================
+    # CONVENIENCE MERGE API
+    # ==========================================================
+
+    def merge_subtitles(
+        self,
+        subtitle_files: Optional[List[Any]] = None,
+        output: str = "",
+        remove_duplicates: bool = True,
+        first_file: Optional[str] = None,
+        second_file: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Merge one to four subtitle tracks.
+
+        MERGE uses a plain list of subtitle file paths.
+
+        Example:
+
+            [
+                "/absolute/file1.srt",
+                "/absolute/file2.srt",
+            ]
+
+        MERGE does not use:
+            - name
+            - offset
+            - gap
+        """
+
+        self.check_cancelled()
+
+        if subtitle_files is not None:
+
+            if isinstance(
+                subtitle_files,
+                (str, os.PathLike),
+            ):
+                files: List[Any] = [subtitle_files]
+            else:
+                files = list(subtitle_files)
+
+        else:
+
+            files = []
+
+            if first_file:
+                files.append(first_file)
+
+            if second_file:
+                files.append(second_file)
+
+        files = self._normalize_subtitle_files(
+            {
+                "subtitle_files": files,
+            },
+            operation="merge_tracks",
+        )
+
+        if not output:
+            raise ValueError(
+                "Output filepath cannot be empty."
+            )
+
+        settings: Dict[str, Any] = {
+            "operation": "merge_tracks",
+            "subtitle_files": files,
+            "output": output,
+            "remove_duplicates": bool(
+                remove_duplicates
+            ),
+            "subtitle_format": self._detect_format(
+                output
+            ),
+        }
+
+        return self.process_subtitle_operation(
+            settings
+        )
 
     # ==========================================================
     # CANCEL
     # ==========================================================
 
     def cancel(self) -> None:
+        """Request cancellation."""
+
+        if self.cancelled:
+            return
 
         self.cancelled = True
 
@@ -120,15 +271,18 @@ class SubtitleSyncService:
         )
 
         if self.cancelled_callback:
-
             try:
                 self.cancelled_callback()
-
             except Exception as exc:
                 self._error(exc)
 
     def reset_cancel(self) -> None:
+        """Reset cancellation state before a new operation."""
         self.cancelled = False
+
+    def check_cancelled(self) -> None:
+        """Public cancellation check."""
+        self._check_cancelled()
 
     # ==========================================================
     # MAIN
@@ -138,11 +292,11 @@ class SubtitleSyncService:
         self,
         settings: Dict[str, Any],
     ) -> Dict[str, Any]:
+        """Main subtitle-processing entry point."""
 
         self.reset_cancel()
 
         settings = self._normalize_settings(settings)
-
         self._validate_settings(settings)
 
         operation = settings["operation"]
@@ -219,7 +373,6 @@ class SubtitleSyncService:
                 return self._cancelled_result(settings)
 
             self._error(exc)
-
             raise
 
     # ==========================================================
@@ -233,9 +386,7 @@ class SubtitleSyncService:
 
         self._progress_stage = "joining"
 
-        first_path = settings["first_file"]
-        second_path = settings["second_file"]
-        output_path = settings["output"]
+        files = settings["subtitle_files"]
 
         self._progress(
             "Joining subtitle files",
@@ -243,17 +394,14 @@ class SubtitleSyncService:
             30,
         )
 
-        # Use SubtitleProcessor as the high-level file operation.
+        self._check_cancelled()
+
         result = SubtitleProcessor.join_parts(
-            first_path,
-            second_path,
-            output_path,
-            gap=settings["gap"],
-            second_offset=settings.get("second_offset"),
+            subtitle_files=files,
+            output_path=settings["output"],
         )
 
-        if self.cancelled:
-            return self._cancelled_result(settings)
+        self._check_cancelled()
 
         self._progress(
             "Joined subtitle files",
@@ -278,22 +426,26 @@ class SubtitleSyncService:
 
         self._progress_stage = "merging"
 
+        files = settings["subtitle_files"]
+
         self._progress(
             "Merging subtitle tracks",
             self._display_name(settings),
             30,
         )
 
-        # SubtitleProcessor orchestrates loading, merging,
-        # and saving through SubtitleJoiner.
+        self._check_cancelled()
+
         result = SubtitleProcessor.merge_tracks(
-            settings["first_file"],
-            settings["second_file"],
-            settings["output"],
+            subtitle_files=files,
+            output_path=settings["output"],
+            remove_duplicates=settings.get(
+                "remove_duplicates",
+                True,
+            ),
         )
 
-        if self.cancelled:
-            return self._cancelled_result(settings)
+        self._check_cancelled()
 
         self._progress(
             "Merged subtitle tracks",
@@ -324,16 +476,18 @@ class SubtitleSyncService:
             40,
         )
 
-        # Use SubtitleProcessor for the complete file operation.
+        self._check_cancelled()
+
         result = SubtitleProcessor.sync_offset(
             settings["subtitle_file"],
             settings["output"],
             settings["offset"],
-            video_duration=settings.get("video_duration"),
+            video_duration=settings.get(
+                "video_duration"
+            ),
         )
 
-        if self.cancelled:
-            return self._cancelled_result(settings)
+        self._check_cancelled()
 
         self._progress(
             "Subtitle offset applied",
@@ -364,8 +518,8 @@ class SubtitleSyncService:
             30,
         )
 
-        # SubtitleProcessor delegates the actual mathematics to
-        # SubtitleSynchronizer.
+        self._check_cancelled()
+
         result = SubtitleProcessor.sync_two_points(
             settings["subtitle_file"],
             settings["output"],
@@ -373,11 +527,12 @@ class SubtitleSyncService:
             settings["video_point_1"],
             settings["subtitle_point_2"],
             settings["video_point_2"],
-            video_duration=settings.get("video_duration"),
+            video_duration=settings.get(
+                "video_duration"
+            ),
         )
 
-        if self.cancelled:
-            return self._cancelled_result(settings)
+        self._check_cancelled()
 
         self._progress(
             "Progressive subtitle timing correction applied",
@@ -408,14 +563,15 @@ class SubtitleSyncService:
             20,
         )
 
+        self._check_cancelled()
+
         points = self._parse_sync_points(
             settings["sync_points"]
         )
 
         if len(points) < 2:
             raise ValueError(
-                "At least two synchronization points "
-                "are required."
+                "At least two synchronization points are required."
             )
 
         self._progress(
@@ -424,15 +580,18 @@ class SubtitleSyncService:
             50,
         )
 
+        self._check_cancelled()
+
         result = SubtitleProcessor.sync_points(
             settings["subtitle_file"],
             settings["output"],
             points,
-            video_duration=settings.get("video_duration"),
+            video_duration=settings.get(
+                "video_duration"
+            ),
         )
 
-        if self.cancelled:
-            return self._cancelled_result(settings)
+        self._check_cancelled()
 
         self._progress(
             "Multi-point synchronization complete",
@@ -465,14 +624,15 @@ class SubtitleSyncService:
             50,
         )
 
+        self._check_cancelled()
+
         result = SubtitleProcessor.sync_start_end(
             settings["subtitle_file"],
             settings["output"],
             video_duration,
         )
 
-        if self.cancelled:
-            return self._cancelled_result(settings)
+        self._check_cancelled()
 
         self._progress(
             "Start and end synchronization complete",
@@ -505,15 +665,13 @@ class SubtitleSyncService:
             10,
         )
 
-        # SubtitleProcessor does not currently expose a fit()
-        # file-level operation, so use SubtitleFile +
-        # SubtitleSynchronizer directly.
+        self._check_cancelled()
+
         subtitles = SubtitleFile.load(
             settings["subtitle_file"]
         )
 
-        if self.cancelled:
-            return self._cancelled_result(settings)
+        self._check_cancelled()
 
         self._progress(
             "Fitting subtitles to video duration",
@@ -526,13 +684,14 @@ class SubtitleSyncService:
             video_duration,
         )
 
-        if self.cancelled:
-            return self._cancelled_result(settings)
+        self._check_cancelled()
 
         result = self._finalize_timing(
             result,
             settings,
         )
+
+        self._check_cancelled()
 
         self._progress(
             "Saving fitted subtitles",
@@ -541,6 +700,8 @@ class SubtitleSyncService:
         )
 
         result.save(settings["output"])
+
+        self._check_cancelled()
 
         return self._result(
             settings=settings,
@@ -567,12 +728,13 @@ class SubtitleSyncService:
             10,
         )
 
+        self._check_cancelled()
+
         subtitles = SubtitleFile.load(
             settings["subtitle_file"]
         )
 
-        if self.cancelled:
-            return self._cancelled_result(settings)
+        self._check_cancelled()
 
         self._progress(
             "Clamping subtitles to video duration",
@@ -585,8 +747,7 @@ class SubtitleSyncService:
             video_duration,
         )
 
-        if self.cancelled:
-            return self._cancelled_result(settings)
+        self._check_cancelled()
 
         self._progress(
             "Saving clamped subtitles",
@@ -595,6 +756,8 @@ class SubtitleSyncService:
         )
 
         result.save(settings["output"])
+
+        self._check_cancelled()
 
         return self._result(
             settings=settings,
@@ -619,10 +782,13 @@ class SubtitleSyncService:
             50,
         )
 
-        # Use SubtitleProcessor for the high-level validation API.
+        self._check_cancelled()
+
         result = SubtitleProcessor.validate(
             settings["subtitle_file"]
         )
+
+        self._check_cancelled()
 
         self._progress(
             "Subtitle validation complete",
@@ -630,9 +796,20 @@ class SubtitleSyncService:
             100,
         )
 
+        if isinstance(result, dict):
+            output = dict(result)
+        else:
+            output = {
+                "errors": result
+            }
+
+        errors = output.get("errors", [])
+
         return {
-            **result,
+            **output,
             "operation": "validate",
+            "success": not bool(errors),
+            "completed": True,
             "cancelled": False,
         }
 
@@ -649,11 +826,9 @@ class SubtitleSyncService:
         result = subtitles
 
         if settings["remove_duplicates"]:
-
             result = result.remove_duplicates()
 
-        if self.cancelled:
-            return result
+        self._check_cancelled()
 
         video_duration = settings.get(
             "video_duration"
@@ -663,22 +838,19 @@ class SubtitleSyncService:
             settings["clamp_to_video"]
             and video_duration is not None
         ):
-
             result = SubtitleSynchronizer.clamp(
                 result,
                 video_duration,
             )
 
-        if self.cancelled:
-            return result
+        self._check_cancelled()
 
         errors = result.validate()
 
         if errors:
-
             raise ValueError(
                 "Subtitle timing validation failed:\n"
-                + "\n".join(errors)
+                + "\n".join(map(str, errors))
             )
 
         return result
@@ -692,10 +864,7 @@ class SubtitleSyncService:
         points: Any,
     ) -> List[SyncPoint]:
 
-        if not isinstance(
-            points,
-            (list, tuple),
-        ):
+        if not isinstance(points, (list, tuple)):
             raise ValueError(
                 "sync_points must be a list."
             )
@@ -704,23 +873,16 @@ class SubtitleSyncService:
 
         for point in points:
 
-            if isinstance(
-                point,
-                SyncPoint,
-            ):
+            if isinstance(point, SyncPoint):
                 result.append(point)
                 continue
 
-            if isinstance(
-                point,
-                dict,
-            ):
+            if isinstance(point, dict):
 
                 try:
                     subtitle_time = float(
                         point["subtitle_time"]
                     )
-
                     video_time = float(
                         point["video_time"]
                     )
@@ -732,8 +894,14 @@ class SubtitleSyncService:
                 ) as exc:
 
                     raise ValueError(
-                        "Invalid synchronization point."
+                        "Invalid synchronization point. "
+                        "Expected subtitle_time and video_time."
                     ) from exc
+
+                if subtitle_time < 0 or video_time < 0:
+                    raise ValueError(
+                        "Synchronization times cannot be negative."
+                    )
 
                 result.append(
                     SyncPoint(
@@ -745,21 +913,13 @@ class SubtitleSyncService:
                 continue
 
             if (
-                isinstance(
-                    point,
-                    (list, tuple),
-                )
+                isinstance(point, (list, tuple))
                 and len(point) >= 2
             ):
 
                 try:
-
-                    result.append(
-                        SyncPoint(
-                            subtitle_time=float(point[0]),
-                            video_time=float(point[1]),
-                        )
-                    )
+                    subtitle_time = float(point[0])
+                    video_time = float(point[1])
 
                 except (
                     TypeError,
@@ -771,17 +931,28 @@ class SubtitleSyncService:
                         f"{point!r}"
                     ) from exc
 
+                if subtitle_time < 0 or video_time < 0:
+                    raise ValueError(
+                        "Synchronization times cannot be negative."
+                    )
+
+                result.append(
+                    SyncPoint(
+                        subtitle_time=subtitle_time,
+                        video_time=video_time,
+                    )
+                )
+
                 continue
 
             raise ValueError(
-                "Invalid synchronization point: "
-                f"{point!r}"
+                f"Invalid synchronization point: {point!r}"
             )
 
         return result
 
     # ==========================================================
-    # SETTINGS
+    # SETTINGS NORMALIZATION
     # ==========================================================
 
     def _normalize_settings(
@@ -789,7 +960,15 @@ class SubtitleSyncService:
         settings: Dict[str, Any],
     ) -> Dict[str, Any]:
 
-        settings = dict(settings or {})
+        if settings is None:
+            settings = {}
+
+        if not isinstance(settings, dict):
+            raise TypeError(
+                "Subtitle settings must be a dictionary."
+            )
+
+        settings = dict(settings)
 
         operation = str(
             settings.get("operation", "offset")
@@ -801,12 +980,14 @@ class SubtitleSyncService:
             "join_two": "join_parts",
             "join_files": "join_parts",
             "merge": "merge_tracks",
+            "merge_files": "merge_tracks",
             "sync": "offset",
             "fixed": "offset",
             "fixed_offset": "offset",
             "drift": "two_point",
             "two_points": "two_point",
             "multi_points": "multi_point",
+            "points": "multi_point",
             "start_end_sync": "start_end",
         }
 
@@ -818,7 +999,7 @@ class SubtitleSyncService:
         settings["operation"] = operation
 
         # ------------------------------------------------------
-        # Output
+        # OUTPUT
         # ------------------------------------------------------
 
         output = str(
@@ -835,93 +1016,48 @@ class SubtitleSyncService:
         )
 
         # ------------------------------------------------------
-        # Files
+        # SINGLE SUBTITLE FILE
         # ------------------------------------------------------
 
-        for key in (
-            "subtitle_file",
-            "first_file",
-            "second_file",
-        ):
-
-            value = str(
-                settings.get(key, "")
-                or ""
-            ).strip()
-
-            settings[key] = (
-                os.path.abspath(
-                    os.path.expanduser(value)
-                )
-                if value
-                else ""
-            )
-
-        # ------------------------------------------------------
-        # Offset
-        # ------------------------------------------------------
-
-        try:
-
-            settings["offset"] = float(
-                settings.get("offset", 0.0)
-            )
-
-        except (
-            TypeError,
-            ValueError,
-        ):
-
-            settings["offset"] = 0.0
-
-        # ------------------------------------------------------
-        # Join gap
-        # ------------------------------------------------------
-
-        try:
-
-            settings["gap"] = float(
-                settings.get("gap", 0.0)
-            )
-
-        except (
-            TypeError,
-            ValueError,
-        ):
-
-            settings["gap"] = 0.0
-
-        # ------------------------------------------------------
-        # Optional second offset
-        # ------------------------------------------------------
-
-        second_offset = settings.get(
-            "second_offset"
+        subtitle_file = (
+            settings.get("subtitle_file")
+            or settings.get("subtitle_path")
+            or settings.get("subtitle_filepath")
+            or ""
         )
 
-        if second_offset in (None, ""):
+        subtitle_file = str(
+            subtitle_file
+            or ""
+        ).strip()
 
-            settings["second_offset"] = None
-
-        else:
-
-            try:
-
-                settings["second_offset"] = float(
-                    second_offset
-                )
-
-            except (
-                TypeError,
-                ValueError,
-            ) as exc:
-
-                raise ValueError(
-                    "second_offset must be numeric."
-                ) from exc
+        settings["subtitle_file"] = (
+            os.path.abspath(
+                os.path.expanduser(subtitle_file)
+            )
+            if subtitle_file
+            else ""
+        )
 
         # ------------------------------------------------------
-        # Video duration
+        # FILE LIST
+        #
+        # IMPORTANT FIX:
+        # operation must be passed here.
+        #
+        # The old code always used the default "join_parts",
+        # which caused MERGE to return JOIN dictionaries.
+        # ------------------------------------------------------
+
+        settings["subtitle_files"] = (
+            self._normalize_subtitle_files(
+                settings,
+                operation=operation,
+            )
+        )
+
+        # ------------------------------------------------------
+        # VIDEO DURATION
         # ------------------------------------------------------
 
         duration = settings.get(
@@ -934,21 +1070,12 @@ class SubtitleSyncService:
 
         else:
 
-            try:
-
-                duration = float(duration)
-
-            except (
-                TypeError,
-                ValueError,
-            ) as exc:
-
-                raise ValueError(
-                    "video_duration must be greater than zero."
-                ) from exc
+            duration = self._to_float(
+                duration,
+                "video_duration",
+            )
 
             if duration <= 0:
-
                 raise ValueError(
                     "video_duration must be greater than zero."
                 )
@@ -956,7 +1083,22 @@ class SubtitleSyncService:
             settings["video_duration"] = duration
 
         # ------------------------------------------------------
-        # Two-point synchronization
+        # OFFSET
+        # ------------------------------------------------------
+
+        offset = settings.get(
+            "offset",
+            0.0,
+        )
+
+        settings["offset"] = self._to_float(
+            offset,
+            "offset",
+            default=0.0,
+        )
+
+        # ------------------------------------------------------
+        # TWO POINT VALUES
         # ------------------------------------------------------
 
         for key in (
@@ -968,26 +1110,28 @@ class SubtitleSyncService:
 
             value = settings.get(key)
 
-            if value is None and operation != "two_point":
-                continue
-
-            try:
-
-                settings[key] = float(value)
-
-            except (
-                TypeError,
-                ValueError,
-            ) as exc:
+            if value in (None, ""):
 
                 if operation == "two_point":
-
                     raise ValueError(
                         f"{key} is required and must be numeric."
-                    ) from exc
+                    )
+
+                settings[key] = None
+                continue
+
+            settings[key] = self._to_float(
+                value,
+                key,
+            )
+
+            if settings[key] < 0:
+                raise ValueError(
+                    f"{key} cannot be negative."
+                )
 
         # ------------------------------------------------------
-        # Multi-point synchronization
+        # SYNC POINTS
         # ------------------------------------------------------
 
         settings["sync_points"] = settings.get(
@@ -996,32 +1140,456 @@ class SubtitleSyncService:
         )
 
         # ------------------------------------------------------
-        # Processing options
+        # OPTIONS
         # ------------------------------------------------------
 
-        settings["remove_duplicates"] = bool(
-            settings.get(
-                "remove_duplicates",
-                True,
+        settings["remove_duplicates"] = (
+            self._to_bool(
+                settings.get(
+                    "remove_duplicates",
+                    True,
+                )
             )
         )
 
-        settings["clamp_to_video"] = bool(
-            settings.get(
-                "clamp_to_video",
-                True,
+        settings["clamp_to_video"] = (
+            self._to_bool(
+                settings.get(
+                    "clamp_to_video",
+                    True,
+                )
             )
         )
 
-        settings["subtitle_format"] = str(
+        # ------------------------------------------------------
+        # FORMAT
+        # ------------------------------------------------------
+
+        subtitle_format = str(
             settings.get(
                 "subtitle_format",
-                "srt",
+                "",
             )
-            or "srt"
+            or ""
         ).strip().lower().lstrip(".")
 
+        if not subtitle_format and output:
+            subtitle_format = self._detect_format(
+                output
+            )
+
+        if not subtitle_format:
+            subtitle_format = "srt"
+
+        settings["subtitle_format"] = subtitle_format
+
+        # Keep service-level compatibility.
+        self.subtitle_format = subtitle_format
+
         return settings
+
+    # ==========================================================
+    # FILE LIST NORMALIZATION
+    # ==========================================================
+
+    @classmethod
+    def _normalize_subtitle_files(
+        cls,
+        settings: Dict[str, Any],
+        operation: str = "join_parts",
+    ) -> List[Any]:
+        """
+        Normalize subtitle files.
+
+        JOIN returns dictionaries:
+
+            [
+                {
+                    "name": "/absolute/part1.srt",
+                    "offset": 0.0,
+                },
+                {
+                    "name": "/absolute/part2.srt",
+                    "offset": 0.0,
+                    "gap": 0.0,
+                },
+            ]
+
+        MERGE returns plain paths:
+
+            [
+                "/absolute/file1.srt",
+                "/absolute/file2.srt",
+            ]
+        """
+
+        files_value = settings.get("subtitle_files")
+
+        if files_value is None:
+            files_value = settings.get("files")
+
+        raw_files: List[Any] = []
+
+        # ------------------------------------------------------
+        # NEW API
+        # ------------------------------------------------------
+
+        if files_value is not None:
+
+            if isinstance(
+                files_value,
+                (str, os.PathLike),
+            ):
+                raw_files.append(files_value)
+
+            elif isinstance(
+                files_value,
+                (list, tuple),
+            ):
+                raw_files.extend(files_value)
+
+            else:
+                raise ValueError(
+                    "subtitle_files must be a list "
+                    "of subtitle file paths or dictionaries."
+                )
+
+        # ------------------------------------------------------
+        # OLD API
+        # ------------------------------------------------------
+
+        else:
+
+            first = settings.get("first_file")
+            second = settings.get("second_file")
+
+            if first:
+                raw_files.append(first)
+
+            if second:
+                raw_files.append(second)
+
+        normalized: List[Any] = []
+
+        for index, item in enumerate(raw_files):
+
+            if not item:
+                continue
+
+            # ==================================================
+            # MERGE
+            # ==================================================
+
+            if operation == "merge_tracks":
+
+                if isinstance(
+                    item,
+                    dict,
+                ):
+
+                    name = (
+                        item.get("name")
+                        or item.get("file")
+                        or item.get("path")
+                        or item.get("filepath")
+                        or item.get("subtitle_file")
+                    )
+
+                    if not name:
+                        raise ValueError(
+                            f"Subtitle file #{index + 1} "
+                            "is missing a file path."
+                        )
+
+                elif isinstance(
+                    item,
+                    (str, os.PathLike),
+                ):
+
+                    name = item
+
+                else:
+
+                    raise ValueError(
+                        f"Subtitle file #{index + 1} must be "
+                        "a string path or dictionary."
+                    )
+
+                name = str(name).strip()
+
+                if not name:
+                    continue
+
+                normalized.append(
+                    os.path.abspath(
+                        os.path.expanduser(name)
+                    )
+                )
+
+                continue
+
+            # ==================================================
+            # JOIN
+            # ==================================================
+
+            if operation == "join_parts":
+
+                # ----------------------------------------------
+                # STRING PATH
+                # ----------------------------------------------
+
+                if isinstance(
+                    item,
+                    (str, os.PathLike),
+                ):
+
+                    name = str(item).strip()
+
+                    if not name:
+                        continue
+
+                    config: Dict[str, Any] = {
+                        "name": os.path.abspath(
+                            os.path.expanduser(name)
+                        ),
+                        "offset": 0.0,
+                    }
+
+                    if index > 0:
+                        config["gap"] = 0.0
+
+                    normalized.append(config)
+
+                    continue
+
+                # ----------------------------------------------
+                # DICTIONARY
+                # ----------------------------------------------
+
+                if isinstance(
+                    item,
+                    dict,
+                ):
+
+                    name = (
+                        item.get("name")
+                        or item.get("file")
+                        or item.get("path")
+                        or item.get("filepath")
+                        or item.get("subtitle_file")
+                    )
+
+                    if not name:
+                        raise ValueError(
+                            f"Subtitle file #{index + 1} "
+                            "is missing a file path."
+                        )
+
+                    name = str(name).strip()
+
+                    if not name:
+                        continue
+
+                    raw_offset = item.get(
+                        "offset",
+                        0.0,
+                    )
+
+                    try:
+                        offset = float(raw_offset)
+                    except (
+                        TypeError,
+                        ValueError,
+                    ) as exc:
+
+                        raise ValueError(
+                            f"Invalid offset for subtitle "
+                            f"file #{index + 1}: "
+                            f"{raw_offset!r}"
+                        ) from exc
+
+                    config = {
+                        "name": os.path.abspath(
+                            os.path.expanduser(name)
+                        ),
+                        "offset": offset,
+                    }
+
+                    if index > 0:
+
+                        raw_gap = item.get(
+                            "gap",
+                            0.0,
+                        )
+
+                        try:
+                            gap = float(raw_gap)
+                        except (
+                            TypeError,
+                            ValueError,
+                        ) as exc:
+
+                            raise ValueError(
+                                f"Invalid gap for subtitle "
+                                f"file #{index + 1}: "
+                                f"{raw_gap!r}"
+                            ) from exc
+
+                        if gap < 0:
+                            raise ValueError(
+                                f"Gap for subtitle file "
+                                f"#{index + 1} cannot be negative."
+                            )
+
+                        config["gap"] = gap
+
+                    normalized.append(config)
+
+                    continue
+
+                raise ValueError(
+                    f"Subtitle file #{index + 1} must be "
+                    "a string path or dictionary."
+                )
+
+        # ------------------------------------------------------
+        # REMOVE DUPLICATES
+        # ------------------------------------------------------
+
+        if operation == "merge_tracks":
+
+            cleaned: List[str] = []
+            seen: set[str] = set()
+
+            for filepath in normalized:
+
+                filepath = os.path.normcase(
+                    os.path.abspath(filepath)
+                )
+
+                if filepath in seen:
+                    continue
+
+                seen.add(filepath)
+                cleaned.append(filepath)
+
+        else:
+
+            cleaned = []
+            seen = set()
+
+            for config in normalized:
+
+                name = os.path.normcase(
+                    os.path.abspath(
+                        config["name"]
+                    )
+                )
+
+                if name in seen:
+                    continue
+
+                seen.add(name)
+                cleaned.append(config)
+
+        # ------------------------------------------------------
+        # VALIDATE COUNT
+        # ------------------------------------------------------
+
+        if not cleaned:
+            raise ValueError(
+                "Select at least one subtitle file."
+            )
+
+        if len(cleaned) > cls.MAX_SUBTITLE_FILES:
+            raise ValueError(
+                "A maximum of four subtitle files can be used."
+            )
+
+        # ------------------------------------------------------
+        # PART 1 MUST NOT HAVE GAP
+        # ------------------------------------------------------
+
+        if operation == "join_parts":
+            cleaned[0].pop("gap", None)
+
+        return cleaned
+
+    # ==========================================================
+    # COMPATIBILITY FILE LIST
+    # ==========================================================
+
+    @classmethod
+    def _build_compatibility_file_list(
+        cls,
+        subtitle_files: Optional[List[str]] = None,
+        first_path: Optional[str] = None,
+        second_path: Optional[str] = None,
+    ) -> List[str]:
+
+        files: List[Any] = []
+
+        if subtitle_files is not None:
+
+            if isinstance(
+                subtitle_files,
+                (str, os.PathLike),
+            ):
+
+                files = [subtitle_files]
+
+            else:
+
+                try:
+                    files = list(subtitle_files)
+
+                except TypeError as exc:
+
+                    raise ValueError(
+                        "subtitle_files must be a list "
+                        "of subtitle file paths."
+                    ) from exc
+
+        else:
+
+            if first_path:
+                files.append(first_path)
+
+            if second_path:
+                files.append(second_path)
+
+        cleaned: List[str] = []
+
+        for filepath in files:
+
+            if not filepath:
+                continue
+
+            filepath = str(
+                filepath
+            ).strip()
+
+            if not filepath:
+                continue
+
+            filepath = os.path.abspath(
+                os.path.expanduser(filepath)
+            )
+
+            if filepath not in cleaned:
+                cleaned.append(filepath)
+
+        if not cleaned:
+            raise ValueError(
+                "At least one subtitle file is required."
+            )
+
+        if len(cleaned) > cls.MAX_SUBTITLE_FILES:
+            raise ValueError(
+                "A maximum of four subtitle files can be used."
+            )
+
+        return cleaned
 
     # ==========================================================
     # VALIDATION
@@ -1034,32 +1602,40 @@ class SubtitleSyncService:
 
         operation = settings["operation"]
 
-        if operation not in self.OPERATIONS:
+        # ------------------------------------------------------
+        # OPERATION
+        # ------------------------------------------------------
 
+        if operation not in self.OPERATIONS:
             raise ValueError(
-                f"Unsupported subtitle operation: "
-                f"{operation}. "
+                f"Unsupported subtitle operation: {operation}. "
                 f"Valid operations: "
                 f"{', '.join(sorted(self.OPERATIONS))}"
             )
 
-        if settings.get("subtitle_format") not in self.FORMATS:
+        # ------------------------------------------------------
+        # FORMAT
+        # ------------------------------------------------------
 
+        subtitle_format = settings.get(
+            "subtitle_format"
+        )
+
+        if subtitle_format not in self.FORMATS:
             raise ValueError(
-                "Unsupported subtitle format: "
-                f"{settings.get('subtitle_format')}. "
+                f"Unsupported subtitle format: "
+                f"{subtitle_format}. "
                 f"Valid formats: "
                 f"{', '.join(sorted(self.FORMATS))}"
             )
 
         # ------------------------------------------------------
-        # Output
+        # OUTPUT
         # ------------------------------------------------------
 
         if operation != "validate":
 
             if not settings["output"]:
-
                 raise ValueError(
                     "Output subtitle file is required."
                 )
@@ -1071,7 +1647,6 @@ class SubtitleSyncService:
             if output_directory:
 
                 try:
-
                     os.makedirs(
                         output_directory,
                         exist_ok=True,
@@ -1084,7 +1659,7 @@ class SubtitleSyncService:
                     ) from exc
 
         # ------------------------------------------------------
-        # Required files
+        # NORMAL OPERATIONS
         # ------------------------------------------------------
 
         if operation in {
@@ -1102,23 +1677,48 @@ class SubtitleSyncService:
                 "subtitle_file",
             )
 
+        # ------------------------------------------------------
+        # JOIN / MERGE
+        # ------------------------------------------------------
+
         if operation in {
             "join_parts",
             "merge_tracks",
         }:
 
-            self._require_file(
-                settings["first_file"],
-                "first_file",
+            files = settings.get(
+                "subtitle_files",
+                [],
             )
 
-            self._require_file(
-                settings["second_file"],
-                "second_file",
-            )
+            if not files:
+                raise ValueError(
+                    "At least one subtitle file is required."
+                )
+
+            if len(files) > self.MAX_SUBTITLE_FILES:
+                raise ValueError(
+                    "A maximum of four subtitle files can be used."
+                )
+
+            for index, item in enumerate(
+                files,
+                start=1,
+            ):
+
+                # FIX:
+                # JOIN uses dictionaries, MERGE uses strings.
+                filepath = self._extract_file_path(
+                    item
+                )
+
+                self._require_file(
+                    filepath,
+                    f"subtitle_file_{index}",
+                )
 
         # ------------------------------------------------------
-        # Video duration
+        # VIDEO DURATION
         # ------------------------------------------------------
 
         if operation in {
@@ -1128,14 +1728,50 @@ class SubtitleSyncService:
         }:
 
             if settings.get("video_duration") is None:
-
                 raise ValueError(
-                    "video_duration is required "
-                    f"for {operation}."
+                    f"video_duration is required for {operation}."
                 )
 
         # ------------------------------------------------------
-        # Multi-point
+        # TWO POINT
+        # ------------------------------------------------------
+
+        if operation == "two_point":
+
+            required = (
+                "subtitle_point_1",
+                "video_point_1",
+                "subtitle_point_2",
+                "video_point_2",
+            )
+
+            for key in required:
+
+                if settings.get(key) is None:
+                    raise ValueError(
+                        f"{key} is required."
+                    )
+
+            if (
+                settings["subtitle_point_2"]
+                <= settings["subtitle_point_1"]
+            ):
+                raise ValueError(
+                    "subtitle_point_2 must be greater than "
+                    "subtitle_point_1."
+                )
+
+            if (
+                settings["video_point_2"]
+                <= settings["video_point_1"]
+            ):
+                raise ValueError(
+                    "video_point_2 must be greater than "
+                    "video_point_1."
+                )
+
+        # ------------------------------------------------------
+        # MULTI POINT
         # ------------------------------------------------------
 
         if operation == "multi_point":
@@ -1145,15 +1781,90 @@ class SubtitleSyncService:
             )
 
             if len(points) < 2:
-
                 raise ValueError(
-                    "At least two synchronization "
-                    "points are required."
+                    "At least two synchronization points "
+                    "are required."
+                )
+
+            previous_subtitle = None
+            previous_video = None
+
+            for point in points:
+
+                if (
+                    previous_subtitle is not None
+                    and point.subtitle_time
+                    <= previous_subtitle
+                ):
+
+                    raise ValueError(
+                        "Synchronization subtitle times "
+                        "must be strictly increasing."
+                    )
+
+                if (
+                    previous_video is not None
+                    and point.video_time
+                    <= previous_video
+                ):
+
+                    raise ValueError(
+                        "Synchronization video times "
+                        "must be strictly increasing."
+                    )
+
+                previous_subtitle = (
+                    point.subtitle_time
+                )
+
+                previous_video = (
+                    point.video_time
                 )
 
     # ==========================================================
     # FILE VALIDATION
     # ==========================================================
+
+    @staticmethod
+    def _extract_file_path(
+        item: Any,
+    ) -> str:
+        """
+        Extract an actual filesystem path from either:
+
+            "/path/file.srt"
+
+        or:
+
+            {
+                "name": "/path/file.srt",
+                "offset": 0,
+                "gap": 0,
+            }
+        """
+
+        if isinstance(
+            item,
+            (str, os.PathLike),
+        ):
+            return str(item)
+
+        if isinstance(item, dict):
+
+            filepath = (
+                item.get("name")
+                or item.get("file")
+                or item.get("path")
+                or item.get("filepath")
+                or item.get("subtitle_file")
+            )
+
+            if filepath:
+                return str(filepath)
+
+        raise ValueError(
+            f"Invalid subtitle file configuration: {item!r}"
+        )
 
     @staticmethod
     def _require_file(
@@ -1162,15 +1873,130 @@ class SubtitleSyncService:
     ) -> None:
 
         if not filepath:
-
             raise ValueError(
                 f"{name} is required."
             )
 
         if not os.path.isfile(filepath):
-
             raise FileNotFoundError(
                 f"{name} was not found: {filepath}"
+            )
+
+    # ==========================================================
+    # FORMAT
+    # ==========================================================
+
+    @staticmethod
+    def _detect_format(
+        filepath: str,
+    ) -> str:
+
+        extension = os.path.splitext(
+            str(filepath)
+        )[1].lower().lstrip(".")
+
+        if extension in {
+            "srt",
+            "vtt",
+        }:
+            return extension
+
+        return "srt"
+
+    # ==========================================================
+    # NUMERIC HELPERS
+    # ==========================================================
+
+    @staticmethod
+    def _to_float(
+        value: Any,
+        name: str,
+        default: Optional[float] = None,
+    ) -> float:
+
+        if value in (None, ""):
+
+            if default is not None:
+                return float(default)
+
+            raise ValueError(
+                f"{name} must be numeric."
+            )
+
+        try:
+            return float(value)
+
+        except (
+            TypeError,
+            ValueError,
+        ) as exc:
+
+            raise ValueError(
+                f"{name} must be numeric."
+            ) from exc
+
+    @staticmethod
+    def _to_bool(
+        value: Any,
+    ) -> bool:
+        """
+        Safely normalize booleans.
+
+        This fixes:
+
+            bool("false") == True
+        """
+
+        if isinstance(value, bool):
+            return value
+
+        if value is None:
+            return False
+
+        if isinstance(
+            value,
+            (int, float),
+        ):
+            return bool(value)
+
+        value = str(
+            value
+        ).strip().lower()
+
+        if value in {
+            "true",
+            "1",
+            "yes",
+            "y",
+            "on",
+            "enabled",
+        }:
+            return True
+
+        if value in {
+            "false",
+            "0",
+            "no",
+            "n",
+            "off",
+            "disabled",
+            "",
+            "none",
+            "null",
+        }:
+            return False
+
+        return bool(value)
+
+    # ==========================================================
+    # CANCELLATION CHECK
+    # ==========================================================
+
+    def _check_cancelled(self) -> None:
+
+        if self.cancelled:
+            raise KeyboardInterrupt(
+                "Subtitle processing cancelled."
             )
 
     # ==========================================================
@@ -1199,19 +2025,15 @@ class SubtitleSyncService:
             "success": not bool(errors),
             "completed": True,
             "cancelled": False,
-
             "filepath": filepath,
             "path": filepath,
             "subtitle_filepath": filepath,
-
             "subtitle_count": len(
                 subtitle.entries
             ),
-
             "start_time": subtitle.start_time,
             "end_time": subtitle.end_time,
             "duration": subtitle.duration,
-
             "errors": errors,
         }
 
@@ -1225,22 +2047,19 @@ class SubtitleSyncService:
     ) -> Dict[str, Any]:
 
         return {
-            "operation": settings.get("operation"),
-
+            "operation": settings.get(
+                "operation"
+            ),
             "success": False,
             "completed": False,
             "cancelled": True,
-
             "filepath": None,
             "path": None,
             "subtitle_filepath": None,
-
             "subtitle_count": 0,
-
             "start_time": 0.0,
             "end_time": 0.0,
             "duration": 0.0,
-
             "errors": [],
         }
 
@@ -1256,16 +2075,34 @@ class SubtitleSyncService:
         for key in (
             "output",
             "subtitle_file",
-            "first_file",
         ):
 
             value = settings.get(key)
 
             if value:
-
                 return os.path.basename(
                     str(value)
                 )
+
+        files = settings.get(
+            "subtitle_files"
+        )
+
+        if files:
+
+            first = files[0]
+
+            if isinstance(first, dict):
+                first = (
+                    first.get("name")
+                    or first.get("file")
+                    or first.get("path")
+                    or ""
+                )
+
+            return os.path.basename(
+                str(first)
+            )
 
         return "Subtitle"
 
@@ -1284,14 +2121,14 @@ class SubtitleSyncService:
             return
 
         try:
-
-            percentage = float(percentage)
+            percentage = float(
+                percentage
+            )
 
         except (
             TypeError,
             ValueError,
         ):
-
             percentage = 0.0
 
         percentage = max(
@@ -1302,19 +2139,25 @@ class SubtitleSyncService:
             ),
         )
 
+        if percentage.is_integer():
+
+            callback_percentage: Any = int(
+                percentage
+            )
+
+        else:
+
+            callback_percentage = round(
+                percentage,
+                1,
+            )
+
         try:
 
             self.progress_callback(
                 info,
                 filename,
-                (
-                    int(percentage)
-                    if percentage.is_integer()
-                    else round(
-                        percentage,
-                        1,
-                    )
-                ),
+                callback_percentage,
                 "--",
                 "--",
                 "--:--",
@@ -1327,7 +2170,7 @@ class SubtitleSyncService:
                 self.progress_callback(
                     info,
                     filename,
-                    percentage,
+                    callback_percentage,
                 )
 
             except Exception:
@@ -1349,11 +2192,11 @@ class SubtitleSyncService:
             return
 
         try:
-
-            self.finished_callback(result)
+            self.finished_callback(
+                result
+            )
 
         except Exception as exc:
-
             self._error(exc)
 
     # ==========================================================
@@ -1368,12 +2211,13 @@ class SubtitleSyncService:
         if self.error_callback:
 
             try:
-
-                self.error_callback(error)
-
+                self.error_callback(
+                    error
+                )
                 return
 
             except Exception:
                 pass
 
         print(error)
+

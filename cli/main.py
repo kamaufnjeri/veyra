@@ -8,12 +8,12 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
-    QListWidget,
-    QListWidgetItem,
     QMainWindow,
+    QPushButton,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
+    QSizePolicy,
 )
 
 from cli.ui.subtitle_page import SubtitlePage
@@ -22,13 +22,24 @@ from cli.ui.subtitle_sync_page import SubtitleSyncPage
 
 
 class VeyraWindow(QMainWindow):
+    SIDEBAR_EXPANDED_WIDTH = 230
+    SIDEBAR_COLLAPSED_WIDTH = 70
+
     def __init__(self):
         super().__init__()
 
         self.setWindowTitle("Veyra")
         self.resize(1200, 800)
 
+        self.sidebar_collapsed = False
+
+        self.navigation_buttons = []
+
         self._build_ui()
+
+    # ==========================================================
+    # BUILD UI
+    # ==========================================================
 
     def _build_ui(self):
         central = QWidget()
@@ -44,62 +55,178 @@ class VeyraWindow(QMainWindow):
 
         self.sidebar = QFrame()
         self.sidebar.setObjectName("Sidebar")
-        self.sidebar.setFixedWidth(230)
-
-        sidebar_layout = QVBoxLayout(self.sidebar)
-        sidebar_layout.setContentsMargins(15, 20, 15, 20)
-        sidebar_layout.setSpacing(10)
-
-        # Logo / application name
-        logo = QLabel("VEYRA")
-        logo.setObjectName("Logo")
-
-        sidebar_layout.addWidget(logo)
-
-        subtitle = QLabel("Media Subtitle Tools")
-        subtitle.setObjectName("SidebarSubtitle")
-
-        sidebar_layout.addWidget(subtitle)
-
-        sidebar_layout.addSpacing(25)
-
-        # Navigation
-        self.navigation = QListWidget()
-        self.navigation.setObjectName("Navigation")
-
-        self._add_navigation_item(
-            "Subtitle Generation",
-            "subtitle",
+        self.sidebar.setFixedWidth(
+            self.SIDEBAR_EXPANDED_WIDTH
         )
 
-        self._add_navigation_item(
-            "Video Download",
-            "download",
+        sidebar_layout = QVBoxLayout(
+            self.sidebar
         )
 
-        self._add_navigation_item(
-            "Subtitle Sync",
-            "sync",
+        sidebar_layout.setContentsMargins(
+            10,
+            15,
+            10,
+            15,
         )
 
-        sidebar_layout.addWidget(
-            self.navigation,
+        sidebar_layout.setSpacing(8)
+
+        # ======================================================
+        # HEADER
+        # ======================================================
+
+        header_layout = QHBoxLayout()
+        header_layout.setContentsMargins(
+            5,
+            0,
+            5,
+            0,
+        )
+
+        header_layout.setSpacing(5)
+
+        self.logo = QLabel("VEYRA")
+        self.logo.setObjectName("Logo")
+
+        header_layout.addWidget(
+            self.logo,
             1,
         )
 
-        version = QLabel("Veyra")
-        version.setObjectName("Version")
+        self.toggle_button = QPushButton("☰")
+        self.toggle_button.setObjectName(
+            "SidebarToggle"
+        )
 
-        sidebar_layout.addWidget(version)
+        self.toggle_button.setFixedSize(
+            38,
+            38,
+        )
 
-        main_layout.addWidget(self.sidebar)
+        self.toggle_button.setCursor(
+            Qt.PointingHandCursor
+        )
+
+        self.toggle_button.clicked.connect(
+            self.toggle_sidebar
+        )
+
+        header_layout.addWidget(
+            self.toggle_button
+        )
+
+        sidebar_layout.addLayout(
+            header_layout
+        )
+
+        # ======================================================
+        # SUBTITLE
+        # ======================================================
+
+        self.sidebar_subtitle = QLabel(
+            "Media Subtitle Tools"
+        )
+
+        self.sidebar_subtitle.setObjectName(
+            "SidebarSubtitle"
+        )
+
+        sidebar_layout.addWidget(
+            self.sidebar_subtitle
+        )
+
+        sidebar_layout.addSpacing(18)
+
+        # ======================================================
+        # NAVIGATION CONTAINER
+        # ======================================================
+
+        self.navigation_container = QWidget()
+
+        self.navigation_container.setObjectName(
+            "NavigationContainer"
+        )
+
+        navigation_layout = QVBoxLayout(
+            self.navigation_container
+        )
+
+        navigation_layout.setContentsMargins(
+            0,
+            0,
+            0,
+            0,
+        )
+
+        navigation_layout.setSpacing(4)
+
+        # ======================================================
+        # NAVIGATION BUTTONS
+        # ======================================================
+
+        self.subtitle_button = self._create_navigation_button(
+            "Subtitle Generation",
+            "SG",
+            0,
+        )
+
+        self.download_button = self._create_navigation_button(
+            "Video Download",
+            "VD",
+            1,
+        )
+
+        self.sync_button = self._create_navigation_button(
+            "Subtitle Sync",
+            "SS",
+            2,
+        )
+
+        navigation_layout.addWidget(
+            self.subtitle_button
+        )
+
+        navigation_layout.addWidget(
+            self.download_button
+        )
+
+        navigation_layout.addWidget(
+            self.sync_button
+        )
+
+        navigation_layout.addStretch()
+
+        sidebar_layout.addWidget(
+            self.navigation_container,
+            1,
+        )
+
+        # ======================================================
+        # VERSION
+        # ======================================================
+
+        self.version = QLabel("Veyra")
+        self.version.setObjectName(
+            "Version"
+        )
+
+        sidebar_layout.addWidget(
+            self.version
+        )
+
+        main_layout.addWidget(
+            self.sidebar
+        )
 
         # ======================================================
         # PAGE AREA
         # ======================================================
 
         self.pages = QStackedWidget()
-        self.pages.setObjectName("Pages")
+        self.pages.setObjectName(
+            "Pages"
+        )
 
         main_layout.addWidget(
             self.pages,
@@ -111,9 +238,7 @@ class VeyraWindow(QMainWindow):
         # ======================================================
 
         self.subtitle_page = SubtitlePage()
-
         self.video_download_page = VideoDownloadPage()
-
         self.subtitle_sync_page = SubtitleSyncPage()
 
         self.pages.addWidget(
@@ -129,52 +254,197 @@ class VeyraWindow(QMainWindow):
         )
 
         # ======================================================
-        # NAVIGATION
+        # INITIAL PAGE
         # ======================================================
 
-        self.navigation.currentRowChanged.connect(
-            self.change_page
+        self._set_active_button(
+            self.subtitle_button
         )
 
-        # Open first page
-        self.navigation.setCurrentRow(0)
-
-        # ======================================================
-        # STYLE
-        # ======================================================
-
-        self._apply_style()
-
     # ==========================================================
-    # NAVIGATION ITEM
+    # CREATE NAVIGATION BUTTON
     # ==========================================================
 
-    def _add_navigation_item(
+    def _create_navigation_button(
         self,
-        text: str,
-        page_id: str,
-    ):
-        item = QListWidgetItem(text)
+        full_text: str,
+        short_text: str,
+        page_index: int,
+    ) -> QPushButton:
 
-        item.setData(
-            Qt.UserRole,
-            page_id,
+        button = QPushButton(
+            full_text
         )
 
-        self.navigation.addItem(item)
+        button.setObjectName(
+            "NavigationButton"
+        )
+
+        button.setProperty(
+            "fullText",
+            full_text,
+        )
+
+        button.setProperty(
+            "shortText",
+            short_text,
+        )
+
+        button.setProperty(
+            "pageIndex",
+            page_index,
+        )
+
+        button.setToolTip(
+            full_text
+        )
+
+        button.setCursor(
+            Qt.PointingHandCursor
+        )
+
+        button.setFixedHeight(
+            48
+        )
+
+        button.setSizePolicy(
+            QSizePolicy.Expanding,
+            QSizePolicy.Fixed,
+        )
+
+        button.clicked.connect(
+            lambda checked=False,
+            index=page_index,
+            btn=button:
+                self._navigation_clicked(
+                    index,
+                    btn,
+                )
+        )
+
+        self.navigation_buttons.append(
+            button
+        )
+
+        return button
 
     # ==========================================================
-    # CHANGE PAGE
+    # NAVIGATION CLICK
     # ==========================================================
 
-    def change_page(
+    def _navigation_clicked(
         self,
-        index: int,
+        page_index: int,
+        button: QPushButton,
     ):
-        if index < 0:
-            return
+        self.pages.setCurrentIndex(
+            page_index
+        )
 
-        self.pages.setCurrentIndex(index)
+        self._set_active_button(
+            button
+        )
+
+    # ==========================================================
+    # ACTIVE BUTTON
+    # ==========================================================
+
+    def _set_active_button(
+        self,
+        active_button: QPushButton,
+    ):
+        for button in self.navigation_buttons:
+            button.setProperty(
+                "active",
+                button is active_button,
+            )
+
+            button.style().unpolish(
+                button
+            )
+
+            button.style().polish(
+                button
+            )
+
+    # ==========================================================
+    # TOGGLE SIDEBAR
+    # ==========================================================
+
+    def toggle_sidebar(self):
+        self.sidebar_collapsed = (
+            not self.sidebar_collapsed
+        )
+
+        if self.sidebar_collapsed:
+            self._collapse_sidebar()
+        else:
+            self._expand_sidebar()
+
+    # ==========================================================
+    # COLLAPSE
+    # ==========================================================
+
+    def _collapse_sidebar(self):
+        self.sidebar.setFixedWidth(
+            self.SIDEBAR_COLLAPSED_WIDTH
+        )
+
+        self.logo.hide()
+        self.sidebar_subtitle.hide()
+        self.version.hide()
+
+        for button in self.navigation_buttons:
+            button.setText(
+                button.property(
+                    "shortText"
+                )
+            )
+
+            button.setToolTip(
+                button.property(
+                    "fullText"
+                )
+            )
+
+            # Center the short form.
+            button.setStyleSheet(
+                """
+                QPushButton {
+                    text-align: center;
+                    padding: 0px;
+                }
+                """
+            )
+
+        # Keep the toggle centered.
+        self.toggle_button.setText("☰")
+
+    # ==========================================================
+    # EXPAND
+    # ==========================================================
+
+    def _expand_sidebar(self):
+        self.sidebar.setFixedWidth(
+            self.SIDEBAR_EXPANDED_WIDTH
+        )
+
+        self.logo.show()
+        self.sidebar_subtitle.show()
+        self.version.show()
+
+        for button in self.navigation_buttons:
+            button.setText(
+                button.property(
+                    "fullText"
+                )
+            )
+
+            button.setToolTip("")
+
+            button.setStyleSheet("")
+
+        self.toggle_button.setText("☰")
 
     # ==========================================================
     # STYLE
@@ -183,56 +453,116 @@ class VeyraWindow(QMainWindow):
     def _apply_style(self):
         self.setStyleSheet(
             """
+            /* ==================================================
+               MAIN WINDOW
+               ================================================== */
+
             QMainWindow {
                 background: #111827;
             }
+
+            /* ==================================================
+               SIDEBAR
+               ================================================== */
 
             #Sidebar {
                 background: #0b1220;
                 border-right: 1px solid #1f2937;
             }
 
+            /* ==================================================
+               LOGO
+               ================================================== */
+
             #Logo {
                 color: #ffffff;
                 font-size: 26px;
                 font-weight: 800;
-                padding-left: 8px;
+                padding-left: 6px;
             }
 
             #SidebarSubtitle {
                 color: #6b7280;
                 font-size: 12px;
-                padding-left: 8px;
+                padding-left: 6px;
             }
 
-            #Navigation {
+            /* ==================================================
+               TOGGLE
+               ================================================== */
+
+            #SidebarToggle {
                 background: transparent;
-                border: none;
-                outline: none;
-            }
-
-            #Navigation::item {
                 color: #9ca3af;
-                padding: 14px 12px;
-                margin: 2px 0;
+                border: none;
                 border-radius: 8px;
+                font-size: 19px;
             }
 
-            #Navigation::item:hover {
+            #SidebarToggle:hover {
                 background: #172033;
                 color: #ffffff;
             }
 
-            #Navigation::item:selected {
+            #SidebarToggle:pressed {
+                background: #1e293b;
+            }
+
+            /* ==================================================
+               NAVIGATION
+               ================================================== */
+
+            #NavigationButton {
+                background: transparent;
+                color: #9ca3af;
+
+                border: none;
+                border-radius: 9px;
+
+                text-align: left;
+
+                padding-left: 14px;
+                padding-right: 10px;
+
+                font-size: 14px;
+                font-weight: 500;
+            }
+
+            /* ==================================================
+               NAVIGATION HOVER
+               ================================================== */
+
+            #NavigationButton:hover {
+                background: #172033;
+                color: #ffffff;
+            }
+
+            /* ==================================================
+               ACTIVE PAGE
+               ================================================== */
+
+            #NavigationButton[active="true"] {
                 background: #2563eb;
                 color: #ffffff;
                 font-weight: 600;
             }
 
+            #NavigationButton[active="true"]:hover {
+                background: #3b82f6;
+            }
+
+            /* ==================================================
+               VERSION
+               ================================================== */
+
             #Version {
                 color: #4b5563;
-                padding-left: 8px;
+                padding-left: 6px;
             }
+
+            /* ==================================================
+               PAGE AREA
+               ================================================== */
 
             #Pages {
                 background: #111827;
@@ -252,6 +582,10 @@ def main() -> int:
     app.setOrganizationName("Veyra")
 
     window = VeyraWindow()
+
+    # Apply stylesheet AFTER all widgets exist.
+    window._apply_style()
+
     window.show()
 
     return app.exec()
@@ -259,3 +593,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+

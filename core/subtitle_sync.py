@@ -2,13 +2,55 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple, TypedDict
+
 import re
+
+
+# ============================================================
+# SUBTITLE PART CONFIGURATION
+# ============================================================
+
+
+class SubtitlePart(TypedDict, total=False):
+    """
+    Configuration for one subtitle file used by JOIN.
+
+    Part 1:
+        {
+            "name": "part1.srt",
+            "offset": 0.0,
+        }
+
+    Part 2+:
+        {
+            "name": "part2.srt",
+            "offset": 2.0,
+            "gap": 5.0,
+        }
+
+    JOIN supports:
+        - name
+        - offset
+        - gap (part 2+ only)
+    """
+
+    name: str | Path
+    offset: float
+    gap: float
+
+
+# ============================================================
+# MERGE FILE TYPE
+# ============================================================
+
+SubtitleMergeFile = str | Path
 
 
 # ============================================================
 # SUBTITLE ENTRY
 # ============================================================
+
 
 @dataclass
 class SubtitleEntry:
@@ -36,6 +78,7 @@ class SubtitleEntry:
 # ============================================================
 # SUBTITLE FILE
 # ============================================================
+
 
 class SubtitleFile:
     """
@@ -68,9 +111,9 @@ class SubtitleFile:
             entries or []
         )
 
-        self.format_name = (
-            format_name.lower()
-        )
+        self.format_name = str(
+            format_name or "srt"
+        ).lower()
 
         self.sort()
         self.renumber()
@@ -86,7 +129,12 @@ class SubtitleFile:
         encoding: str = "utf-8-sig",
     ) -> "SubtitleFile":
 
-        path = Path(path)
+        path = Path(path).expanduser()
+
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"Subtitle file not found: {path}"
+            )
 
         text = path.read_text(
             encoding=encoding,
@@ -98,7 +146,12 @@ class SubtitleFile:
         if suffix == ".vtt":
             return cls.from_vtt(text)
 
-        return cls.from_srt(text)
+        if suffix == ".srt":
+            return cls.from_srt(text)
+
+        raise ValueError(
+            f"Unsupported subtitle format: {suffix}"
+        )
 
     # ========================================================
     # SRT PARSER
@@ -110,39 +163,32 @@ class SubtitleFile:
         text: str,
     ) -> "SubtitleFile":
 
-        text = text.replace(
-            "\r\n",
-            "\n",
-        ).replace(
-            "\r",
-            "\n",
+        text = (
+            text.replace("\r\n", "\n")
+            .replace("\r", "\n")
         )
 
+        # Split subtitle blocks on blank lines.
         blocks = re.split(
             r"\n\s*\n",
             text.strip(),
         )
 
-        entries = []
+        entries: List[SubtitleEntry] = []
 
         for block in blocks:
 
-            lines = block.splitlines()
+            lines = [
+                line.rstrip()
+                for line in block.splitlines()
+            ]
 
             if not lines:
                 continue
 
-            lines = [
-                line.rstrip()
-                for line in lines
-            ]
-
             index = 0
 
-            # --------------------------------------------
-            # NUMBER
-            # --------------------------------------------
-
+            # SRT normally starts with a numeric index.
             if lines[0].strip().isdigit():
                 index = int(
                     lines[0].strip()
@@ -152,40 +198,31 @@ class SubtitleFile:
             if not lines:
                 continue
 
-            # --------------------------------------------
-            # TIMING
-            # --------------------------------------------
-
-            timing_line = None
             timing_index = None
 
             for i, line in enumerate(lines):
                 if "-->" in line:
-                    timing_line = line
                     timing_index = i
                     break
 
-            if timing_line is None:
+            if timing_index is None:
                 continue
 
-            start_text, end_text = (
-                timing_line.split(
-                    "-->",
-                    1,
-                )
+            timing_line = lines[timing_index]
+
+            start_text, end_text = timing_line.split(
+                "-->",
+                1,
             )
 
             start = cls.parse_timestamp(
                 start_text.strip()
             )
 
+            # Remove optional SRT/VTT timing settings.
             end = cls.parse_timestamp(
                 end_text.strip().split()[0]
             )
-
-            # --------------------------------------------
-            # TEXT
-            # --------------------------------------------
 
             subtitle_lines = lines[
                 timing_index + 1:
@@ -225,19 +262,20 @@ class SubtitleFile:
         text: str,
     ) -> "SubtitleFile":
 
-        text = text.replace(
-            "\r\n",
-            "\n",
-        ).replace(
-            "\r",
-            "\n",
+        text = (
+            text.replace("\r\n", "\n")
+            .replace("\r", "\n")
         )
 
         lines = text.splitlines()
 
         # Remove WEBVTT header.
-        if lines and lines[0].strip().upper().startswith(
-            "WEBVTT"
+        if (
+            lines
+            and lines[0]
+            .strip()
+            .upper()
+            .startswith("WEBVTT")
         ):
             lines = lines[1:]
 
@@ -246,7 +284,8 @@ class SubtitleFile:
             "\n".join(lines).strip(),
         )
 
-        entries = []
+        entries: List[SubtitleEntry] = []
+
         counter = 1
 
         for block in blocks:
@@ -266,15 +305,11 @@ class SubtitleFile:
             if timing_index is None:
                 continue
 
-            timing_line = lines[
-                timing_index
-            ]
+            timing_line = lines[timing_index]
 
-            start_text, end_text = (
-                timing_line.split(
-                    "-->",
-                    1,
-                )
+            start_text, end_text = timing_line.split(
+                "-->",
+                1,
             )
 
             start = cls.parse_timestamp(
@@ -286,7 +321,9 @@ class SubtitleFile:
             )
 
             subtitle_text = "\n".join(
-                lines[timing_index + 1:]
+                lines[
+                    timing_index + 1:
+                ]
             ).strip()
 
             if not subtitle_text:
@@ -323,27 +360,56 @@ class SubtitleFile:
             .replace(",", ".")
         )
 
+        # HH:MM:SS.mmm
         match = re.match(
             r"^(\d+):(\d{2}):(\d{2})\.(\d{3})$",
             value,
         )
 
-        if not match:
+        if match:
 
-            # VTT may allow MM:SS.mmm.
-            match = re.match(
-                r"^(\d{2}):(\d{2})\.(\d{3})$",
-                value,
+            hours = int(
+                match.group(1)
             )
 
-            if not match:
-                raise ValueError(
-                    f"Invalid subtitle timestamp: {value}"
-                )
+            minutes = int(
+                match.group(2)
+            )
 
-            minutes = int(match.group(1))
-            seconds = int(match.group(2))
-            milliseconds = int(match.group(3))
+            seconds = int(
+                match.group(3)
+            )
+
+            milliseconds = int(
+                match.group(4)
+            )
+
+            return (
+                hours * 3600
+                + minutes * 60
+                + seconds
+                + milliseconds / 1000.0
+            )
+
+        # MM:SS.mmm
+        match = re.match(
+            r"^(\d{2}):(\d{2})\.(\d{3})$",
+            value,
+        )
+
+        if match:
+
+            minutes = int(
+                match.group(1)
+            )
+
+            seconds = int(
+                match.group(2)
+            )
+
+            milliseconds = int(
+                match.group(3)
+            )
 
             return (
                 minutes * 60
@@ -351,16 +417,8 @@ class SubtitleFile:
                 + milliseconds / 1000.0
             )
 
-        hours = int(match.group(1))
-        minutes = int(match.group(2))
-        seconds = int(match.group(3))
-        milliseconds = int(match.group(4))
-
-        return (
-            hours * 3600
-            + minutes * 60
-            + seconds
-            + milliseconds / 1000.0
+        raise ValueError(
+            f"Invalid subtitle timestamp: {value}"
         )
 
     # ========================================================
@@ -409,7 +467,7 @@ class SubtitleFile:
     # SORT
     # ========================================================
 
-    def sort(self):
+    def sort(self) -> None:
 
         self.entries.sort(
             key=lambda e: (
@@ -423,7 +481,7 @@ class SubtitleFile:
     # RENUMBER
     # ========================================================
 
-    def renumber(self):
+    def renumber(self) -> None:
 
         for number, entry in enumerate(
             self.entries,
@@ -453,9 +511,14 @@ class SubtitleFile:
         self,
         path: str | Path,
         encoding: str = "utf-8",
-    ):
+    ) -> None:
 
-        path = Path(path)
+        path = Path(path).expanduser()
+
+        path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
 
         path.write_text(
             self.to_srt(),
@@ -582,14 +645,16 @@ class SubtitleFile:
 
             entry.start = (
                 anchor
-                + (entry.start - anchor)
-                * scale
+                + (
+                    entry.start - anchor
+                ) * scale
             )
 
             entry.end = (
                 anchor
-                + (entry.end - anchor)
-                * scale
+                + (
+                    entry.end - anchor
+                ) * scale
             )
 
             entry.start = max(
@@ -603,6 +668,7 @@ class SubtitleFile:
             )
 
         result.sort()
+        result.renumber()
 
         return result
 
@@ -617,7 +683,7 @@ class SubtitleFile:
 
         result = self.copy()
 
-        unique = []
+        unique: List[SubtitleEntry] = []
 
         for entry in result.entries:
 
@@ -658,6 +724,7 @@ class SubtitleFile:
                 unique.append(entry)
 
         result.entries = unique
+
         result.sort()
         result.renumber()
 
@@ -676,8 +743,14 @@ class SubtitleFile:
             video_duration
         )
 
+        if video_duration <= 0:
+            raise ValueError(
+                "Video duration must be greater than zero."
+            )
+
         result = self.copy()
-        valid = []
+
+        valid: List[SubtitleEntry] = []
 
         for entry in result.entries:
 
@@ -700,6 +773,8 @@ class SubtitleFile:
             valid.append(entry)
 
         result.entries = valid
+
+        result.sort()
         result.renumber()
 
         return result
@@ -710,7 +785,7 @@ class SubtitleFile:
 
     def validate(self) -> List[str]:
 
-        errors = []
+        errors: List[str] = []
 
         previous_start = -1.0
 
@@ -748,7 +823,82 @@ class SubtitleFile:
 # SUBTITLE JOINER
 # ============================================================
 
+
 class SubtitleJoiner:
+
+    # ========================================================
+    # VALIDATE JOIN PART
+    # ========================================================
+
+    @staticmethod
+    def _validate_part(
+        part: SubtitlePart,
+        is_first: bool = False,
+    ) -> Tuple[str | Path, float, float]:
+
+        if not isinstance(part, dict):
+            raise TypeError(
+                "Each JOIN subtitle file must be a dictionary "
+                "containing 'name' and 'offset'."
+            )
+
+        if "name" not in part:
+            raise ValueError(
+                "Each JOIN subtitle file must contain "
+                "a 'name' key."
+            )
+
+        if "offset" not in part:
+            raise ValueError(
+                "Each JOIN subtitle file must contain "
+                "an 'offset' key."
+            )
+
+        name = part["name"]
+
+        if not isinstance(name, (str, Path)):
+            raise TypeError(
+                "Subtitle 'name' must be a string or Path."
+            )
+
+        try:
+            offset = float(part["offset"])
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                f"Invalid offset for subtitle file "
+                f"'{name}': {part['offset']!r}"
+            ) from exc
+
+        # Part 1 cannot have gap.
+        if is_first:
+            if "gap" in part:
+                raise ValueError(
+                    "Part 1 cannot have a 'gap'. "
+                    "Gap is only allowed from part 2 onward."
+                )
+
+            gap = 0.0
+
+        # Part 2+ may have gap.
+        else:
+            if "gap" not in part:
+                gap = 0.0
+            else:
+                try:
+                    gap = float(part["gap"])
+                except (TypeError, ValueError) as exc:
+                    raise TypeError(
+                        f"Invalid gap for subtitle file "
+                        f"'{name}': {part['gap']!r}"
+                    ) from exc
+
+                if gap < 0:
+                    raise ValueError(
+                        f"Gap for subtitle file "
+                        f"'{name}' cannot be negative."
+                    )
+
+        return name, offset, gap
 
     # ========================================================
     # SEQUENTIAL JOIN
@@ -756,127 +906,182 @@ class SubtitleJoiner:
 
     @staticmethod
     def join_sequential(
-        first: SubtitleFile,
-        second: SubtitleFile,
-        gap: float = 0.0,
-        second_offset: Optional[float] = None,
+        subtitles: Sequence[SubtitleFile],
+        offsets: Sequence[float],
+        gaps: Sequence[float],
     ) -> SubtitleFile:
+        """
+        JOIN subtitle files sequentially.
 
-        first_result = first.copy()
-        second_result = second.copy()
+        Part 1:
+            original timestamps + offset
 
-        if second_offset is None:
+        Part 2+:
+            previous final end + gap,
+            then apply current part's offset.
 
-            if first_result.entries:
-                first_end = (
-                    first_result.end_time
-                )
+        Offset belongs to the current part.
+        Gap belongs between the previous part and
+        the current part.
+        """
+
+        if not subtitles:
+            return SubtitleFile([], "srt")
+
+        if len(subtitles) != len(offsets):
+            raise ValueError(
+                "The number of subtitle files must match "
+                "the number of offsets."
+            )
+
+        if len(subtitles) != len(gaps):
+            raise ValueError(
+                "The number of subtitle files must match "
+                "the number of gaps."
+            )
+
+        result = SubtitleFile([], "srt")
+
+        previous_end = 0.0
+        has_previous_part = False
+
+        for subtitle, offset, gap in zip(
+            subtitles,
+            offsets,
+            gaps,
+        ):
+            if not subtitle.entries:
+                continue
+
+            offset = float(offset)
+            gap = float(gap)
+
+            # ------------------------------------------------
+            # PART 1
+            # ------------------------------------------------
+
+            if not has_previous_part:
+                shifted = subtitle.shift(offset)
+
+            # ------------------------------------------------
+            # PART 2+
+            # ------------------------------------------------
+
             else:
-                first_end = 0.0
+                # Previous part has already received its offset.
+                # Gap is measured from that final timestamp.
+                target_start = previous_end + gap
 
-            second_start = (
-                second_result.start_time
-                if second_result.entries
-                else 0.0
+                # Position the current part so its original
+                # first subtitle lands at target_start.
+                placement_shift = (
+                    target_start
+                    - subtitle.start_time
+                )
+
+                # Apply this part's own offset.
+                total_shift = (
+                    placement_shift
+                    + offset
+                )
+
+                shifted = subtitle.shift(total_shift)
+
+            result.entries.extend(
+                entry.copy()
+                for entry in shifted.entries
             )
 
-            second_offset = (
-                first_end
-                + float(gap)
-                - second_start
-            )
+            # IMPORTANT:
+            # Store the end AFTER the current part's offset.
+            # The next gap is calculated from this value.
+            previous_end = shifted.end_time
 
-        second_result = second_result.shift(
-            second_offset
-        )
-
-        first_result.entries.extend(
-            second_result.entries
-        )
-
-        first_result.sort()
-        first_result.renumber()
-
-        return first_result.remove_duplicates()
-
-    # ========================================================
-    # TIMELINE MERGE
-    # ========================================================
-
-    @staticmethod
-    def merge_tracks(
-        first: SubtitleFile,
-        second: SubtitleFile,
-        remove_duplicates: bool = True,
-    ) -> SubtitleFile:
-
-        result = first.copy()
-
-        result.entries.extend(
-            entry.copy()
-            for entry in second.entries
-        )
+            has_previous_part = True
 
         result.sort()
-
-        if remove_duplicates:
-            result = result.remove_duplicates()
-
         result.renumber()
 
         return result
 
     # ========================================================
-    # JOIN FILES
+    # JOIN CONFIGURED FILES
     # ========================================================
 
     @staticmethod
-    def join_files(
-        first_path: str | Path,
-        second_path: str | Path,
+    def join_configured_files(
+        subtitle_files: Sequence[SubtitlePart],
         output_path: str | Path,
-        gap: float = 0.0,
-        second_offset: Optional[float] = None,
     ) -> SubtitleFile:
+        """
+        Load and JOIN configured subtitle files.
 
-        first = SubtitleFile.load(
-            first_path
-        )
+        Example:
 
-        second = SubtitleFile.load(
-            second_path
-        )
+            [
+                {
+                    "name": "part1.srt",
+                    "offset": 2.0,
+                },
+                {
+                    "name": "part2.srt",
+                    "offset": -1.0,
+                    "gap": 5.0,
+                },
+                {
+                    "name": "part3.srt",
+                    "offset": 3.0,
+                    "gap": 2.0,
+                },
+            ]
+
+        Each part's offset is applied.
+        Each part after Part 1 also receives its gap.
+        """
+
+        if not subtitle_files:
+            raise ValueError(
+                "At least one subtitle file is required."
+            )
+
+        subtitles: List[SubtitleFile] = []
+        offsets: List[float] = []
+        gaps: List[float] = []
+
+        for index, part in enumerate(
+            subtitle_files
+        ):
+            name, offset, gap = (
+                SubtitleJoiner._validate_part(
+                    part,
+                    is_first=(index == 0),
+                )
+            )
+
+            subtitles.append(
+                SubtitleFile.load(name)
+            )
+
+            offsets.append(offset)
+            gaps.append(gap)
 
         result = SubtitleJoiner.join_sequential(
-            first,
-            second,
-            gap=gap,
-            second_offset=second_offset,
+            subtitles=subtitles,
+            offsets=offsets,
+            gaps=gaps,
         )
 
-        result.save(
-            output_path
-        )
+        result.save(output_path)
 
         return result
 
+# ============================================================
+# SYNC POINT
+# ============================================================
 
-# ============================================================
-# SYNCHRONIZATION ANCHOR
-# ============================================================
 
 @dataclass
 class SyncPoint:
-    """
-    A known matching point.
-
-    subtitle_time:
-        Timestamp in subtitle file.
-
-    video_time:
-        Corresponding timestamp in video.
-    """
-
     subtitle_time: float
     video_time: float
 
@@ -884,6 +1089,7 @@ class SyncPoint:
 # ============================================================
 # SUBTITLE SYNCHRONIZER
 # ============================================================
+
 
 class SubtitleSynchronizer:
 
@@ -902,7 +1108,7 @@ class SubtitleSynchronizer:
         )
 
     # ========================================================
-    # TWO POINT DRIFT CORRECTION
+    # TWO POINT SYNC
     # ========================================================
 
     @staticmethod
@@ -929,7 +1135,7 @@ class SubtitleSynchronizer:
         )
 
     # ========================================================
-    # MULTI-POINT SYNCHRONIZATION
+    # MULTI POINT SYNC
     # ========================================================
 
     @staticmethod
@@ -952,13 +1158,10 @@ class SubtitleSynchronizer:
         result = subtitles.copy()
 
         # ----------------------------------------------------
-        # Check duplicate subtitle points.
+        # VALIDATE POINTS
         # ----------------------------------------------------
 
-        for i in range(
-            1,
-            len(points),
-        ):
+        for i in range(1, len(points)):
 
             if (
                 points[i].subtitle_time
@@ -979,28 +1182,26 @@ class SubtitleSynchronizer:
                 )
 
         # ----------------------------------------------------
-        # Piecewise linear correction.
-        #
-        # This is important because a subtitle track can
-        # drift differently over different sections.
+        # TRANSFORM
         # ----------------------------------------------------
 
         def transform(
             timestamp: float,
         ) -> float:
 
-            # Before first anchor.
+            # Before first point.
             if timestamp <= points[0].subtitle_time:
 
                 p1 = points[0]
                 p2 = points[1]
 
-            # After last anchor.
+            # After last point.
             elif timestamp >= points[-1].subtitle_time:
 
                 p1 = points[-2]
                 p2 = points[-1]
 
+            # Between points.
             else:
 
                 p1 = points[0]
@@ -1011,9 +1212,14 @@ class SubtitleSynchronizer:
                     len(points),
                 ):
 
-                    if timestamp <= points[i].subtitle_time:
+                    if (
+                        timestamp
+                        <= points[i].subtitle_time
+                    ):
+
                         p1 = points[i - 1]
                         p2 = points[i]
+
                         break
 
             subtitle_delta = (
@@ -1044,7 +1250,7 @@ class SubtitleSynchronizer:
             )
 
         # ----------------------------------------------------
-        # Transform every subtitle.
+        # TRANSFORM EVERY ENTRY
         # ----------------------------------------------------
 
         for entry in result.entries:
@@ -1073,7 +1279,7 @@ class SubtitleSynchronizer:
         return result
 
     # ========================================================
-    # AUTOMATIC TWO-POINT DURATION CORRECTION
+    # FIT TO VIDEO
     # ========================================================
 
     @staticmethod
@@ -1085,13 +1291,17 @@ class SubtitleSynchronizer:
         if not subtitles.entries:
             return subtitles.copy()
 
-        subtitle_start = (
-            subtitles.start_time
+        video_duration = float(
+            video_duration
         )
 
-        subtitle_end = (
-            subtitles.end_time
-        )
+        if video_duration <= 0:
+            raise ValueError(
+                "Video duration must be greater than zero."
+            )
+
+        subtitle_start = subtitles.start_time
+        subtitle_end = subtitles.end_time
 
         subtitle_duration = (
             subtitle_end
@@ -1100,10 +1310,6 @@ class SubtitleSynchronizer:
 
         if subtitle_duration <= 0:
             return subtitles.copy()
-
-        video_duration = float(
-            video_duration
-        )
 
         scale = (
             video_duration
@@ -1146,7 +1352,7 @@ class SubtitleSynchronizer:
         return result
 
     # ========================================================
-    # START ALIGNMENT
+    # ALIGN START
     # ========================================================
 
     @staticmethod
@@ -1168,7 +1374,7 @@ class SubtitleSynchronizer:
         )
 
     # ========================================================
-    # END ALIGNMENT
+    # ALIGN END
     # ========================================================
 
     @staticmethod
@@ -1204,7 +1410,7 @@ class SubtitleSynchronizer:
         )
 
     # ========================================================
-    # AUTO CORRECT USING START + END
+    # START + END SYNC
     # ========================================================
 
     @staticmethod
@@ -1288,6 +1494,7 @@ class SubtitleSynchronizer:
 # HIGH LEVEL PROCESSOR
 # ============================================================
 
+
 class SubtitleProcessor:
 
     # ========================================================
@@ -1304,55 +1511,314 @@ class SubtitleProcessor:
         )
 
     # ========================================================
-    # JOIN TWO PARTS
+    # VALIDATE JOIN SUBTITLE CONFIGURATION
+    # ========================================================
+
+    @staticmethod
+    def _validate_subtitle_files(
+        subtitle_files: Sequence[SubtitlePart],
+    ) -> List[SubtitlePart]:
+        """
+        Validate JOIN subtitle configuration.
+
+        This method is JOIN-specific.
+
+        JOIN requires dictionaries:
+
+            {
+                "name": "...",
+                "offset": 0.0,
+                "gap": 5.0,
+            }
+
+        Part 1 must not contain gap.
+        """
+
+        if not subtitle_files:
+            raise ValueError(
+                "At least one subtitle file is required."
+            )
+
+        normalized: List[SubtitlePart] = []
+
+        for index, part in enumerate(
+            subtitle_files,
+            start=1,
+        ):
+
+            if not isinstance(
+                part,
+                dict,
+            ):
+                raise TypeError(
+                    f"JOIN subtitle file #{index} must be "
+                    "a dictionary with 'name' and 'offset'."
+                )
+
+            if "name" not in part:
+                raise ValueError(
+                    f"JOIN subtitle file #{index} "
+                    "is missing 'name'."
+                )
+
+            if "offset" not in part:
+                raise ValueError(
+                    f"JOIN subtitle file #{index} "
+                    "is missing 'offset'."
+                )
+
+            name = part["name"]
+
+            if not isinstance(
+                name,
+                (str, Path),
+            ):
+                raise TypeError(
+                    f"JOIN subtitle file #{index} "
+                    "'name' must be a string or Path."
+                )
+
+            try:
+                offset = float(
+                    part["offset"]
+                )
+            except (
+                TypeError,
+                ValueError,
+            ) as exc:
+                raise TypeError(
+                    f"JOIN subtitle file #{index} "
+                    f"has invalid offset: "
+                    f"{part['offset']!r}"
+                ) from exc
+
+            # ------------------------------------------------
+            # PART 1
+            # ------------------------------------------------
+
+            if index == 1:
+
+                if "gap" in part:
+                    raise ValueError(
+                        "Part 1 cannot have a 'gap'. "
+                        "Gap is only allowed from part 2 onward."
+                    )
+
+                normalized.append(
+                    {
+                        "name": name,
+                        "offset": offset,
+                    }
+                )
+
+                continue
+
+            # ------------------------------------------------
+            # PART 2+
+            # ------------------------------------------------
+
+            if "gap" not in part:
+
+                gap = 0.0
+
+            else:
+
+                try:
+                    gap = float(
+                        part["gap"]
+                    )
+                except (
+                    TypeError,
+                    ValueError,
+                ) as exc:
+                    raise TypeError(
+                        f"JOIN subtitle file #{index} "
+                        f"has invalid gap: "
+                        f"{part['gap']!r}"
+                    ) from exc
+
+                if gap < 0:
+                    raise ValueError(
+                        f"JOIN subtitle file #{index} "
+                        "gap cannot be negative."
+                    )
+
+            normalized.append(
+                {
+                    "name": name,
+                    "offset": offset,
+                    "gap": gap,
+                }
+            )
+
+        return normalized
+
+    # ========================================================
+    # VALIDATE MERGE FILES
+    # ========================================================
+
+    @staticmethod
+    def _validate_merge_files(
+        subtitle_files: Sequence[SubtitleMergeFile],
+    ) -> List[Path]:
+        """
+        Validate MERGE subtitle files.
+
+        MERGE intentionally accepts ONLY file paths.
+
+        Example:
+
+            [
+                "english.srt",
+                "english_extra.srt",
+                "signs.srt",
+            ]
+
+        MERGE has no:
+            - name
+            - offset
+            - gap
+
+        Files retain their original timestamps.
+        """
+
+        if not subtitle_files:
+            raise ValueError(
+                "At least one subtitle file is required."
+            )
+
+        normalized: List[Path] = []
+        seen: set[Path] = set()
+
+        for index, filepath in enumerate(
+            subtitle_files,
+            start=1,
+        ):
+
+            if not isinstance(
+                filepath,
+                (str, Path),
+            ):
+                raise TypeError(
+                    f"MERGE subtitle file #{index} must be "
+                    "a string path or Path."
+                )
+
+            path = Path(
+                filepath
+            ).expanduser()
+
+            if not str(path).strip():
+                continue
+
+            path = path.absolute()
+
+            if path in seen:
+                continue
+
+            seen.add(path)
+            normalized.append(path)
+
+        if not normalized:
+            raise ValueError(
+                "At least one subtitle file is required."
+            )
+
+        return normalized
+
+    # ========================================================
+    # JOIN PARTS
     # ========================================================
 
     @staticmethod
     def join_parts(
-        first_path: str | Path,
-        second_path: str | Path,
+        subtitle_files: Sequence[SubtitlePart],
         output_path: str | Path,
-        gap: float = 0.0,
-        second_offset: Optional[float] = None,
     ) -> SubtitleFile:
+        """
+        Join multiple subtitle files sequentially.
 
-        result = SubtitleJoiner.join_files(
-            first_path,
-            second_path,
-            output_path,
-            gap=gap,
-            second_offset=second_offset,
+        Part 1:
+            name
+            offset
+
+        Part 2+:
+            name
+            offset
+            gap
+        """
+
+        if output_path is None:
+            raise ValueError(
+                "output_path is required."
+            )
+
+        files = (
+            SubtitleProcessor
+            ._validate_subtitle_files(
+                subtitle_files
+            )
         )
 
-        return result
+        return SubtitleJoiner.join_configured_files(
+            subtitle_files=files,
+            output_path=output_path,
+        )
 
     # ========================================================
-    # MERGE TWO TRACKS
+    # MERGE TRACKS
     # ========================================================
 
     @staticmethod
     def merge_tracks(
-        first_path: str | Path,
-        second_path: str | Path,
+        subtitle_files: Sequence[SubtitleMergeFile],
         output_path: str | Path,
+        remove_duplicates: bool = True,
     ) -> SubtitleFile:
+        """
+        Merge multiple subtitle files on their existing
+        timelines.
 
-        first = SubtitleFile.load(
-            first_path
+        MERGE accepts a plain list of file paths.
+
+        Example:
+
+            [
+                "english.srt",
+                "english_extra.srt",
+                "signs.srt",
+            ]
+
+        No offset is applied.
+        No gap is applied.
+        No sequential positioning is performed.
+        """
+
+        if output_path is None:
+            raise ValueError(
+                "output_path is required."
+            )
+
+        files = (
+            SubtitleProcessor
+            ._validate_merge_files(
+                subtitle_files
+            )
         )
 
-        second = SubtitleFile.load(
-            second_path
-        )
+        subtitles: List[SubtitleFile] = []
+
+        for path in files:
+            subtitles.append(
+                SubtitleFile.load(path)
+            )
 
         result = SubtitleJoiner.merge_tracks(
-            first,
-            second,
+            subtitles=subtitles,
+            remove_duplicates=remove_duplicates,
         )
 
-        result.save(
-            output_path
-        )
+        result.save(output_path)
 
         return result
 
@@ -1372,15 +1838,22 @@ class SubtitleProcessor:
             subtitle_path
         )
 
-        result = SubtitleSynchronizer.apply_offset(
-            subtitles,
-            offset,
+        result = (
+            SubtitleSynchronizer
+            .apply_offset(
+                subtitles,
+                offset,
+            )
         )
 
         if video_duration is not None:
-            result = SubtitleSynchronizer.clamp(
-                result,
-                video_duration,
+
+            result = (
+                SubtitleSynchronizer
+                .clamp(
+                    result,
+                    video_duration,
+                )
             )
 
         result.save(
@@ -1409,7 +1882,8 @@ class SubtitleProcessor:
         )
 
         result = (
-            SubtitleSynchronizer.synchronize_two_points(
+            SubtitleSynchronizer
+            .synchronize_two_points(
                 subtitles,
                 subtitle_point_1,
                 video_point_1,
@@ -1419,9 +1893,13 @@ class SubtitleProcessor:
         )
 
         if video_duration is not None:
-            result = SubtitleSynchronizer.clamp(
-                result,
-                video_duration,
+
+            result = (
+                SubtitleSynchronizer
+                .clamp(
+                    result,
+                    video_duration,
+                )
             )
 
         result.save(
@@ -1446,15 +1924,22 @@ class SubtitleProcessor:
             subtitle_path
         )
 
-        result = SubtitleSynchronizer.synchronize(
-            subtitles,
-            points,
+        result = (
+            SubtitleSynchronizer
+            .synchronize(
+                subtitles,
+                points,
+            )
         )
 
         if video_duration is not None:
-            result = SubtitleSynchronizer.clamp(
-                result,
-                video_duration,
+
+            result = (
+                SubtitleSynchronizer
+                .clamp(
+                    result,
+                    video_duration,
+                )
             )
 
         result.save(
@@ -1479,15 +1964,19 @@ class SubtitleProcessor:
         )
 
         result = (
-            SubtitleSynchronizer.synchronize_start_end(
+            SubtitleSynchronizer
+            .synchronize_start_end(
                 subtitles,
                 video_duration,
             )
         )
 
-        result = SubtitleSynchronizer.clamp(
-            result,
-            video_duration,
+        result = (
+            SubtitleSynchronizer
+            .clamp(
+                result,
+                video_duration,
+            )
         )
 
         result.save(
@@ -1510,3 +1999,4 @@ class SubtitleProcessor:
         )
 
         return subtitles.validate()
+
