@@ -5,7 +5,6 @@ from PySide6.QtWidgets import (
 
 from ui.subtitle_page import SubtitlePage
 from cli.ui.media_download_page import DownloadPage
-from cli.ui.subtitle_sync_page import SyncPage
 
 
 class VeyraWindow(QMainWindow):
@@ -20,7 +19,6 @@ class VeyraWindow(QMainWindow):
 
         self.subtitle_page = SubtitlePage()
         self.download_page = DownloadPage()
-        self.sync_page = SyncPage()
 
         self.tabs.addTab(
             self.subtitle_page,
@@ -32,9 +30,10 @@ class VeyraWindow(QMainWindow):
             "Video Download",
         )
 
+       
         self.tabs.addTab(
             self.sync_page,
-            "Video / Subtitle Synchronization",
+            "Media Processing and Conversion",
         )
 
         self.setCentralWidget(self.tabs)

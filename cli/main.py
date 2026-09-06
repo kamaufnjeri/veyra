@@ -18,7 +18,12 @@ from PySide6.QtWidgets import (
 
 from cli.ui.subtitle_page import SubtitlePage
 from cli.ui.media_download_page import VideoDownloadPage
-from cli.ui.subtitle_sync_page import SubtitleSyncPage
+from cli.ui.media_pipeline_page import MediaPipelinePage
+
+from core.temp_manager import (
+    initialize_veyra_temp,
+    cleanup_veyra_temp,
+)
 
 
 class VeyraWindow(QMainWindow):
@@ -121,11 +126,11 @@ class VeyraWindow(QMainWindow):
         )
 
         # ======================================================
-        # SUBTITLE
+        # SIDEBAR SUBTITLE
         # ======================================================
 
         self.sidebar_subtitle = QLabel(
-            "Media Subtitle Tools"
+            "Media Tools"
         )
 
         self.sidebar_subtitle.setObjectName(
@@ -177,10 +182,12 @@ class VeyraWindow(QMainWindow):
             1,
         )
 
-        self.sync_button = self._create_navigation_button(
-            "Subtitle Sync",
-            "SS",
-            2,
+        self.media_processing_button = (
+            self._create_navigation_button(
+                "Media Processing",
+                "MP",
+                2,
+            )
         )
 
         navigation_layout.addWidget(
@@ -192,7 +199,7 @@ class VeyraWindow(QMainWindow):
         )
 
         navigation_layout.addWidget(
-            self.sync_button
+            self.media_processing_button
         )
 
         navigation_layout.addStretch()
@@ -238,8 +245,18 @@ class VeyraWindow(QMainWindow):
         # ======================================================
 
         self.subtitle_page = SubtitlePage()
-        self.video_download_page = VideoDownloadPage()
-        self.subtitle_sync_page = SubtitleSyncPage()
+
+        self.video_download_page = (
+            VideoDownloadPage()
+        )
+
+        self.media_processing_page = (
+            MediaPipelinePage()
+        )
+
+        # ======================================================
+        # ADD PAGES
+        # ======================================================
 
         self.pages.addWidget(
             self.subtitle_page
@@ -250,12 +267,14 @@ class VeyraWindow(QMainWindow):
         )
 
         self.pages.addWidget(
-            self.subtitle_sync_page
+            self.media_processing_page
         )
 
         # ======================================================
         # INITIAL PAGE
         # ======================================================
+
+        self.pages.setCurrentIndex(0)
 
         self._set_active_button(
             self.subtitle_button
@@ -367,6 +386,8 @@ class VeyraWindow(QMainWindow):
                 button
             )
 
+            button.update()
+
     # ==========================================================
     # TOGGLE SIDEBAR
     # ==========================================================
@@ -407,7 +428,6 @@ class VeyraWindow(QMainWindow):
                 )
             )
 
-            # Center the short form.
             button.setStyleSheet(
                 """
                 QPushButton {
@@ -417,7 +437,6 @@ class VeyraWindow(QMainWindow):
                 """
             )
 
-        # Keep the toggle centered.
         self.toggle_button.setText("☰")
 
     # ==========================================================
@@ -443,8 +462,6 @@ class VeyraWindow(QMainWindow):
             button.setToolTip("")
 
             button.setStyleSheet("")
-
-        self.toggle_button.setText("☰")
 
     # ==========================================================
     # STYLE
@@ -576,14 +593,37 @@ class VeyraWindow(QMainWindow):
 # ==============================================================
 
 def main() -> int:
+
+    # ==========================================================
+    # VEYRA TEMP DIRECTORY — STARTUP
+    # ==========================================================
+
+    initialize_veyra_temp()
+
+    # ==========================================================
+    # QT APPLICATION
+    # ==========================================================
+
     app = QApplication(sys.argv)
 
     app.setApplicationName("Veyra")
     app.setOrganizationName("Veyra")
 
+    # ==========================================================
+    # VEYRA TEMP DIRECTORY — SHUTDOWN
+    # ==========================================================
+
+    app.aboutToQuit.connect(
+        cleanup_veyra_temp
+    )
+
+    # ==========================================================
+    # MAIN WINDOW
+    # ==========================================================
+
     window = VeyraWindow()
 
-    # Apply stylesheet AFTER all widgets exist.
+    # Apply stylesheet after all widgets exist.
     window._apply_style()
 
     window.show()
@@ -593,4 +633,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

@@ -3,8 +3,12 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-import tempfile
 import time
+
+from core.temp_manager import (
+    create_temp_file,
+    remove_temp_file,
+)
 
 
 class WavConverter:
@@ -39,8 +43,10 @@ class WavConverter:
         fpath, _ = os.path.split(program)
 
         if fpath:
+
             if is_exe(program):
                 return program
+
             return None
 
         for path in os.environ.get(
@@ -84,12 +90,17 @@ class WavConverter:
     ):
 
         if "\\" in media_filepath:
-            media_filepath = media_filepath.replace(
-                "\\",
-                "/",
+
+            media_filepath = (
+                media_filepath.replace(
+                    "\\",
+                    "/",
+                )
             )
 
-        if not os.path.isfile(media_filepath):
+        if not os.path.isfile(
+            media_filepath
+        ):
 
             error = (
                 f"The given file does not exist: "
@@ -97,7 +108,10 @@ class WavConverter:
             )
 
             self._error(error)
-            raise FileNotFoundError(error)
+
+            raise FileNotFoundError(
+                error
+            )
 
         ffmpeg = self.ffmpeg_check()
 
@@ -108,14 +122,19 @@ class WavConverter:
             )
 
             self._error(error)
-            raise RuntimeError(error)
 
-        temp = tempfile.NamedTemporaryFile(
+            raise RuntimeError(
+                error
+            )
+
+        # ======================================================
+        # VEYRA TEMP WAV
+        # ======================================================
+
+        wav_filepath = create_temp_file(
             suffix=".wav",
-            delete=False,
+            prefix="audio_",
         )
-
-        temp.close()
 
         try:
 
@@ -153,7 +172,7 @@ class WavConverter:
                 "-sample_fmt",
                 "s16",
 
-                temp.name,
+                wav_filepath,
             ]
 
             if sys.platform == "win32":
@@ -186,17 +205,27 @@ class WavConverter:
                 start_time,
             )
 
+            # ==================================================
+            # IMPORTANT
+            #
+            # Do NOT delete the WAV here.
+            #
+            # The caller still needs it for transcription.
+            #
+            # It lives inside /tmp/veyra and will be cleaned
+            # when Veyra exits.
+            # ==================================================
+
             return (
-                temp.name,
+                wav_filepath,
                 self.rate,
             )
 
         except KeyboardInterrupt:
 
-            try:
-                os.unlink(temp.name)
-            except OSError:
-                pass
+            remove_temp_file(
+                wav_filepath
+            )
 
             self._error(
                 "Cancelling all tasks"
@@ -206,12 +235,12 @@ class WavConverter:
 
         except Exception as exc:
 
-            try:
-                os.unlink(temp.name)
-            except OSError:
-                pass
+            remove_temp_file(
+                wav_filepath
+            )
 
             self._error(exc)
+
             raise
 
     # ==========================================================
@@ -258,16 +287,22 @@ class WavConverter:
     # ERROR
     # ==========================================================
 
-    def _error(self, error):
+    def _error(
+        self,
+        error,
+    ):
 
         if self.error_messages_callback:
 
             try:
+
                 self.error_messages_callback(
                     error
                 )
+
             except Exception:
                 pass
 
         else:
+
             print(error)

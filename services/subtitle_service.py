@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 
 from typing import (
     Any,
@@ -11,6 +12,8 @@ from typing import (
     Tuple,
 )
 
+import pysubs2
+
 from core.audio_transcriber import AudioTranscriber
 from core.subtitle_formatter import SubtitleFormatter
 from core.language import Language, is_same_language
@@ -20,6 +23,10 @@ from core.media_subtitle import (
     EmbeddedSubtitle,
     MediaSubtitleExtractor,
     MediaSubtitleInspector,
+)
+from core.temp_manager import (
+    create_temp_file,
+    remove_temp_file,
 )
 
 
@@ -41,6 +48,30 @@ class SubtitleService:
         1. Matching embedded target text subtitle
         2. Existing external target subtitle
         3. Translation
+
+    TRANSLATION
+    -----------
+
+    Translation uses:
+
+        SRTranslator
+            +
+        TranslatePy
+
+    Translation is performed in batches.
+
+    Example:
+
+        subtitles 1-200
+            -> SrtFile.translate()
+
+        subtitles 201-400
+            -> SrtFile.translate()
+
+        ...
+
+    If a batch fails, SubtitlesTranslator falls back to
+    individual TranslatePy translation for that batch.
 
     IMPORTANT
     ---------
@@ -64,8 +95,7 @@ class SubtitleService:
         AND no usable target subtitle exists.
 
     translate_callback is OPTIONAL. It is only used as a
-    confirmation/UI hook when supplied. Its absence does NOT
-    disable translation.
+    confirmation/UI hook when supplied.
     """
 
     LANGUAGE_ALIASES = {
@@ -228,7 +258,6 @@ class SubtitleService:
         self.translate_callback = translate_callback
         self.overwrite_existing = overwrite_existing
 
-    
         self.formatter = SubtitleFormatter(
             format_type=self.subtitle_format,
             error_messages_callback=self._error,
@@ -282,6 +311,115 @@ class SubtitleService:
             ),
         )
 
+    # ==========================================================
+    # SUBTITLE FORMAT
+    # ==========================================================
+
+    @staticmethod
+    def _normalize_subtitle_format(
+        filepath: str,
+    ) -> str:
+
+        return (
+            os.path.splitext(filepath)[1]
+            .lower()
+            .lstrip(".")
+        )
+
+    # ==========================================================
+    # CONVERT TO SRT
+    # ==========================================================
+
+    @staticmethod
+    def _convert_subtitle_to_srt(
+        input_filepath: str,
+        output_filepath: str,
+    ) -> str:
+
+        input_format = (
+            SubtitleService
+            ._normalize_subtitle_format(
+                input_filepath
+            )
+        )
+
+        if input_format == "srt":
+
+            if (
+                os.path.abspath(input_filepath)
+                !=
+                os.path.abspath(output_filepath)
+            ):
+
+                shutil.copyfile(
+                    input_filepath,
+                    output_filepath,
+                )
+
+            return output_filepath
+
+        subtitles = pysubs2.load(
+            input_filepath,
+            encoding="utf-8",
+        )
+
+        subtitles.save(
+            output_filepath,
+            format_="srt",
+            encoding="utf-8",
+        )
+
+        return output_filepath
+
+    # ==========================================================
+    # CONVERT SRT TO REQUESTED FORMAT
+    # ==========================================================
+
+    @staticmethod
+    def _convert_srt_to_format(
+        input_srt: str,
+        output_filepath: str,
+    ) -> str:
+
+        output_format = (
+            SubtitleService
+            ._normalize_subtitle_format(
+                output_filepath
+            )
+        )
+
+        if output_format == "srt":
+
+            if (
+                os.path.abspath(input_srt)
+                !=
+                os.path.abspath(output_filepath)
+            ):
+
+                shutil.copyfile(
+                    input_srt,
+                    output_filepath,
+                )
+
+            return output_filepath
+
+        subtitles = pysubs2.load(
+            input_srt,
+            encoding="utf-8",
+        )
+
+        subtitles.save(
+            output_filepath,
+            format_=output_format,
+            encoding="utf-8",
+        )
+
+        return output_filepath
+
+    # ==========================================================
+    # RESOLVE LANGUAGE
+    # ==========================================================
+
     def _resolve_language(
         self,
         language: str,
@@ -291,30 +429,46 @@ class SubtitleService:
             return ""
 
         try:
-            if self.lang_registry.exists(language):
 
-                code = self.lang_registry.get(
-                    language
-                ).code
+            if self.lang_registry.exists(
+                language
+            ):
 
-                return self._normalize_language(code)
+                code = (
+                    self.lang_registry
+                    .get(language)
+                    .code
+                )
+
+                return self._normalize_language(
+                    code
+                )
 
         except Exception:
             pass
 
         try:
-            if self.lang_registry.name_exists(language):
 
-                code = self.lang_registry.get_by_name(
-                    language
-                ).code
+            if self.lang_registry.name_exists(
+                language
+            ):
 
-                return self._normalize_language(code)
+                code = (
+                    self.lang_registry
+                    .get_by_name(language)
+                    .code
+                )
+
+                return self._normalize_language(
+                    code
+                )
 
         except Exception:
             pass
 
-        return self._normalize_language(language)
+        return self._normalize_language(
+            language
+        )
 
     # ==========================================================
     # PUBLIC API
@@ -395,17 +549,16 @@ class SubtitleService:
                 subtitle
             )
 
-            # Unknown language.
             if not actual:
 
                 if subtitle.extractable:
+
                     unknown_text_matches.append(
                         subtitle
                     )
 
                 continue
 
-            # Requested language does not match.
             if actual != requested:
                 continue
 
@@ -421,21 +574,18 @@ class SubtitleService:
                     subtitle
                 )
 
-        # Matching text wins.
         if exact_text_matches:
 
             return self._choose_embedded_candidate(
                 exact_text_matches
             )
 
-        # Unknown text is usable.
         if unknown_text_matches:
 
             return self._choose_embedded_candidate(
                 unknown_text_matches
             )
 
-        # Image subtitle is returned for reporting.
         if exact_image_matches:
 
             return self._choose_embedded_candidate(
@@ -443,6 +593,10 @@ class SubtitleService:
             )
 
         return None
+
+    # ==========================================================
+    # CHOOSE EMBEDDED CANDIDATE
+    # ==========================================================
 
     @staticmethod
     def _choose_embedded_candidate(
@@ -467,6 +621,7 @@ class SubtitleService:
         ]
 
         if non_forced:
+
             candidates = non_forced
 
         defaults = [
@@ -476,6 +631,7 @@ class SubtitleService:
         ]
 
         if defaults:
+
             return defaults[0]
 
         return candidates[0]
@@ -520,7 +676,9 @@ class SubtitleService:
             media_filepath
         )
 
-        if not os.path.isfile(media_filepath):
+        if not os.path.isfile(
+            media_filepath
+        ):
 
             error = FileNotFoundError(
                 f"Media file does not exist: "
@@ -528,6 +686,7 @@ class SubtitleService:
             )
 
             self._error(error)
+
             raise error
 
         filename = os.path.basename(
@@ -716,8 +875,6 @@ class SubtitleService:
 
         # ------------------------------------------------------
         # 1. EMBEDDED SOURCE TEXT
-        #
-        # Only use embedded subtitle when overwrite is FALSE.
         # ------------------------------------------------------
 
         if (
@@ -763,8 +920,6 @@ class SubtitleService:
 
         # ------------------------------------------------------
         # 2. EXISTING EXTERNAL SOURCE
-        #
-        # Only reuse existing subtitle when overwrite is FALSE.
         # ------------------------------------------------------
 
         elif (
@@ -785,8 +940,6 @@ class SubtitleService:
 
         # ------------------------------------------------------
         # 3. OVERWRITE
-        #
-        # Ignore BOTH embedded and existing external subtitles.
         # ------------------------------------------------------
 
         elif self.overwrite_existing:
@@ -805,8 +958,6 @@ class SubtitleService:
 
         # ------------------------------------------------------
         # 4. EMBEDDED IMAGE SOURCE
-        #
-        # This is only reached when overwrite is FALSE.
         # ------------------------------------------------------
 
         elif (
@@ -865,9 +1016,7 @@ class SubtitleService:
         if self.target_language:
 
             # --------------------------------------------------
-            # 1. EMBEDDED TARGET
-            #
-            # Only use embedded target when overwrite is FALSE.
+            # EMBEDDED TARGET
             # --------------------------------------------------
 
             if (
@@ -879,7 +1028,7 @@ class SubtitleService:
                 self._progress(
                     (
                         "Embedded target text subtitle found; "
-                        "using it instead of Translation "
+                        "using it instead of translation"
                     ),
                     filename,
                     18,
@@ -904,10 +1053,7 @@ class SubtitleService:
                     )
 
             # --------------------------------------------------
-            # 2. OVERWRITE
-            #
-            # Ignore BOTH embedded and existing target subtitles.
-            # Translation will regenerate the target subtitle.
+            # OVERWRITE TARGET
             # --------------------------------------------------
 
             elif self.overwrite_existing:
@@ -915,8 +1061,8 @@ class SubtitleService:
                 self._progress(
                     (
                         "Overwrite enabled; ignoring embedded and "
-                        "existing target subtitles. Translation will "
-                        "regenerate the target subtitle."
+                        "existing target subtitles. Translation "
+                        "will regenerate the target subtitle."
                     ),
                     filename,
                     20,
@@ -925,7 +1071,7 @@ class SubtitleService:
                 translate_required = True
 
             # --------------------------------------------------
-            # 3. EXISTING TARGET
+            # EXISTING TARGET
             # --------------------------------------------------
 
             elif (
@@ -943,7 +1089,7 @@ class SubtitleService:
                 )
 
             # --------------------------------------------------
-            # 4. EMBEDDED IMAGE TARGET
+            # EMBEDDED IMAGE TARGET
             # --------------------------------------------------
 
             elif (
@@ -982,7 +1128,7 @@ class SubtitleService:
                     )
 
             # --------------------------------------------------
-            # 5. NO EMBEDDED TARGET
+            # NO EMBEDDED TARGET
             # --------------------------------------------------
 
             else:
@@ -1130,7 +1276,9 @@ class SubtitleService:
                     regions=regions,
                     transcripts=transcripts,
                     filename=filename,
-                    progress_message="Writing source subtitle",
+                    progress_message=(
+                        "Writing source subtitle"
+                    ),
                 )
 
                 source_available = True
@@ -1187,7 +1335,7 @@ class SubtitleService:
                 )
 
             # ==================================================
-            # Translation 
+            # TRANSLATION
             # ==================================================
 
             if translate_required:
@@ -1207,8 +1355,8 @@ class SubtitleService:
 
                 self._progress(
                     (
-                        "Starting offline Translation CTranslate2 "
-                        "translation "
+                        "Starting SRTranslator / TranslatePy "
+                        f"translation "
                         f"{self.source_language} -> "
                         f"{self.target_language}"
                     ),
@@ -1216,108 +1364,214 @@ class SubtitleService:
                     65,
                 )
 
-                translator = SubtitlesTranslator(
-                    source_language=self.source_language,
-                    target_language=self.target_language,
-                    error_messages_callback=self._error,
-                    batch_size=32,
-                )
-
-                if not translator.is_available:
-
-                    raise RuntimeError(
-                        "Translation CTranslate2 failed to initialize.\n"
-                        f"Model path: "
-                        f"{translator.model_path}\n"
-                        f"Source: "
-                        f"{self.source_language}\n"
-                        f"Target: "
-                        f"{self.target_language}"
+                source_format = (
+                    self._normalize_subtitle_format(
+                        source_subtitle
                     )
-
-                self._progress(
-                    "Translating subtitles offline with Translation ",
-                    filename,
-                    70,
                 )
 
-                translated_transcripts = translator(
-                    transcripts
-                )
+                temporary_source_srt: Optional[
+                    str
+                ] = None
 
-                if (
-                    not translated_transcripts
-                    or len(translated_transcripts)
-                    != len(transcripts)
-                ):
+                translated_srt: Optional[
+                    str
+                ] = None
 
-                    raise RuntimeError(
-                        "Translation CTranslate2 returned an "
-                        "invalid number of subtitle lines."
-                    )
+                translator: Optional[
+                    SubtitlesTranslator
+                ] = None
 
-                # Basic sanity check.
-                cleaned_translations = []
+                try:
 
-                for original, translated in zip(
-                    transcripts,
-                    translated_transcripts,
-                ):
+                    # --------------------------------------------------
+                    # CONVERT SOURCE TO SRT IF NECESSARY
+                    # --------------------------------------------------
 
-                    translated = str(
-                        translated or ""
-                    ).strip()
+                    if source_format == "srt":
 
-                    if not translated:
-
-                        raise RuntimeError(
-                            "Translation returned an empty translation "
-                            f"for subtitle line: {original!r}"
+                        translation_source_srt = (
+                            source_subtitle
                         )
 
-                    cleaned_translations.append(
-                        translated
+                    else:
+
+                        temporary_source_srt = create_temp_file(
+                            suffix=".srt",
+                            prefix="source_",
+                        )
+
+                        self._progress(
+                            (
+                                f"Converting source "
+                                f"{source_format.upper()} "
+                                "to SRT"
+                            ),
+                            filename,
+                            66,
+                        )
+
+                        self._convert_subtitle_to_srt(
+                            source_subtitle,
+                            temporary_source_srt,
+                        )
+
+                        translation_source_srt = (
+                            temporary_source_srt
+                        )
+
+                    # --------------------------------------------------
+                    # TEMPORARY TRANSLATED SRT
+                    # --------------------------------------------------
+
+                    translated_srt = create_temp_file(
+                        suffix=".srt",
+                        prefix="translated_",
                     )
 
-                translated_transcripts = (
-                    cleaned_translations
-                )
+                    # --------------------------------------------------
+                    # SUBTITLE TRANSLATOR
+                    #
+                    # 200 subtitles per bulk batch.
+                    # --------------------------------------------------
 
-                if os.path.isfile(
-                    translated_subtitle
-                ):
+                    translator = SubtitlesTranslator(
+                        source_language=self.source_language,
+                        target_language=self.target_language,
+                        error_messages_callback=self._error,
+                        progress_callback=(
+                            lambda percentage:
+                            self._translation_progress(
+                                percentage,
+                                filename,
+                            )
+                        ),
+                        batch_size=100,
+                        retry_count=3,
+                        retry_delay=1.0,
+                    )
 
-                    try:
+                    if not translator.is_available:
 
-                        os.remove(
+                        raise RuntimeError(
+                            "SRTranslator failed to initialize."
+                        )
+
+                    self._progress(
+                        (
+                            "Translating with "
+                            "SRTranslator / TranslatePy "
+                            f"{self.source_language} -> "
+                            f"{self.target_language} "
+                            "(batches of 200 subtitles)"
+                        ),
+                        filename,
+                        70,
+                    )
+
+                    # --------------------------------------------------
+                    # THIS IS THE ONLY TRANSLATION CALL.
+                    #
+                    # It creates translated_srt.
+                    #
+                    # There is intentionally NO translated_transcripts
+                    # variable here.
+                    # --------------------------------------------------
+
+                    translator.translate_srt(
+                        translation_source_srt,
+                        translated_srt,
+                    )
+
+                    if not os.path.isfile(
+                        translated_srt
+                    ):
+
+                        raise RuntimeError(
+                            "SRTranslator completed but did not "
+                            "create the translated SRT."
+                        )
+
+                    # --------------------------------------------------
+                    # CONVERT TRANSLATED SRT TO REQUESTED FORMAT
+                    # --------------------------------------------------
+
+                    output_format = (
+                        self._normalize_subtitle_format(
                             translated_subtitle
                         )
+                    )
 
-                    except OSError as exc:
+                    self._progress(
+                        (
+                            "Converting translated SRT "
+                            f"to {output_format.upper()}"
+                        ),
+                        filename,
+                        95,
+                    )
+
+                    if os.path.isfile(
+                        translated_subtitle
+                    ):
+
+                        try:
+
+                            os.remove(
+                                translated_subtitle
+                            )
+
+                        except OSError as exc:
+
+                            raise RuntimeError(
+                                "Cannot replace existing target "
+                                f"subtitle: "
+                                f"{translated_subtitle}"
+                            ) from exc
+
+                    self._convert_srt_to_format(
+                        translated_srt,
+                        translated_subtitle,
+                    )
+
+                    if not os.path.isfile(
+                        translated_subtitle
+                    ):
 
                         raise RuntimeError(
-                            "Cannot replace existing target "
-                            f"subtitle: {translated_subtitle}"
-                        ) from exc
+                            "Translated subtitle conversion "
+                            "completed but the target file "
+                            "was not created."
+                        )
 
-                self._write_subtitle(
-                    filepath=translated_subtitle,
-                    regions=regions,
-                    transcripts=translated_transcripts,
-                    filename=filename,
-                    progress_message=(
-                        "Writing translated subtitle"
-                    ),
-                )
+                    self._progress(
+                        (
+                            "Translation complete: "
+                            f"{translated_subtitle}"
+                        ),
+                        filename,
+                        98,
+                    )
 
-                self._progress(
-                    (
-                        "Translation complete: "
-                        f"{translated_subtitle}"
-                    ),
-                    filename,
-                    98,
-                )
+                finally:
+
+                    if translator:
+
+                        try:
+
+                            translator.close()
+
+                        except Exception:
+
+                            pass
+
+                    remove_temp_file(
+                        temporary_source_srt
+                    )
+
+                    remove_temp_file(
+                        translated_srt
+                    )
 
             # ==================================================
             # COMPLETE
@@ -1352,6 +1606,7 @@ class SubtitleService:
             self._error(exc)
 
             raise
+
     # ==========================================================
     # RESULT
     # ==========================================================
@@ -1365,6 +1620,7 @@ class SubtitleService:
             filepath
             and os.path.isfile(filepath)
         ):
+
             return filepath
 
         return None
@@ -1396,11 +1652,52 @@ class SubtitleService:
             ),
 
             "transcription_task": "transcribe",
-
         }
 
     # ==========================================================
-    # TRANSLATION DECISION — FIXED
+    # TRANSLATION PROGRESS
+    # ==========================================================
+
+    def _translation_progress(
+        self,
+        percentage: int,
+        filename: str,
+    ) -> None:
+
+        percentage = max(
+            0,
+            min(
+                100,
+                int(percentage),
+            ),
+        )
+
+        # Map translator's 0-100 progress into
+        # service's 70-95 range.
+        service_percentage = int(
+            70
+            + (
+                percentage
+                * 0.25
+            )
+        )
+
+        service_percentage = max(
+            70,
+            min(
+                95,
+                service_percentage,
+            ),
+        )
+
+        self._progress(
+            "Translation in progress",
+            filename,
+            service_percentage,
+        )
+
+    # ==========================================================
+    # TRANSLATION DECISION
     # ==========================================================
 
     def _should_translate(
@@ -1410,12 +1707,10 @@ class SubtitleService:
         translated_subtitle: Optional[str],
     ) -> bool:
 
-        # No target = no translation.
         if not self.target_language:
 
             return False
 
-        # Same language = no translation.
         if is_same_language(
             self.source_language,
             self.target_language,
@@ -1433,7 +1728,6 @@ class SubtitleService:
 
             return False
 
-        # Existing target = don't translate unless overwrite.
         if (
             translated_subtitle
             and os.path.isfile(
@@ -1454,14 +1748,7 @@ class SubtitleService:
             return False
 
         # ------------------------------------------------------
-        # FIX:
-        #
-        # Translation is automatic.
-        #
-        # translate_callback is NOT required.
-        #
-        # If supplied, use it as an optional confirmation hook.
-        # If absent, continue directly to Translation .
+        # OPTIONAL CALLBACK
         # ------------------------------------------------------
 
         if self.translate_callback:
@@ -1479,7 +1766,6 @@ class SubtitleService:
 
             except TypeError:
 
-                # Support older callback signatures.
                 try:
 
                     decision = self.translate_callback(
@@ -1501,12 +1787,10 @@ class SubtitleService:
 
                         self._error(exc)
 
-                        # Do not silently disable translation
-                        # because the callback failed.
                         self._progress(
                             (
                                 "Translation callback failed; "
-                                "continuing with Translation "
+                                "continuing automatically"
                             ),
                             filename,
                             63,
@@ -1521,7 +1805,7 @@ class SubtitleService:
                     self._progress(
                         (
                             "Translation callback failed; "
-                            "continuing with Translation "
+                            "continuing automatically"
                         ),
                         filename,
                         63,
@@ -1536,7 +1820,7 @@ class SubtitleService:
                 self._progress(
                     (
                         "Translation callback failed; "
-                        "continuing with Translation "
+                        "continuing automatically"
                     ),
                     filename,
                     63,
@@ -1545,14 +1829,13 @@ class SubtitleService:
                 return True
 
         # ------------------------------------------------------
-        # NO CALLBACK:
         # AUTOMATIC TRANSLATION
         # ------------------------------------------------------
 
         self._progress(
             (
                 "No existing target subtitle; "
-                "automatic Translation requested"
+                "automatic translation requested"
             ),
             filename,
             62,
@@ -1561,7 +1844,7 @@ class SubtitleService:
         return True
 
     # ==========================================================
-    # READ SOURCE
+    # READ SOURCE SUBTITLE
     # ==========================================================
 
     def _read_source_subtitle(
@@ -1572,7 +1855,9 @@ class SubtitleService:
         List[str],
     ]:
 
-        if not os.path.isfile(filepath):
+        if not os.path.isfile(
+            filepath
+        ):
 
             raise FileNotFoundError(
                 f"Source subtitle does not exist: "
@@ -1629,6 +1914,7 @@ class SubtitleService:
                         not region
                         or len(region) != 2
                     ):
+
                         continue
 
                     text = str(
@@ -1636,6 +1922,7 @@ class SubtitleService:
                     ).strip()
 
                     if not text:
+
                         continue
 
                     try:
@@ -1656,6 +1943,7 @@ class SubtitleService:
                         continue
 
                     if end <= start:
+
                         continue
 
                     parsed_regions.append(
@@ -1737,20 +2025,25 @@ class SubtitleService:
             ]
 
             if len(lines) < 2:
+
                 continue
 
             timing_line = None
             timing_index = -1
 
-            for index, line in enumerate(lines):
+            for index, line in enumerate(
+                lines
+            ):
 
                 if "-->" in line:
 
                     timing_line = line
                     timing_index = index
+
                     break
 
             if timing_line is None:
+
                 continue
 
             try:
@@ -1785,6 +2078,7 @@ class SubtitleService:
                 continue
 
             if end <= start:
+
                 continue
 
             subtitle_text = "\n".join(
@@ -1794,6 +2088,7 @@ class SubtitleService:
             ).strip()
 
             if not subtitle_text:
+
                 continue
 
             regions.append(
@@ -1807,10 +2102,13 @@ class SubtitleService:
                 subtitle_text
             )
 
-        return regions, texts
+        return (
+            regions,
+            texts,
+        )
 
     # ==========================================================
-    # WRITE
+    # WRITE SUBTITLE
     # ==========================================================
 
     def _write_subtitle(
@@ -1824,7 +2122,9 @@ class SubtitleService:
         progress_message: str,
     ) -> None:
 
-        if len(regions) != len(transcripts):
+        if len(regions) != len(
+            transcripts
+        ):
 
             raise ValueError(
                 "Subtitle regions and transcript "
@@ -1880,6 +2180,7 @@ class SubtitleService:
     ) -> None:
 
         if not self.progress_callback:
+
             return
 
         percentage = max(
@@ -1910,10 +2211,16 @@ class SubtitleService:
                 )
 
             except Exception:
+
                 pass
 
         except Exception:
+
             pass
+
+    # ==========================================================
+    # CORE PROGRESS
+    # ==========================================================
 
     def _core_progress(
         self,
@@ -1924,6 +2231,7 @@ class SubtitleService:
     ) -> None:
 
         if not self.progress_callback:
+
             return
 
         try:
@@ -1946,9 +2254,11 @@ class SubtitleService:
                 )
 
             except Exception:
+
                 pass
 
         except Exception:
+
             pass
 
     # ==========================================================
@@ -1971,6 +2281,7 @@ class SubtitleService:
                 return
 
             except Exception:
+
                 pass
 
         print(error)
@@ -1999,9 +2310,17 @@ def self_timestamp_to_seconds(
             f"{timestamp}"
         )
 
-    hours = float(parts[0])
-    minutes = float(parts[1])
-    seconds = float(parts[2])
+    hours = float(
+        parts[0]
+    )
+
+    minutes = float(
+        parts[1]
+    )
+
+    seconds = float(
+        parts[2]
+    )
 
     return (
         hours * 3600

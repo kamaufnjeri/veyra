@@ -1,47 +1,47 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Optional
 
-import httpx
-import requests
-
+from srtranslator import SrtFile
+from srtranslator.translators.translatepy import TranslatePy
 
 class SubtitlesTranslator:
     """
-    Fast subtitle translator using Google's GTX endpoint.
+    Subtitle translator using SRTranslator + TranslatePy.
 
-    No CTranslate2.
-    No NLLB model.
-    No local model files.
+    Translation strategy:
+
+        1. Load the complete SRT.
+        2. Split subtitles into batches.
+        3. Translate each batch using SrtFile.translate().
+        4. If a batch fails, translate that batch individually.
+        5. Continue until the entire file is processed.
 
     Example:
 
-        translator = SubtitlesTranslator(
-            source_language="es",
-            target_language="en",
-        )
+        1-200       -> bulk
+        201-400     -> bulk
+        401-600     -> bulk
+        ...
 
-        result = translator([
-            "Hola, ¿cómo estás?",
-            "Me llamo Carlos.",
-        ])
+    Individual translation is only used as a fallback for a
+    failed batch.
     """
-
-    DEFAULT_TIMEOUT = 30
-    DEFAULT_RETRIES = 3
-    DEFAULT_BATCH_SIZE = 16
 
     def __init__(
         self,
         source_language: str,
         target_language: str,
-        error_messages_callback=None,
-        progress_callback=None,
-        batch_size: int = DEFAULT_BATCH_SIZE,
-        timeout: int = DEFAULT_TIMEOUT,
-        retries: int = DEFAULT_RETRIES,
-        patience: int = 1,
+        error_messages_callback: Optional[
+            Callable[[str], None]
+        ] = None,
+        progress_callback: Optional[
+            Callable[[int], None]
+        ] = None,
+        batch_size: int = 100,
+        retry_count: int = 3,
+        retry_delay: float = 1.0,
     ):
         self.source_language = self._normalize_language(
             source_language
@@ -55,59 +55,32 @@ class SubtitlesTranslator:
             error_messages_callback
         )
 
-        self.progress_callback = (
-            progress_callback
-        )
+        self.progress_callback = progress_callback
 
         self.batch_size = max(
             1,
             int(batch_size),
         )
 
-        self.timeout = max(
+        self.retry_count = max(
             1,
-            int(timeout),
+            int(retry_count),
         )
 
-        self.retries = max(
-            0,
-            int(retries),
+        self.retry_delay = max(
+            0.0,
+            float(retry_delay),
         )
 
-        self.patience = max(
-            0,
-            int(patience),
-        )
+        self.translator = TranslatePy()
 
-        self._translation_cache: Dict[
-            str,
-            str,
-        ] = {}
-
-        self._session = requests.Session()
-
-        self._session.headers.update(
-            {
-                "User-Agent": (
-                    "Mozilla/5.0 "
-                    "(Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) "
-                    "Chrome/131.0 Safari/537.36"
-                ),
-                "Referer": (
-                    "https://translate.google.com/"
-                ),
-            }
-        )
-
-    # ==========================================================
-    # LANGUAGE
-    # ==========================================================
+    # ------------------------------------------------------------------
+    # Language
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _normalize_language(
-        language: Optional[str],
+        language: str,
     ) -> str:
 
         if not language:
@@ -118,526 +91,396 @@ class SubtitlesTranslator:
             .strip()
             .lower()
             .replace("_", "-")
+            .split("-", 1)[0]
         )
 
-    # ==========================================================
-    # STATUS
-    # ==========================================================
+    # ------------------------------------------------------------------
+    # Availability
+    # ------------------------------------------------------------------
 
     @property
     def is_available(self) -> bool:
         return bool(
             self.source_language
             and self.target_language
+            and self.translator
         )
 
-    # ==========================================================
-    # SINGLE TRANSLATION
-    # ==========================================================
+    # ------------------------------------------------------------------
+    # Main SRT translation
+    # ------------------------------------------------------------------
 
-    def translate(
+    def translate_srt(
         self,
-        text: Optional[str],
+        input_srt: str,
+        output_srt: str,
     ) -> str:
 
-        if text is None:
-            return ""
+        subtitles = SrtFile(input_srt)
 
-        original = str(text)
+        print("SRT loaded successfully")
 
-        if not original.strip():
-            return original
+        total = len(subtitles.subtitles)
 
-        # ------------------------------------------------------
-        # Cache
-        # ------------------------------------------------------
+        if total == 0:
+            print("SRT contains no subtitles.")
 
-        cached = self._translation_cache.get(
-            original
+            subtitles.save(output_srt)
+
+            return output_srt
+
+        print(
+            f"Total subtitles: {total}"
         )
 
-        if cached is not None:
-            return cached
-
-        if not self.is_available:
-            raise RuntimeError(
-                "Translator is not configured."
-            )
-
-        try:
-
-            translated = self.google_translate(
-                text=original,
-                source=self.source_language,
-                target=self.target_language,
-            )
-
-            if not translated:
-                return original
-
-            # --------------------------------------------------
-            # GTX occasionally returns a trailing newline.
-            # Retry if requested.
-            # --------------------------------------------------
-
-            attempts = 0
-
-            while (
-                translated.endswith("\n")
-                and attempts < self.patience
-            ):
-                attempts += 1
-
-                retry_result = (
-                    self.google_translate(
-                        text=original,
-                        source=self.source_language,
-                        target=self.target_language,
-                    )
-                )
-
-                if not retry_result:
-                    break
-
-                translated = retry_result
-
-            translated = translated.strip()
-
-            if not translated:
-                translated = original
-
-            self._translation_cache[
-                original
-            ] = translated
-
-            return translated
-
-        except Exception as exc:
-
-            self._error(
-                f"Translation failed: {exc}"
-            )
-
-            # Keep subtitle processing alive.
-            return original
-
-    # ==========================================================
-    # GOOGLE GTX
-    # ==========================================================
-
-    def google_translate(
-        self,
-        text: str,
-        source: str,
-        target: str,
-    ) -> Optional[str]:
-
-        url = (
-            "https://translate.googleapis.com/"
-            "translate_a/single"
+        print(
+            f"Batch size: {self.batch_size}"
         )
 
-        params = {
-            "client": "gtx",
-            "sl": source,
-            "tl": target,
-            "dt": "t",
-            "q": text,
-        }
+        print()
 
-        last_error = None
+        # Keep the complete subtitle list.
+        all_subtitles = subtitles.subtitles
 
-        for attempt in range(
-            self.retries + 1
+        # --------------------------------------------------------------
+        # Calculate number of batches
+        # --------------------------------------------------------------
+
+        batch_count = (
+            total + self.batch_size - 1
+        ) // self.batch_size
+
+        print(
+            f"Translation batches: {batch_count}"
+        )
+
+        print()
+
+        # --------------------------------------------------------------
+        # Process batches
+        # --------------------------------------------------------------
+
+        for batch_number in range(
+            batch_count
         ):
 
-            try:
-
-                response = self._session.get(
-                    url,
-                    params=params,
-                    timeout=self.timeout,
-                )
-
-                response.raise_for_status()
-
-                data = response.json()
-
-                translated = (
-                    self._parse_response(data)
-                )
-
-                if translated:
-                    return translated
-
-                raise RuntimeError(
-                    "Google returned an empty translation."
-                )
-
-            except requests.exceptions.RequestException as exc:
-
-                last_error = exc
-
-                if attempt < self.retries:
-                    time.sleep(
-                        min(
-                            0.5 * (attempt + 1),
-                            2.0,
-                        )
-                    )
-
-            except Exception as exc:
-
-                last_error = exc
-
-                if attempt < self.retries:
-                    time.sleep(0.2)
-
-        # ------------------------------------------------------
-        # HTTPX fallback
-        # ------------------------------------------------------
-
-        try:
-
-            with httpx.Client(
-                timeout=self.timeout,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 "
-                        "(Windows NT 10.0; Win64; x64)"
-                    ),
-                    "Referer": (
-                        "https://translate.google.com/"
-                    ),
-                },
-            ) as client:
-
-                response = client.get(
-                    url,
-                    params=params,
-                )
-
-                response.raise_for_status()
-
-                return self._parse_response(
-                    response.json()
-                )
-
-        except Exception as exc:
-
-            last_error = exc
-
-        if last_error:
-            self._error(
-                last_error
+            start = (
+                batch_number
+                * self.batch_size
             )
-
-        return None
-
-    # ==========================================================
-    # RESPONSE PARSER
-    # ==========================================================
-
-    def _parse_response(
-        self,
-        response_data: Any,
-    ) -> Optional[str]:
-
-        try:
-
-            if not response_data:
-                return None
-
-            if not isinstance(
-                response_data,
-                list,
-            ):
-                return None
-
-            if not response_data[0]:
-                return None
-
-            parts = []
-
-            for item in response_data[0]:
-
-                if not item:
-                    continue
-
-                if not isinstance(
-                    item,
-                    list,
-                ):
-                    continue
-
-                if len(item) < 1:
-                    continue
-
-                translated_text = item[0]
-
-                if translated_text:
-                    parts.append(
-                        str(translated_text)
-                    )
-
-            if not parts:
-                return None
-
-            return "".join(parts)
-
-        except (
-            IndexError,
-            KeyError,
-            TypeError,
-        ) as exc:
-
-            self._error(exc)
-
-            return None
-
-    # ==========================================================
-    # BATCH
-    # ==========================================================
-
-    def _translate_batch(
-        self,
-        texts: List[str],
-    ) -> List[str]:
-
-        if not texts:
-            return []
-
-        results: List[Optional[str]] = [
-            None
-        ] * len(texts)
-
-        uncached_indices = []
-        uncached_texts = []
-
-        # ------------------------------------------------------
-        # Cache lookup
-        # ------------------------------------------------------
-
-        for index, text in enumerate(texts):
-
-            text = str(text)
-
-            if not text.strip():
-                results[index] = text
-                continue
-
-            cached = (
-                self._translation_cache.get(
-                    text
-                )
-            )
-
-            if cached is not None:
-                results[index] = cached
-            else:
-                uncached_indices.append(index)
-                uncached_texts.append(text)
-
-        # Everything was cached.
-        if not uncached_texts:
-
-            return [
-                results[index]
-                if results[index] is not None
-                else str(texts[index])
-                for index in range(len(texts))
-            ]
-
-        # ------------------------------------------------------
-        # Google GTX does not have a reliable official
-        # multi-sentence batch API, so translate requests
-        # individually.
-        #
-        # The Session keeps HTTP connections alive, which makes
-        # this considerably cheaper than creating a new client
-        # for every subtitle.
-        # ------------------------------------------------------
-
-        for index, text in zip(
-            uncached_indices,
-            uncached_texts,
-        ):
-
-            translated = self.translate(
-                text
-            )
-
-            results[index] = translated
-
-        return [
-            results[index]
-            if results[index] is not None
-            else str(texts[index])
-            for index in range(len(texts))
-        ]
-
-    # ==========================================================
-    # LIST TRANSLATION
-    # ==========================================================
-
-    def __call__(
-        self,
-        transcripts: List[str],
-    ) -> List[str]:
-
-        if not transcripts:
-            return []
-
-        if not self.is_available:
-            raise RuntimeError(
-                "Translator is not configured."
-            )
-
-        translated: List[str] = []
-
-        total = len(transcripts)
-
-        for start in range(
-            0,
-            total,
-            self.batch_size,
-        ):
 
             end = min(
                 start + self.batch_size,
                 total,
             )
 
-            batch = transcripts[
+            batch = all_subtitles[
                 start:end
             ]
 
-            translated_batch = (
-                self._translate_batch(
-                    batch
+            print(
+                "=" * 60
+            )
+
+            print(
+                f"TRANSLATING BATCH "
+                f"{batch_number + 1}/{batch_count}"
+            )
+
+            print(
+                f"Subtitles "
+                f"{start + 1}-{end}"
+            )
+
+            print(
+                "=" * 60
+            )
+
+            # ----------------------------------------------------------
+            # IMPORTANT:
+            #
+            # Give SrtFile.translate() ONLY this batch.
+            # ----------------------------------------------------------
+
+            subtitles.subtitles = batch
+
+            # Save original text in case bulk translation partially
+            # modifies the batch before failing.
+            original_contents = [
+                subtitle.content
+                for subtitle in batch
+            ]
+
+            try:
+
+                print(
+                    "Starting bulk translation..."
+                )
+
+                subtitles.translate(
+                    self.translator,
+                    self.source_language,
+                    self.target_language,
+                )
+
+                print(
+                    f"Batch {batch_number + 1} "
+                    f"translated successfully."
+                )
+
+                # Report progress based on completed batch.
+                self._report_progress(
+                    end,
+                    total,
+                )
+
+            except Exception as exc:
+
+                print(
+                    f"Bulk translation failed "
+                    f"for batch "
+                    f"{batch_number + 1}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+                self._report_error(
+                    "Bulk translation failed "
+                    f"for subtitles "
+                    f"{start + 1}-{end}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+                # ------------------------------------------------------
+                # Restore the original text.
+                #
+                # SrtFile.translate() may have translated some
+                # subtitles before throwing an exception.
+                # ------------------------------------------------------
+
+                for subtitle, original in zip(
+                    batch,
+                    original_contents,
+                ):
+                    subtitle.content = original
+
+                # ------------------------------------------------------
+                # Fallback: translate this batch individually.
+                # ------------------------------------------------------
+
+                print(
+                    f"Falling back to individual "
+                    f"translation for subtitles "
+                    f"{start + 1}-{end}..."
+                )
+
+                self._translate_batch_individually(
+                    batch,
+                    start,
+                    total,
+                )
+
+            # Restore complete subtitle list.
+            subtitles.subtitles = all_subtitles
+
+        # --------------------------------------------------------------
+        # Final formatting
+        # --------------------------------------------------------------
+
+        subtitles.subtitles = all_subtitles
+
+        print()
+        print(
+            "Wrapping subtitle lines..."
+        )
+
+        try:
+            subtitles.wrap_lines()
+        except Exception as exc:
+            self._report_error(
+                "Failed to wrap subtitle lines: "
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        # --------------------------------------------------------------
+        # Save
+        # --------------------------------------------------------------
+
+     
+        subtitles.save(output_srt)
+
+        self._report_progress(
+            total,
+            total,
+        )
+
+        print()
+        print(
+            "Translation complete."
+        )
+
+        return output_srt
+
+    # ------------------------------------------------------------------
+    # Individual batch fallback
+    # ------------------------------------------------------------------
+
+    def _translate_batch_individually(
+        self,
+        batch: list[Any],
+        start_index: int,
+        total: int,
+    ) -> None:
+
+        batch_total = len(batch)
+
+        for index, subtitle in enumerate(
+            batch
+        ):
+
+            original = subtitle.content
+
+            if not original or not original.strip():
+
+                self._report_progress(
+                    start_index + index + 1,
+                    total,
+                )
+
+                continue
+
+            translated = (
+                self._translate_individual(
+                    original
                 )
             )
 
-            translated.extend(
-                translated_batch
+            if translated:
+                subtitle.content = translated
+
+            self._report_progress(
+                start_index + index + 1,
+                total,
             )
 
-            self._progress(
-                "Translating subtitles",
-                int(end * 100 / total),
-            )
+    # ------------------------------------------------------------------
+    # Individual translation
+    # ------------------------------------------------------------------
 
-        return translated
-
-    # ==========================================================
-    # TIMED SUBTITLES
-    # ==========================================================
-
-    def translate_pairs(
+    def _translate_individual(
         self,
-        timed_subtitles: List[
-            Tuple[
-                Tuple[float, float],
-                str,
-            ]
-        ],
-    ) -> List[
-        Tuple[
-            Tuple[float, float],
-            str,
-        ]
-    ]:
+        text: str,
+    ) -> Optional[str]:
 
-        if not timed_subtitles:
-            return []
+        for attempt in range(
+            1,
+            self.retry_count + 1,
+        ):
 
-        regions = [
-            region
-            for region, _ in timed_subtitles
-        ]
+            try:
 
-        texts = [
-            text
-            for _, text in timed_subtitles
-        ]
+                translated = (
+                    self.translator.translate(
+                        text,
+                        self.source_language,
+                        self.target_language,
+                    )
+                )
 
-        translated = self(
-            texts
-        )
+                # TranslatePy adapter returns a string.
+                if isinstance(
+                    translated,
+                    str,
+                ):
+                    translated = (
+                        translated.strip()
+                    )
 
-        return [
-            (
-                regions[index],
-                translated[index],
-            )
-            for index in range(
-                len(regions)
-            )
-        ]
+                if translated:
+                    return translated
 
-    # ==========================================================
-    # CACHE
-    # ==========================================================
+                raise RuntimeError(
+                    "Translator returned "
+                    "an empty result"
+                )
 
-    def clear_cache(self) -> None:
-        self._translation_cache.clear()
+            except Exception as exc:
 
-    def cache_size(self) -> int:
-        return len(
-            self._translation_cache
-        )
+                if attempt >= self.retry_count:
 
-    # ==========================================================
-    # PROGRESS
-    # ==========================================================
+                    self._report_error(
+                        "Individual translation "
+                        "failed after "
+                        f"{self.retry_count} attempts: "
+                        f"{type(exc).__name__}: {exc}\n"
+                        f"Text: {text!r}"
+                    )
 
-    def _progress(
+                    # Preserve original subtitle.
+                    return text
+
+                print(
+                    f"Translation attempt "
+                    f"{attempt}/{self.retry_count} "
+                    f"failed. Retrying..."
+                )
+
+                time.sleep(
+                    self.retry_delay
+                )
+
+        return text
+
+    # ------------------------------------------------------------------
+    # Progress
+    # ------------------------------------------------------------------
+
+    def _report_progress(
         self,
-        message: str,
-        percentage: int,
+        current: int,
+        total: int,
     ) -> None:
 
-        if not self.progress_callback:
-            return
-
-        try:
-            self.progress_callback(
-                message,
-                percentage,
+        if total <= 0:
+            percent = 100
+        else:
+            percent = int(
+                (current / total) * 100
             )
-        except Exception:
-            pass
 
-    # ==========================================================
-    # ERROR
-    # ==========================================================
+        if self.progress_callback:
 
-    def _error(
+            try:
+                self.progress_callback(
+                    percent
+                )
+            except Exception:
+                pass
+
+    # ------------------------------------------------------------------
+    # Errors
+    # ------------------------------------------------------------------
+
+    def _report_error(
         self,
-        error: Any,
+        message: str,
     ) -> None:
 
         if self.error_messages_callback:
 
             try:
                 self.error_messages_callback(
-                    error
+                    message
                 )
-                return
             except Exception:
                 pass
 
-        print(
-            f"ERROR: {error}"
-        )
-
-    # ==========================================================
-    # CLEANUP
-    # ==========================================================
+    # ------------------------------------------------------------------
+    # Close
+    # ------------------------------------------------------------------
 
     def close(self) -> None:
 
         try:
-            self._session.close()
+            self.translator.quit()
         except Exception:
             pass

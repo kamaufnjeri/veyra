@@ -18,9 +18,10 @@ from typing import (
 
 import speech_recognition as sr
 
+from core.temp_manager import remove_temp_file
 from core.wav_converter import WavConverter
 from core.silero_vad import SileroVAD
-
+from core.temp_manager import remove_temp_file
 
 # ==============================================================
 # AUDIO TRANSCRIBER
@@ -469,16 +470,8 @@ class AudioTranscriber:
 
         finally:
 
-            if wav_path:
 
-                try:
-
-                    os.unlink(
-                        wav_path
-                    )
-
-                except OSError:
-                    pass
+            remove_temp_file(wav_path)
 
     # ==========================================================
     # RECOGNIZE ONE REGION

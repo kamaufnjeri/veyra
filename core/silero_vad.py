@@ -1,377 +1,440 @@
 from __future__ import annotations
 
 import math
+import os
 import subprocess
-from typing import List, Tuple
+from typing import Callable, List, Optional, Tuple
+
+
+# ---------------------------------------------------------------------------
+# PyTorch environment configuration
+# ---------------------------------------------------------------------------
+#
+# These MUST be set before importing torch.
+#
+# Your Intel i3-3110M does not support the CPU instructions expected by
+# NNPACK. PyTorch can still run using other CPU implementations, but without
+# this setting it may repeatedly print:
+#
+#   Could not initialize NNPACK! Reason: Unsupported hardware.
+#
+# TORCH_CPP_LOG_LEVEL=ERROR suppresses that noisy warning.
+#
+os.environ["OMP_NUM_THREADS"] = "2"
+os.environ["MKL_NUM_THREADS"] = "2"
+os.environ["ATEN_CPU_CAPABILITY"] = "default"
+os.environ["TORCH_CPP_LOG_LEVEL"] = "ERROR"
+
 
 import torch
+from silero_vad import load_silero_vad, get_speech_timestamps
 
-from silero_vad import (
-    load_silero_vad,
-    get_speech_timestamps,
-)
+
+# Keep CPU usage reasonable on older machines.
+torch.set_num_threads(2)
+
+try:
+    torch.set_num_interop_threads(1)
+except RuntimeError:
+    # PyTorch only allows this to be configured before certain work has
+    # started. If another part of the application already initialized
+    # PyTorch, simply keep the existing setting.
+    pass
 
 
 class SileroVAD:
+    """
+    Silero Voice Activity Detection with a fixed 10-second fallback.
+
+    Normal path
+    -----------
+    1. Load Silero VAD.
+    2. Run Silero get_speech_timestamps().
+    3. Merge nearby speech regions.
+    4. Split excessively long regions.
+
+    Fallback path
+    --------------
+    If Silero cannot be loaded OR Silero timestamp detection fails,
+    the complete audio is divided into fixed 10-second chunks.
+
+    Important:
+    - Silero is ALWAYS attempted first.
+    - A successful Silero result of [] means no speech was detected.
+      In that case we return [] and DO NOT use the fallback.
+    - No audio is discarded by the fallback.
+    """
 
     def __init__(
         self,
         sampling_rate: int = 16000,
         threshold: float = 0.5,
-
-        # ------------------------------------------------------
-        # SILERO VAD
-        # ------------------------------------------------------
-
-        # Do not make this too large.
-        #
-        # A subtitle such as:
-        #
-        #   "Oh"
-        #   "When?"
-        #   "Santiago"
-        #
-        # can legitimately be very short.
         min_speech_duration_ms: int = 100,
-
         min_silence_duration_ms: int = 350,
-
         speech_pad_ms: int = 150,
-
-        # ------------------------------------------------------
-        # SEGMENTATION
-        # ------------------------------------------------------
-
-        # Speech regions separated by <= this amount of silence
-        # are treated as one ASR segment.
         merge_gap: float = 0.50,
-
-        # IMPORTANT:
-        #
-        # This is NOT used to delete speech anymore.
-        #
-        # It is kept only for backwards compatibility / API
-        # compatibility.
         min_segment_duration: float = 0.0,
-
-        # Maximum amount of audio sent to ASR at once.
         max_segment_duration: float = 8.0,
+        fallback_chunk_duration: float = 10.0,
+        error_callback: Optional[Callable[[object], None]] = None,
+    ) -> None:
 
-        error_callback=None,
-    ):
+        # ------------------------------------------------------------------
+        # Validate configuration
+        # ------------------------------------------------------------------
 
-        self.sampling_rate = int(
-            sampling_rate
-        )
-
-        self.threshold = float(
-            threshold
-        )
-
-        self.min_speech_duration_ms = int(
-            min_speech_duration_ms
-        )
-
-        self.min_silence_duration_ms = int(
-            min_silence_duration_ms
-        )
-
-        self.speech_pad_ms = int(
-            speech_pad_ms
-        )
-
-        self.merge_gap = float(
-            merge_gap
-        )
-
-        self.min_segment_duration = float(
-            min_segment_duration
-        )
-
-        self.max_segment_duration = float(
-            max_segment_duration
-        )
-
-        self.error_callback = (
-            error_callback
-        )
-
-        if self.sampling_rate <= 0:
+        if sampling_rate not in (8000, 16000):
             raise ValueError(
-                "sampling_rate must be greater than 0."
+                "sampling_rate must be either 8000 or 16000."
             )
 
-        if not 0.0 <= self.threshold <= 1.0:
+        if not 0.0 <= threshold <= 1.0:
             raise ValueError(
                 "threshold must be between 0.0 and 1.0."
             )
 
-        if self.min_speech_duration_ms < 0:
+        if min_speech_duration_ms < 0:
             raise ValueError(
                 "min_speech_duration_ms cannot be negative."
             )
 
-        if self.min_silence_duration_ms < 0:
+        if min_silence_duration_ms < 0:
             raise ValueError(
                 "min_silence_duration_ms cannot be negative."
             )
 
-        if self.speech_pad_ms < 0:
+        if speech_pad_ms < 0:
             raise ValueError(
                 "speech_pad_ms cannot be negative."
             )
 
-        if self.merge_gap < 0:
+        if merge_gap < 0:
             raise ValueError(
                 "merge_gap cannot be negative."
             )
 
-        if self.max_segment_duration <= 0:
+        if min_segment_duration < 0:
             raise ValueError(
-                "max_segment_duration must be greater than 0."
+                "min_segment_duration cannot be negative."
             )
 
-        # ------------------------------------------------------
-        # Silero VAD
-        # ------------------------------------------------------
+        if max_segment_duration <= 0:
+            raise ValueError(
+                "max_segment_duration must be greater than zero."
+            )
 
-        self.model = load_silero_vad()
+        if fallback_chunk_duration <= 0:
+            raise ValueError(
+                "fallback_chunk_duration must be greater than zero."
+            )
 
-        self.model.eval()
+        self.sampling_rate = sampling_rate
+        self.threshold = threshold
+        self.min_speech_duration_ms = min_speech_duration_ms
+        self.min_silence_duration_ms = min_silence_duration_ms
+        self.speech_pad_ms = speech_pad_ms
+        self.merge_gap = merge_gap
+        self.min_segment_duration = min_segment_duration
+        self.max_segment_duration = max_segment_duration
+        self.fallback_chunk_duration = fallback_chunk_duration
+        self.error_callback = error_callback
 
-    # ==========================================================
-    # AUDIO LOADING
-    # ==========================================================
+        # ------------------------------------------------------------------
+        # Silero state
+        # ------------------------------------------------------------------
 
-    def _load_audio(
-        self,
-        wav_filepath: str,
-    ) -> torch.Tensor:
+        self.model = None
+        self.vad_available = False
 
+        # ------------------------------------------------------------------
+        # ALWAYS TRY SILERO FIRST
+        # ------------------------------------------------------------------
+
+        try:
+            self.model = load_silero_vad()
+
+            if self.model is None:
+                raise RuntimeError(
+                    "load_silero_vad() returned None."
+                )
+
+            self.model.eval()
+
+            self.vad_available = True
+
+        except Exception as exc:
+            self.model = None
+            self.vad_available = False
+
+            self._error(
+                "Silero VAD unavailable: "
+                f"{exc}. "
+                "Falling back to fixed 10-second segmentation."
+            )
+
+    # ======================================================================
+    # Error handling
+    # ======================================================================
+
+    def _error(self, error: object) -> None:
         """
-        Decode audio through FFmpeg.
+        Send an error/warning to the application's callback.
 
-        Output:
-            mono float32 tensor
-            at self.sampling_rate
+        If no callback is configured, print it to the terminal.
         """
+
+        if self.error_callback:
+            try:
+                self.error_callback(error)
+                return
+            except Exception:
+                pass
+
+        print(error)
+
+    # ======================================================================
+    # Audio loading
+    # ======================================================================
+
+    def _load_audio(self, wav_filepath: str) -> torch.Tensor:
+        """
+        Load WAV audio through FFmpeg and return a float32 mono tensor.
+
+        The WAV is converted to:
+            mono
+            configured sampling rate
+            raw float32 PCM
+
+        No temporary audio region files are created here.
+        """
+
+        if not wav_filepath:
+            raise ValueError("wav_filepath cannot be empty.")
+
+        if not os.path.isfile(wav_filepath):
+            raise FileNotFoundError(
+                f"WAV file does not exist: '{wav_filepath}'"
+            )
 
         command = [
             "ffmpeg",
-
             "-v",
             "error",
-
             "-i",
             wav_filepath,
-
             "-ac",
             "1",
-
             "-ar",
             str(self.sampling_rate),
-
             "-f",
             "f32le",
-
             "pipe:1",
         ]
 
         try:
-
             result = subprocess.run(
                 command,
+                stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=True,
             )
 
         except FileNotFoundError as exc:
-
             raise RuntimeError(
-                "FFmpeg was not found. "
-                "Please make sure ffmpeg is installed."
+                "FFmpeg executable was not found."
             ) from exc
 
         except subprocess.CalledProcessError as exc:
-
             stderr = (
                 exc.stderr.decode(
                     "utf-8",
                     errors="replace",
-                )
+                ).strip()
                 if exc.stderr
                 else ""
             )
 
             raise RuntimeError(
-                "FFmpeg failed to decode audio:\n"
-                f"{stderr}"
+                "FFmpeg failed while loading audio"
+                + (f": {stderr}" if stderr else ".")
             ) from exc
 
         if not result.stdout:
-
             raise RuntimeError(
-                f"FFmpeg produced no audio data for: "
-                f"{wav_filepath}"
+                "FFmpeg returned no audio data."
             )
 
+        # Raw float32 PCM requires complete 4-byte samples.
+        usable_bytes = len(result.stdout) - (
+            len(result.stdout) % 4
+        )
+
+        if usable_bytes <= 0:
+            raise RuntimeError(
+                "FFmpeg returned incomplete float32 audio data."
+            )
+
+        audio_bytes = bytearray(
+            result.stdout[:usable_bytes]
+        )
+
         audio = torch.frombuffer(
-            result.stdout,
+            audio_bytes,
             dtype=torch.float32,
         ).clone()
 
         if audio.numel() == 0:
-
             raise RuntimeError(
-                f"Decoded audio is empty: "
-                f"{wav_filepath}"
+                "Loaded audio contains no samples."
             )
 
         return audio
 
-    # ==========================================================
-    # RAW SILERO DETECTION
-    # ==========================================================
+    # ======================================================================
+    # Silero timestamp detection
+    # ======================================================================
 
     def _detect(
         self,
         audio: torch.Tensor,
     ) -> List[Tuple[float, float]]:
+        """
+        Run Silero get_speech_timestamps().
+
+        This method is ONLY called when Silero successfully loaded.
+        """
+
+        if self.model is None:
+            raise RuntimeError(
+                "Silero model is not loaded."
+            )
+
+        if audio.numel() == 0:
+            return []
 
         timestamps = get_speech_timestamps(
             audio,
             self.model,
-
-            sampling_rate=self.sampling_rate,
-
             threshold=self.threshold,
-
-            min_speech_duration_ms=(
-                self.min_speech_duration_ms
-            ),
-
-            min_silence_duration_ms=(
-                self.min_silence_duration_ms
-            ),
-
-            speech_pad_ms=(
-                self.speech_pad_ms
-            ),
-
+            sampling_rate=self.sampling_rate,
+            min_speech_duration_ms=self.min_speech_duration_ms,
+            min_silence_duration_ms=self.min_silence_duration_ms,
+            speech_pad_ms=self.speech_pad_ms,
             return_seconds=True,
         )
 
-        regions: List[
-            Tuple[float, float]
-        ] = []
+        regions: List[Tuple[float, float]] = []
 
-        for item in timestamps:
-
+        for timestamp in timestamps:
             try:
+                start = float(timestamp["start"])
+                end = float(timestamp["end"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Invalid Silero timestamp: {timestamp!r}"
+                ) from exc
 
-                start = float(
-                    item["start"]
-                )
-
-                end = float(
-                    item["end"]
-                )
-
-            except (
-                KeyError,
-                TypeError,
-                ValueError,
-            ):
-
+            if not math.isfinite(start) or not math.isfinite(end):
                 continue
 
-            if not (
-                math.isfinite(start)
-                and math.isfinite(end)
-            ):
+            start = max(0.0, start)
+            end = max(0.0, end)
 
-                continue
-
-            if end <= start:
-
-                continue
-
-            # Never allow negative timestamps.
-            start = max(
-                0.0,
-                start,
-            )
-
-            regions.append(
-                (
-                    start,
-                    end,
-                )
-            )
+            if end > start:
+                regions.append((start, end))
 
         return regions
 
-    # ==========================================================
-    # MERGE NEARBY SPEECH
-    # ==========================================================
+    # ======================================================================
+    # Fallback segmentation
+    # ======================================================================
+
+    def _fallback_segments(
+        self,
+        duration: float,
+    ) -> List[Tuple[float, float]]:
+        """
+        Divide the COMPLETE audio into fixed-size chunks.
+
+        Default:
+            10 seconds
+
+        Example:
+            31.2 seconds becomes:
+
+                0.0  -> 10.0
+                10.0 -> 20.0
+                20.0 -> 30.0
+                30.0 -> 31.2
+
+        No audio is discarded.
+        """
+
+        if duration <= 0:
+            return []
+
+        segments: List[Tuple[float, float]] = []
+
+        start = 0.0
+
+        while start < duration:
+            end = min(
+                start + self.fallback_chunk_duration,
+                duration,
+            )
+
+            if end > start:
+                segments.append(
+                    (
+                        round(start, 6),
+                        round(end, 6),
+                    )
+                )
+
+            start = end
+
+        return segments
+
+    # ======================================================================
+    # Merge speech regions
+    # ======================================================================
 
     def _merge_regions(
         self,
         regions: List[Tuple[float, float]],
     ) -> List[Tuple[float, float]]:
+        """
+        Merge overlapping or nearby speech regions.
+
+        Regions are merged when the silence/gap between them is less than
+        or equal to merge_gap.
+
+        This preserves short pauses and prevents excessive fragmentation.
+        """
 
         if not regions:
             return []
 
-        # ------------------------------------------------------
-        # Sort defensively.
-        #
-        # Silero normally returns ordered timestamps, but this
-        # makes the method safe if the source changes.
-        # ------------------------------------------------------
-
-        ordered = sorted(
+        sorted_regions = sorted(
             regions,
-            key=lambda item: item[0],
+            key=lambda region: region[0],
         )
 
-        merged: List[
-            Tuple[float, float]
-        ] = []
+        merged: List[Tuple[float, float]] = []
 
-        current_start, current_end = (
-            ordered[0]
-        )
+        current_start, current_end = sorted_regions[0]
 
-        for start, end in ordered[1:]:
+        for start, end in sorted_regions[1:]:
 
-            gap = (
-                start
-                - current_end
-            )
-
-            # --------------------------------------------------
-            # Important:
-            #
-            # gap <= merge_gap includes:
-            #
-            #   overlapping regions
-            #   touching regions
-            #   very small pauses
-            #
-            # This means speech is preserved.
-            # --------------------------------------------------
+            gap = start - current_end
 
             if gap <= self.merge_gap:
-
                 current_end = max(
                     current_end,
                     end,
                 )
-
             else:
-
                 merged.append(
                     (
                         current_start,
@@ -391,242 +454,213 @@ class SileroVAD:
 
         return merged
 
-    # ==========================================================
-    # SPLIT LONG REGIONS
-    # ==========================================================
+    # ======================================================================
+    # Split long speech regions
+    # ======================================================================
 
     def _split_long_regions(
         self,
         regions: List[Tuple[float, float]],
     ) -> List[Tuple[float, float]]:
-
         """
-        Split only regions longer than max_segment_duration.
+        Split regions longer than max_segment_duration.
 
-        IMPORTANT:
-            No audio is discarded.
+        The split is performed evenly.
 
-        A 12.2 second region with an 8 second maximum becomes
-        approximately:
+        Example with max_segment_duration=8:
 
-            6.1 + 6.1
+            12 seconds
+            ->
+            6 + 6
 
-        rather than:
+        16 seconds
+            ->
+            8 + 8
 
-            8.0 + 4.2
-
-        Likewise:
-
-            16.2
-
-        becomes approximately:
-
-            8.1 + 8.1
-
-        rather than:
-
-            8.0 + 8.0 + 0.2
-
-        This prevents tiny trailing chunks.
+        No audio is discarded.
         """
 
-        result: List[
-            Tuple[float, float]
-        ] = []
+        if not regions:
+            return []
+
+        result: List[Tuple[float, float]] = []
 
         for start, end in regions:
 
-            duration = (
-                end - start
-            )
+            duration = end - start
 
-            if duration <= 0:
-                continue
-
-            # --------------------------------------------------
-            # Normal region.
-            #
-            # Keep it exactly as detected.
-            # --------------------------------------------------
-
-            if (
-                duration
-                <= self.max_segment_duration
-            ):
-
+            if duration <= self.max_segment_duration:
                 result.append(
                     (
                         start,
                         end,
                     )
                 )
-
                 continue
 
-            # --------------------------------------------------
-            # Determine how many chunks are required.
-            # --------------------------------------------------
-
-            number_of_chunks = max(
-                1,
-                math.ceil(
-                    duration
-                    / self.max_segment_duration
-                ),
+            # Number of chunks required.
+            chunk_count = math.ceil(
+                duration / self.max_segment_duration
             )
 
-            # --------------------------------------------------
-            # Distribute the complete region evenly.
-            #
-            # This guarantees:
-            #
-            #   sum(chunk durations) == duration
-            #
-            # and avoids a tiny final chunk.
-            # --------------------------------------------------
+            # Divide evenly so that the final segment is not tiny.
+            chunk_duration = duration / chunk_count
 
-            chunk_duration = (
-                duration
-                / number_of_chunks
-            )
+            for index in range(chunk_count):
 
-            current = start
+                chunk_start = (
+                    start + index * chunk_duration
+                )
 
-            for index in range(
-                number_of_chunks
-            ):
+                chunk_end = (
+                    start + (index + 1) * chunk_duration
+                )
 
-                if (
-                    index
-                    == number_of_chunks - 1
-                ):
-
+                # Prevent tiny floating-point errors.
+                if index == chunk_count - 1:
                     chunk_end = end
 
-                else:
-
-                    chunk_end = (
-                        start
-                        + (
-                            (
-                                index
-                                + 1
-                            )
-                            * chunk_duration
+                if chunk_end > chunk_start:
+                    result.append(
+                        (
+                            chunk_start,
+                            chunk_end,
                         )
                     )
 
-                if chunk_end <= current:
-                    continue
-
-                result.append(
-                    (
-                        current,
-                        chunk_end,
-                    )
-                )
-
-                current = chunk_end
-
         return result
 
-    # ==========================================================
-    # PUBLIC VAD
-    # ==========================================================
+    # ======================================================================
+    # Main entry point
+    # ======================================================================
 
     def __call__(
         self,
         wav_filepath: str,
     ) -> List[Tuple[float, float]]:
+        """
+        Detect speech regions.
+
+        Priority:
+
+            1. Load audio
+            2. Try Silero VAD
+            3. If Silero fails -> fixed 10-second fallback
+            4. If Silero succeeds with no speech -> []
+            5. Merge regions
+            6. Split long regions
+
+        Returns:
+            List of (start_seconds, end_seconds)
+        """
+
+        # --------------------------------------------------------------
+        # Load audio first.
+        #
+        # This is NOT a VAD failure. If FFmpeg/audio loading fails,
+        # don't fabricate speech regions.
+        # --------------------------------------------------------------
 
         try:
-
-            # --------------------------------------------------
-            # 1. Decode once
-            # --------------------------------------------------
-
-            audio = self._load_audio(
-                wav_filepath
-            )
-
-            # --------------------------------------------------
-            # 2. Silero speech detection
-            # --------------------------------------------------
-
-            raw_regions = self._detect(
-                audio
-            )
-
-            if not raw_regions:
-                return []
-
-            # --------------------------------------------------
-            # 3. Merge nearby speech
-            #
-            # Short speech is NOT removed.
-            #
-            # If a short utterance is close to another speech
-            # region, it gets combined.
-            #
-            # If it is isolated, it remains intact.
-            # --------------------------------------------------
-
-            merged_regions = (
-                self._merge_regions(
-                    raw_regions
-                )
-            )
-
-            # --------------------------------------------------
-            # 4. Split ONLY long regions
-            #
-            # No short-region filtering.
-            # No audio is discarded.
-            # --------------------------------------------------
-
-            final_regions = (
-                self._split_long_regions(
-                    merged_regions
-                )
-            )
-
-            return final_regions
+            audio = self._load_audio(wav_filepath)
 
         except KeyboardInterrupt:
+            self._error(
+                "Silero VAD cancelled."
+            )
+            raise
 
+        except Exception as exc:
+            self._error(
+                f"Failed to load audio for VAD: {exc}"
+            )
+            return []
+
+        # --------------------------------------------------------------
+        # Determine complete audio duration.
+        # --------------------------------------------------------------
+
+        duration = (
+            audio.numel() / self.sampling_rate
+        )
+
+        if duration <= 0:
+            return []
+
+        # --------------------------------------------------------------
+        # SILERO FIRST
+        #
+        # If model loading failed in __init__, use fallback.
+        # --------------------------------------------------------------
+
+        if not self.vad_available or self.model is None:
+
+            self._error(
+                "Silero VAD is unavailable. "
+                "Using fixed 10-second segmentation."
+            )
+
+            return self._fallback_segments(
+                duration
+            )
+
+        # --------------------------------------------------------------
+        # Silero is available.
+        #
+        # Try actual Silero speech detection.
+        # --------------------------------------------------------------
+
+        try:
+            raw_regions = self._detect(audio)
+
+        except KeyboardInterrupt:
+            self._error(
+                "Silero VAD cancelled."
+            )
             raise
 
         except Exception as exc:
 
             self._error(
-                exc
+                "Silero VAD timestamp detection failed: "
+                f"{exc}. "
+                "Falling back to fixed 10-second segmentation."
             )
 
+            return self._fallback_segments(
+                duration
+            )
+
+        # --------------------------------------------------------------
+        # IMPORTANT:
+        #
+        # Silero successfully ran and found no speech.
+        #
+        # DO NOT fallback here.
+        #
+        # [] is a legitimate Silero result.
+        # --------------------------------------------------------------
+
+        if not raw_regions:
             return []
 
-    # ==========================================================
-    # ERROR HANDLING
-    # ==========================================================
+        # --------------------------------------------------------------
+        # Merge nearby regions.
+        # --------------------------------------------------------------
 
-    def _error(
-        self,
-        error,
-    ):
-
-        if self.error_callback:
-
-            try:
-
-                self.error_callback(
-                    error
-                )
-
-                return
-
-            except Exception:
-
-                pass
-
-        print(
-            error
+        merged_regions = self._merge_regions(
+            raw_regions
         )
+
+        if not merged_regions:
+            return []
+
+        # --------------------------------------------------------------
+        # Split excessively long speech regions.
+        # --------------------------------------------------------------
+
+        final_regions = self._split_long_regions(
+            merged_regions
+        )
+
+        return final_regions

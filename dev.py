@@ -19,6 +19,9 @@ MAIN_FILE = PROJECT_ROOT / "main.py"
 # Directories to watch.
 WATCH_DIRECTORIES = [
     PROJECT_ROOT / "cli",
+    PROJECT_ROOT / "core",
+    PROJECT_ROOT / "services",
+    PROJECT_ROOT / "jobs",
 ]
 
 # File types that trigger a restart.

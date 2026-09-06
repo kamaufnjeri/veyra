@@ -1,136 +1,88 @@
-from __future__ import annotations
+from pathlib import Path
 
-import os
-import sys
-
-from jobs.media_processor import MediaJobProcessor
+from core.subtitle_translator import SubtitlesTranslator
 
 
-URL = "https://www.youtube.com/watch?v=XHTecPextHY"
-OUTPUT = "./downloads"
+INPUT_FILE = (
+    "/home/florence/Downloads/Corazon Salvaje/"
+    "Corazon Salvaje - Capitulo 02_(480p).es.srt"
+)
+
+OUTPUT_FILE = (
+    "/home/florence/Downloads/Corazon Salvaje/"
+    "Corazon Salvaje - Capitulo 02_(480p).en.test.srt"
+)
 
 
-def progress_callback(
-    info,
-    filename,
-    percentage,
-    downloaded,
-    speed,
-    eta,
-    **kwargs,
-):
-    print(
-        f"[PROGRESS] "
-        f"{float(percentage):6.2f}% | "
-        f"{str(downloaded):>12} | "
-        f"{str(speed):>12} | "
-        f"ETA {str(eta):>8} | "
-        f"{info} | "
-        f"{filename}",
-        flush=True,
-    )
+def on_progress(percent: int):
+    print(f"Progress: {percent}%")
 
 
-def error_callback(error):
-    print(
-        f"[ERROR] {error}",
-        file=sys.stderr,
-        flush=True,
-    )
+def on_error(message: str):
+    print(f"ERROR: {message}")
 
 
 def main():
-    print("[TEST] Starting MediaJobProcessor")
-    print(f"[TEST] URL: {URL}")
-    print(f"[TEST] Output: {OUTPUT}")
-    print("[TEST] Mode: video")
+
+    print("=" * 70)
+    print("CORAZON SALVAJE SUBTITLE TRANSLATION TEST")
+    print("=" * 70)
     print()
 
-    processor = MediaJobProcessor(
-        download_mode="video",
-        output=OUTPUT,
+    print(f"Input : {INPUT_FILE}")
+    print(f"Output: {OUTPUT_FILE}")
+    print()
 
-        quality="best",
-        container="mp4",
-        audio_quality="best",
+    if not Path(INPUT_FILE).exists():
+        print("ERROR: Input subtitle file does not exist.")
+        return
 
-        # No subtitles for this test.
-        download_subtitles=False,
-        save_separate_subtitle=False,
-        embed_subtitles=False,
+    translator = SubtitlesTranslator(
+        source_language="es",
+        target_language="en",
 
-        playlist_folder=True,
-        avoid_duplicates=True,
+        # Translate 200 subtitles at a time using
+        # SrtFile.translate().
+        batch_size=100,
 
-        fragments=8,
-        retries=10,
+        # Only used if a bulk batch fails.
+        retry_count=3,
+        retry_delay=1.0,
 
-        cookies=False,
-        sponsorblock=False,
-
-        progress_callback=progress_callback,
-        error_callback=error_callback,
-
-        # Keep an existing final file instead of overwriting it.
-        overwrite_mode="keep",
+        error_messages_callback=on_error,
+        progress_callback=on_progress,
     )
 
     try:
-        result = processor.process(URL)
+
+        print("Starting translation...")
+        print()
+
+        result = translator.translate_srt(
+            INPUT_FILE,
+            OUTPUT_FILE,
+        )
 
         print()
         print("=" * 70)
-        print("[TEST] PROCESS COMPLETE")
+        print("TEST COMPLETE")
         print("=" * 70)
-
-        print(f"Result type: {type(result).__name__}")
-
-        if isinstance(result, dict):
-            print(f"URL:       {result.get('url')}")
-            print(f"Mode:      {result.get('download_mode')}")
-            print(f"ID:        {result.get('id')}")
-            print(f"Title:     {result.get('title')}")
-            print(f"Filepath:  {result.get('filepath')}")
-            print(f"Path:      {result.get('path')}")
-            print(f"Completed: {result.get('completed')}")
-            print(f"Cancelled: {result.get('cancelled')}")
-
-            filepath = result.get("filepath")
-
-            if filepath:
-                filepath = os.path.abspath(str(filepath))
-
-                print()
-                print(f"[TEST] Final file: {filepath}")
-                print(
-                    f"[TEST] Exists: "
-                    f"{os.path.isfile(filepath)}"
-                )
-
-                if os.path.isfile(filepath):
-                    size = os.path.getsize(filepath)
-
-                    print(
-                        f"[TEST] Size: "
-                        f"{size / (1024 * 1024):.2f} MB"
-                    )
-
-        print("=" * 70)
-
-    except KeyboardInterrupt:
         print()
-        print("[TEST] Ctrl+C detected")
-        processor.cancel()
+        print(f"Translated file: {result}")
 
     except Exception as exc:
+
         print()
         print("=" * 70)
-        print("[TEST] FAILED")
+        print("TRANSLATION FAILED")
         print("=" * 70)
-        print(f"{type(exc).__name__}: {exc}")
-        print("=" * 70)
+        print()
+        print(
+            f"{type(exc).__name__}: {exc}"
+        )
 
-        raise
+    finally:
+        translator.close()
 
 
 if __name__ == "__main__":
