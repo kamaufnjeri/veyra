@@ -19,13 +19,52 @@ class WavConverter:
         rate: int = 16000,
         progress_callback=None,
         error_messages_callback=None,
+        audio_source: str = "wav",
     ):
+        """
+        audio_source:
+
+            "wav"
+                Always extract WAV.
+
+            "video"
+                Do not extract WAV. Return the original
+                media filepath so the caller/transcriber
+                can process the media directly.
+
+            "auto"
+                Try WAV extraction first. If extraction fails,
+                fall back to the original media filepath.
+
+        Default:
+            "wav"
+        """
+
         self.channels = channels
         self.rate = rate
         self.progress_callback = progress_callback
         self.error_messages_callback = (
             error_messages_callback
         )
+
+        self.audio_source = (
+            str(audio_source)
+            .strip()
+            .lower()
+        )
+
+        valid_sources = {
+            "wav",
+            "video",
+            "auto",
+        }
+
+        if self.audio_source not in valid_sources:
+
+            raise ValueError(
+                "Invalid audio_source. "
+                "Expected 'wav', 'video', or 'auto'."
+            )
 
     # ==========================================================
     # FIND EXECUTABLE
@@ -113,6 +152,37 @@ class WavConverter:
                 error
             )
 
+        filename = os.path.basename(
+            media_filepath
+        )
+
+        # ======================================================
+        # DIRECT VIDEO MODE
+        # ======================================================
+
+        if self.audio_source == "video":
+
+            self._progress(
+                (
+                    "Using media file directly "
+                    "for speech transcription"
+                ),
+                filename,
+                100,
+                None,
+            )
+
+            return (
+                media_filepath,
+                self.rate,
+            )
+
+        # ======================================================
+        # CHECK FFMPEG
+        #
+        # Only required when WAV extraction is requested.
+        # ======================================================
+
         ffmpeg = self.ffmpeg_check()
 
         if not ffmpeg:
@@ -121,6 +191,29 @@ class WavConverter:
                 "Cannot find ffmpeg executable"
             )
 
+            # --------------------------------------------------
+            # AUTO MODE FALLBACK
+            # --------------------------------------------------
+
+            if self.audio_source == "auto":
+
+                self._progress(
+                    (
+                        "FFmpeg unavailable; "
+                        "falling back to media file"
+                    ),
+                    filename,
+                    100,
+                    None,
+                )
+
+                self._error(error)
+
+                return (
+                    media_filepath,
+                    self.rate,
+                )
+
             self._error(error)
 
             raise RuntimeError(
@@ -128,7 +221,7 @@ class WavConverter:
             )
 
         # ======================================================
-        # VEYRA TEMP WAV
+        # TEMP WAV
         # ======================================================
 
         wav_filepath = create_temp_file(
@@ -137,10 +230,6 @@ class WavConverter:
         )
 
         try:
-
-            filename = os.path.basename(
-                media_filepath
-            )
 
             info = (
                 f"Extracting speech audio from "
@@ -198,6 +287,19 @@ class WavConverter:
                     check=True,
                 )
 
+            # --------------------------------------------------
+            # VERIFY OUTPUT
+            # --------------------------------------------------
+
+            if not os.path.isfile(
+                wav_filepath
+            ):
+
+                raise RuntimeError(
+                    "FFmpeg completed but the WAV "
+                    "file was not created."
+                )
+
             self._progress(
                 info,
                 filename,
@@ -205,16 +307,12 @@ class WavConverter:
                 start_time,
             )
 
-            # ==================================================
+            # --------------------------------------------------
             # IMPORTANT
             #
-            # Do NOT delete the WAV here.
-            #
-            # The caller still needs it for transcription.
-            #
-            # It lives inside /tmp/veyra and will be cleaned
-            # when Veyra exits.
-            # ==================================================
+            # Do NOT delete WAV here.
+            # The transcription caller still needs it.
+            # --------------------------------------------------
 
             return (
                 wav_filepath,
@@ -234,6 +332,46 @@ class WavConverter:
             raise
 
         except Exception as exc:
+
+            # --------------------------------------------------
+            # AUTO MODE
+            #
+            # WAV failed, so use the original media file.
+            # --------------------------------------------------
+
+            if self.audio_source == "auto":
+
+                remove_temp_file(
+                    wav_filepath
+                )
+
+                self._error(
+                    (
+                        "WAV extraction failed; "
+                        "falling back to media file: "
+                        f"{exc}"
+                    )
+                )
+
+                self._progress(
+                    (
+                        "WAV extraction failed; "
+                        "using media file directly "
+                        "for transcription"
+                    ),
+                    filename,
+                    100,
+                    None,
+                )
+
+                return (
+                    media_filepath,
+                    self.rate,
+                )
+
+            # --------------------------------------------------
+            # NORMAL WAV MODE
+            # --------------------------------------------------
 
             remove_temp_file(
                 wav_filepath

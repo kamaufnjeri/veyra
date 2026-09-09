@@ -1,0 +1,825 @@
+Yes. **This is the right point to redesign the backend around operation-specific Settings.** I would not just add a few parameters to the existing classes; I’d make settings a first-class backend concept and then have the planner translate those settings into executable jobs.
+
+The architecture should become:
+
+```text
+MediaWorkspace
+    │
+    ├── MediaAsset
+    │     └── cached MediaInfo
+    │
+    ├── active_asset              ← display/info only
+    │
+    └── operation selections      ← independent
+             │
+             ▼
+      OperationSettings
+             │
+             ▼
+      OperationPlanner
+             │
+             ▼
+        OperationJob
+             │
+             ▼
+ MediaPipelineServiceProcessor
+             │
+             ▼
+   MediaPipelineService
+             │
+      ┌──────┴─────────────────────────┐
+      ▼                                ▼
+specialized media classes       subtitle classes
+      │                                │
+      └──────────────┬─────────────────┘
+                     ▼
+               CommandRunner
+                     │
+                     ▼
+              FFmpeg / FFprobe
+```
+
+### 1. Conversion settings
+
+Conversion should have its own settings object, rather than relying on scattered arguments.
+
+For example:
+
+```python
+@dataclass(frozen=True, slots=True)
+class ConversionSettings:
+    output_format: str | None = None
+
+    video_codec: str = "libx264"
+    audio_codec: str = "aac"
+
+    preset: str = "medium"
+    crf: int = 23
+
+    video_bitrate: str | None = None
+    audio_bitrate: str = "192k"
+
+    width: int | None = None
+    height: int | None = None
+    fps: float | None = None
+
+    pixel_format: str = "yuv420p"
+
+    tune: str | None = None
+    profile: str | None = None
+    level: str | None = None
+
+    threads: int | None = None
+    faststart: bool = True
+
+    extra_video_args: tuple[str, ...] = ()
+    extra_audio_args: tuple[str, ...] = ()
+```
+
+So the GUI eventually gets a settings panel such as:
+
+```text
+CONVERT
+
+Output format
+    MKV ▼
+
+Video
+    Codec       H.264 ▼
+    Preset      Medium ▼
+    CRF         23
+    Resolution  Original ▼
+    FPS         Original ▼
+    Pixel format yuv420p
+
+Audio
+    Codec       AAC ▼
+    Bitrate     192k
+
+Advanced
+    Faststart   ✓
+    Threads     Auto
+    Profile
+    Level
+    Tune
+```
+
+And the backend receives **one** **`ConversionSettings`** **object**.
+
+---
+
+# 2. Every operation gets Settings
+
+I would introduce a proper settings hierarchy.
+
+### Convert
+
+```python
+ConversionSettings
+```
+
+Controls:
+
+- output/container format
+- video codec
+- audio codec
+- CRF
+- preset
+- video bitrate
+- audio bitrate
+- resolution
+- FPS
+- pixel format
+- profile
+- level
+- tune
+- threads
+- faststart
+- extra codec arguments
+
+### Concatenate
+
+```python
+ConcatenateSettings
+```
+
+Controls:
+
+- stream copy vs re-encode
+- encoding options
+- output format
+- handling of audio
+- timestamp behavior
+
+It should reuse:
+
+```python
+EncodeOptions
+```
+
+rather than duplicating codec settings.
+
+### Join Videos + Subtitles
+
+```python
+JoinSettings
+```
+
+Controls:
+
+- video concatenation mode
+- encoding options
+- subtitle handling
+- subtitle output format
+- subtitle language policy
+- missing subtitle policy
+
+And the backend automatically calculates:
+
+```text
+duration(asset 1)
+duration(asset 2)
+duration(asset 3)
+        ↓
+0
+duration 1
+duration 1 + duration 2
+```
+
+No manual offset entry.
+
+### Mux
+
+This needs a bigger settings model.
+
+Instead of:
+
+```python
+audio: Path | None
+subtitles: list[MuxSubtitle]
+```
+
+I'd introduce track specifications.
+
+For example:
+
+```python
+@dataclass(frozen=True, slots=True)
+class MuxAudioTrack:
+    source: TrackSource
+    language: str | None = None
+    title: str | None = None
+    default: bool = False
+    forced: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class MuxSubtitleTrack:
+    source: TrackSource
+    language: str | None = None
+    title: str | None = None
+    default: bool = False
+    forced: bool = False
+```
+
+with something like:
+
+```python
+@dataclass(frozen=True, slots=True)
+class TrackSource:
+    kind: Literal["embedded", "external"]
+    path: Path | None = None
+    stream_index: int | None = None
+```
+
+That allows:
+
+```text
+VIDEO
+  └── video stream 0
+
+AUDIO
+  ├── embedded audio 0
+  ├── embedded audio 1
+  └── external audio file
+
+SUBTITLES
+  ├── embedded subtitle 0
+  ├── embedded subtitle 1
+  └── external .srt
+```
+
+So the future Mux UI can genuinely support **multiple audio and subtitle tracks**.
+
+---
+
+# 3. Extraction settings
+
+Instead of only:
+
+```python
+extract_audio(video, output, stream_index=0)
+```
+
+I'd have:
+
+```python
+@dataclass(frozen=True, slots=True)
+class AudioExtractionSettings:
+    stream_index: int = 0
+    codec: str = "copy"
+    output_format: str | None = None
+```
+
+and:
+
+```python
+@dataclass(frozen=True, slots=True)
+class SubtitleExtractionSettings:
+    stream_index: int = 0
+    output_format: str = "srt"
+```
+
+This also lets the planner clearly distinguish:
+
+```text
+stream_index = index among audio streams
+```
+
+from FFprobe's global stream index.
+
+---
+
+# 4. Trim settings
+
+Rather than hardcoding:
+
+```python
+libx264
+medium
+23
+aac
+192k
+```
+
+we'll have:
+
+```python
+@dataclass(frozen=True, slots=True)
+class TrimSettings:
+    start: float = 0.0
+    end: float | None = None
+
+    mode: Literal[
+        "fast_copy",
+        "accurate_copy",
+        "reencode",
+    ] = "accurate_copy"
+
+    encode: EncodeOptions = field(
+        default_factory=EncodeOptions
+    )
+```
+
+This gives the eventual UI:
+
+```text
+TRIM
+
+Start       00:05:00
+End         00:15:00
+
+Mode
+    Accurate copy ▼
+
+Encoding
+    Codec       H.264
+    CRF         23
+    Preset      Medium
+    Audio       AAC
+    Bitrate     192k
+```
+
+And importantly, the backend can make the semantics explicit:
+
+- `fast_copy` → fastest, keyframe limitations
+- `accurate_copy` → stream-copy approach where applicable
+- `reencode` → actual accurate re-encoding
+
+---
+
+# 5. Burn subtitle settings
+
+Something like:
+
+```python
+@dataclass(frozen=True, slots=True)
+class BurnSubtitleSettings:
+    source: SubtitleSource
+
+    video_codec: str = "libx264"
+    audio_codec: str = "copy"
+
+    preset: str = "medium"
+    crf: int = 23
+
+    audio_bitrate: str = "192k"
+
+    width: int | None = None
+    height: int | None = None
+    fps: float | None = None
+
+    pixel_format: str = "yuv420p"
+
+    subtitle_style: SubtitleStyle | None = None
+```
+
+Eventually this gives us room for:
+
+```text
+BURN SUBTITLES
+
+Subtitle source
+    External file
+    Embedded subtitle ▼
+
+Subtitle track
+    #2 English ▼
+
+Video
+    Codec
+    CRF
+    Preset
+    Resolution
+    FPS
+
+Audio
+    Copy / AAC
+```
+
+---
+
+# 6. Subtitle merging settings
+
+We should unify the current `SubtitleMerger` and `SubtitleJoiner` conceptually.
+
+The important distinction is:
+
+```text
+SubtitleMerger
+    generic subtitle-file merging
+
+SubtitleJoiner
+    joining subtitle files according to media durations
+```
+
+The operation layer should expose:
+
+```python
+@dataclass(frozen=True, slots=True)
+class SubtitleMergeSettings:
+    output_format: str = "srt"
+
+    missing_subtitle_policy: Literal[
+        "allow",
+        "require",
+    ] = "allow"
+
+    encoding: str = "utf-8"
+```
+
+The planner creates:
+
+```python
+SubtitleMergePart(
+    subtitle=...,
+    offset_seconds=...
+)
+```
+
+from the cached media durations.
+
+---
+
+# 7. EncodeOptions becomes the common encoding core
+
+This is important.
+
+Rather than having:
+
+```text
+Converter settings
+Concatenator settings
+Cutter settings
+Burner settings
+```
+
+all independently duplicate codec options, we'll have:
+
+```python
+@dataclass(frozen=True, slots=True)
+class EncodeOptions:
+    video_codec: str = "libx264"
+    audio_codec: str = "aac"
+
+    preset: str = "medium"
+    crf: int = 23
+
+    audio_bitrate: str = "192k"
+    pixel_format: str = "yuv420p"
+
+    width: int | None = None
+    height: int | None = None
+    fps: float | None = None
+
+    video_bitrate: str | None = None
+
+    threads: int | None = None
+
+    faststart: bool = True
+
+    tune: str | None = None
+    profile: str | None = None
+    level: str | None = None
+
+    extra_video_args: tuple[str, ...] = ()
+    extra_audio_args: tuple[str, ...] = ()
+```
+
+Then:
+
+```python
+ConversionSettings
+    └── encode: EncodeOptions
+
+ConcatenateSettings
+    └── encode: EncodeOptions
+
+JoinSettings
+    └── encode: EncodeOptions
+
+TrimSettings
+    └── encode: EncodeOptions
+
+BurnSubtitleSettings
+    └── encode: EncodeOptions
+```
+
+This gives us **one canonical encoding system**.
+
+---
+
+# 8. Output/container settings should be separate from encoding
+
+This is another important distinction.
+
+For example:
+
+```text
+MKV → MP4
+```
+
+isn't simply "change codec."
+
+We need to represent:
+
+```python
+@dataclass(frozen=True, slots=True)
+class OutputSettings:
+    format: str | None = None
+    extension: str | None = None
+```
+
+Then:
+
+```python
+ConversionSettings(
+    output=OutputSettings(format="mp4"),
+    encode=EncodeOptions(
+        video_codec="libx264",
+        audio_codec="aac",
+    ),
+)
+```
+
+That makes the architecture understand:
+
+```text
+Container
+    ↓
+Video codec
+    ↓
+Audio codec
+    ↓
+Subtitle codec
+```
+
+as separate concerns.
+
+---
+
+# 9. Operation registry
+
+Instead of the current:
+
+```python
+OPERATIONS = {
+    "inspect",
+    "duration",
+    "convert",
+    ...
+}
+```
+
+we'll create definitions such as:
+
+```python
+@dataclass(frozen=True, slots=True)
+class OperationDefinition:
+    id: str
+    label: str
+    selection_mode: SelectionMode
+    settings_type: type
+```
+
+For example:
+
+```text
+convert
+    label = Convert Media
+    selection = MULTI
+
+concatenate
+    label = Concatenate Videos
+    selection = ORDERED_MULTI
+
+join
+    label = Join Videos
+    selection = ORDERED_MULTI
+
+mux
+    label = Mux Media
+    selection = SINGLE
+
+extract_audio
+    label = Extract Audio
+    selection = MULTI
+
+extract_subtitle
+    label = Extract Subtitles
+    selection = MULTI
+
+trim
+    label = Trim Video
+    selection = SINGLE
+
+burn_subtitles
+    label = Burn Subtitles
+    selection = SINGLE
+
+merge_subtitles
+    label = Merge Subtitles
+    selection = ORDERED_MULTI
+```
+
+That will make the eventual GUI dynamic instead of hardcoding operation behavior into widgets.
+
+---
+
+# 10. The Workspace becomes much cleaner
+
+The workspace should basically manage:
+
+```python
+class MediaWorkspace:
+    assets
+    active_asset
+    operation_selections
+```
+
+For example:
+
+```text
+Library
+
+Movie 01.mkv
+Movie 02.mkv
+Movie 03.mkv
+Movie 04.mkv
+
+Active:
+    Movie 02.mkv
+
+Operation:
+    Join Videos
+
+Selected:
+    Movie 01.mkv
+    Movie 03.mkv
+    Movie 04.mkv
+```
+
+Changing:
+
+```text
+Active → Movie 04
+```
+
+must **not** change:
+
+```text
+Join selection
+```
+
+This separation is fundamental.
+
+---
+
+# 11. Processor becomes job-based
+
+Rather than making the processor interpret every possible GUI argument, we'll eventually give it normalized jobs:
+
+```python
+@dataclass(frozen=True, slots=True)
+class OperationJob:
+    operation: str
+    inputs: tuple[Path, ...]
+    output: Path | None
+    settings: object
+```
+
+Then:
+
+```text
+GUI
+ ↓
+Workspace
+ ↓
+Planner
+ ↓
+OperationJob
+ ↓
+Processor
+```
+
+The processor doesn't need to know whether the GUI had a combo box called `"codec"`.
+
+It receives:
+
+```python
+ConversionSettings(...)
+```
+
+and executes it.
+
+---
+
+# 12. Settings validation belongs in the backend
+
+This is important too.
+
+The GUI can prevent bad values, but **the backend must not trust the GUI**.
+
+For example:
+
+```python
+ConversionSettings(
+    crf=999,
+    width=-100,
+    fps=-4,
+)
+```
+
+must fail before FFmpeg runs.
+
+Likewise:
+
+```text
+MP4 + incompatible subtitle codec
+MP3 extension + AAC codec
+negative trim start
+end <= start
+invalid stream index
+missing subtitle
+missing media
+same input/output
+```
+
+should all be validated by backend settings/operation validators.
+
+---
+
+# 13. Centralized temporary output stays mandatory
+
+Every operation becomes:
+
+```text
+validate
+   ↓
+create /tmp/veyra temporary output
+   ↓
+FFmpeg / subtitle processing
+   ↓
+verify result
+   ↓
+atomic replace
+   ↓
+cleanup
+```
+
+No more:
+
+```python
+NamedTemporaryFile(dir=output.parent)
+```
+
+inside individual classes.
+
+---
+
+## So yes — I would fix **all the files you already gave me as one coordinated backend rewrite**
+
+Not as isolated patches.
+
+The final backend pass should give us approximately:
+
+```text
+media/
+    models.py
+    validation.py
+
+core/
+    command_runner.py
+    ffmpeg_toolchain.py
+    temp.py
+
+media/
+    probe.py
+    transcoder.py
+    converter.py
+    concatenator.py
+    joiner.py
+    muxer.py
+    extractor.py
+    cutter.py
+    burner.py
+
+subtitles/
+    merger.py
+    joiner.py
+
+services/
+    media_pipeline_service.py
+    media_pipeline_processor.py
+    media_workspace.py
+
+operations/
+    definitions.py
+    settings.py
+    planner.py
+    jobs.py
+```
+
+with **settings driving every operation**, a shared encoding model, proper output/container configuration, validation, cancellation, progress, centralized temp files, cached FFprobe information, and clean separation between workspace state and operation state.
+
+And I will preserve the source/dependency context you've already given me rather than inventing a completely unrelated architecture. LET'S REBUILD FOR THESE AND ONLY USE FOLDERS /MEDIA /SERVICES- PIPELINE SERVICE /JOBS -FOR PROCESSOR

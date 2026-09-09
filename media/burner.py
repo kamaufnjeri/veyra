@@ -1,150 +1,202 @@
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
 
-from .exceptions import (
-    MediaOutputError,
-    MediaValidationError,
-)
-from .models import BurnResult
-from .runner import CommandRunner
-from .toolchain import FFmpegToolchain
+from .ffmpeg import FFmpeg
+from .models import BurnResult, BurnerSettings
 
 
 class SubtitleBurner:
-    """Burn subtitles permanently into video frames."""
 
     def __init__(
         self,
-        toolchain: FFmpegToolchain | None = None,
-        runner: CommandRunner | None = None,
-    ) -> None:
-        self.toolchain = toolchain or FFmpegToolchain()
-        self.runner = runner or CommandRunner()
+        *,
+        ffmpeg="ffmpeg",
+        ffprobe="ffprobe",
+        progress_callback=None,
+        cancellation_callback=None,
+    ):
+        self.ff = FFmpeg(
+            ffmpeg=ffmpeg,
+            ffprobe=ffprobe,
+            progress_callback=progress_callback,
+            cancellation_callback=cancellation_callback,
+        )
 
     def burn(
         self,
         video: str | Path,
         subtitle: str | Path,
         output: str | Path,
-        *,
-        overwrite: bool = True,
-        video_codec: str = "libx264",
-        preset: str = "medium",
-        crf: int = 20,
-        audio_codec: str = "copy",
+        settings: BurnerSettings | None = None,
     ) -> BurnResult:
-        video_path = self._validate(video)
-        subtitle_path = self._validate(subtitle)
 
-        output_path = Path(output).expanduser().resolve()
+        settings = settings or BurnerSettings()
 
-        if video_path == output_path:
-            raise MediaValidationError(
-                "Input and output cannot be the same file."
-            )
+        settings.validate()
 
-        output_path.parent.mkdir(
-            parents=True,
-            exist_ok=True,
+        video = Path(video)
+        subtitle = Path(subtitle)
+        output = Path(output)
+
+        self.ff.validate_input(video)
+        self.ff.validate_input(subtitle)
+
+        self.ff.validate_output(
+            video,
+            output,
+            settings.overwrite,
         )
 
-        subtitle_filter_path = self._escape_filter_path(
-            subtitle_path
+        duration = self.ff.duration(
+            video
         )
 
-        subtitle_filter = (
-            f"subtitles='{subtitle_filter_path}'"
+        temp = self.ff.temporary_path(
+            output.suffix or ".mp4"
+        )
+
+        subtitle_filter = self._subtitle_filter(
+            subtitle,
+            settings,
         )
 
         command = [
-            self.toolchain.ffmpeg,
+            self.ff.ffmpeg,
             "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y" if overwrite else "-n",
+            "-y",
+            "-nostdin",
+
             "-i",
-            str(video_path),
+            str(video),
+
             "-vf",
             subtitle_filter,
-            "-c:v",
-            video_codec,
-            "-preset",
-            preset,
-            "-crf",
-            str(crf),
-            "-c:a",
-            audio_codec,
-            "-movflags",
-            "+faststart",
+
+            "-map",
+            "0:v:0",
+            "-map",
+            "0:a?",
         ]
 
-        temporary = self._temporary_output(output_path)
+        # ----------------------------------------------------
+        # VIDEO
+        #
+        # Burning subtitles necessarily requires encoding.
+        # ----------------------------------------------------
 
-        command.append(str(temporary))
+        command += [
+            "-c:v",
+            settings.video_codec,
+
+            "-preset",
+            settings.preset,
+
+            "-crf",
+            str(settings.crf),
+
+            "-pix_fmt",
+            settings.pixel_format,
+        ]
+
+        # ----------------------------------------------------
+        # AUDIO
+        # ----------------------------------------------------
+
+        if settings.audio_mode == "fast_copy":
+            command += [
+                "-c:a",
+                "copy",
+            ]
+        else:
+            command += [
+                "-c:a",
+                settings.audio_codec,
+                "-b:a",
+                settings.audio_bitrate,
+            ]
+
+        if (
+            settings.faststart
+            and output.suffix.lower()
+            in {".mp4", ".m4v", ".mov"}
+        ):
+            command += [
+                "-movflags",
+                "+faststart",
+            ]
+
+        command.append(
+            str(temp)
+        )
 
         try:
-            self.runner.run(command)
+            self.ff.run(
+                command,
+                message="Burning subtitles",
+                duration=duration,
+            )
 
-            if not temporary.exists():
-                raise MediaOutputError(
-                    f"Burned subtitle output was not created: "
-                    f"{temporary}"
-                )
+            self.ff.atomic_replace(
+                temp,
+                output,
+            )
 
-            temporary.replace(output_path)
+            return BurnResult(
+                source=video,
+                subtitle=subtitle,
+                output=output,
+                duration=duration,
+            )
 
         finally:
-            temporary.unlink(missing_ok=True)
+            self.ff.cleanup()
 
-        return BurnResult(
-            input_path=video_path,
-            subtitle_path=subtitle_path,
-            output_path=output_path,
-        )
+    # ========================================================
+    # FILTER
+    # ========================================================
 
     @staticmethod
-    def _escape_filter_path(
-        path: Path,
+    def _subtitle_filter(
+        subtitle: Path,
+        settings: BurnerSettings,
     ) -> str:
-        """
-        Escape a Linux path for ffmpeg's subtitles filter.
-        """
 
-        value = str(path)
-
-        return (
-            value
-            .replace("\\", "\\\\")
-            .replace(":", "\\:")
-            .replace("'", "\\'")
+        path = (
+            str(subtitle.resolve())
+            .replace("\\", "/")
+            .replace(":", r"\:")
+            .replace("'", r"\'")
         )
 
-    @staticmethod
-    def _validate(path: str | Path) -> Path:
-        path = Path(path).expanduser().resolve()
+        extension = subtitle.suffix.lower()
 
-        if not path.exists():
-            raise MediaValidationError(
-                f"File does not exist: {path}"
+        if extension in {".ass", ".ssa"}:
+            return f"subtitles='{path}'"
+
+        options = []
+
+        if settings.subtitle_font:
+            options.append(
+                f"FontName={settings.subtitle_font}"
             )
 
-        if not path.is_file():
-            raise MediaValidationError(
-                f"Path is not a file: {path}"
+        if settings.subtitle_font_size:
+            options.append(
+                f"FontSize={settings.subtitle_font_size}"
             )
 
-        return path
+        if settings.subtitle_color:
+            options.append(
+                f"PrimaryColour={settings.subtitle_color}"
+            )
 
-    @staticmethod
-    def _temporary_output(
-        output: Path,
-    ) -> Path:
-        with tempfile.NamedTemporaryFile(
-            prefix=f".{output.stem}.",
-            suffix=output.suffix,
-            dir=output.parent,
-            delete=False,
-        ) as file:
-            return Path(file.name)
+        if options:
+            force_style = ",".join(options)
+
+            return (
+                f"subtitles='{path}':"
+                f"force_style='{force_style}'"
+            )
+
+        return f"subtitles='{path}'"

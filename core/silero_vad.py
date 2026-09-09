@@ -44,25 +44,49 @@ except RuntimeError:
 
 class SileroVAD:
     """
-    Silero Voice Activity Detection with a fixed 10-second fallback.
+    Voice Activity Detection with selectable segmentation mode.
 
-    Normal path
-    -----------
+    Modes
+    -----
+    "silero"
+        Try Silero VAD first.
+
+        If Silero cannot be loaded OR Silero timestamp detection fails,
+        automatically fall back to fixed-duration segmentation.
+
+    "fixed"
+        Do not load or run Silero VAD.
+
+        The complete audio is divided into fixed-duration chunks using
+        fallback_chunk_duration.
+
+    Default
+    -------
+    "silero"
+
+    Normal Silero path
+    ------------------
     1. Load Silero VAD.
-    2. Run Silero get_speech_timestamps().
+    2. Run get_speech_timestamps().
     3. Merge nearby speech regions.
     4. Split excessively long regions.
 
-    Fallback path
-    --------------
-    If Silero cannot be loaded OR Silero timestamp detection fails,
-    the complete audio is divided into fixed 10-second chunks.
+    Silero fallback path
+    --------------------
+    If Silero cannot be loaded OR timestamp detection fails, the complete
+    audio is divided into fixed-duration chunks.
 
-    Important:
-    - Silero is ALWAYS attempted first.
-    - A successful Silero result of [] means no speech was detected.
-      In that case we return [] and DO NOT use the fallback.
-    - No audio is discarded by the fallback.
+    Fixed path
+    ----------
+    If vad_mode="fixed", Silero is skipped entirely and the complete audio
+    is divided into fixed-duration chunks.
+
+    Important
+    ---------
+    A successful Silero result of [] means no speech was detected.
+    In that case we return [] and DO NOT use the fallback.
+
+    No audio is discarded by fixed-duration segmentation.
     """
 
     def __init__(
@@ -76,6 +100,7 @@ class SileroVAD:
         min_segment_duration: float = 0.0,
         max_segment_duration: float = 8.0,
         fallback_chunk_duration: float = 10.0,
+        vad_mode: str = "silero",
         error_callback: Optional[Callable[[object], None]] = None,
     ) -> None:
 
@@ -128,6 +153,22 @@ class SileroVAD:
                 "fallback_chunk_duration must be greater than zero."
             )
 
+        # ------------------------------------------------------------------
+        # VAD mode
+        # ------------------------------------------------------------------
+        #
+        # "silero" = Silero first, fixed-duration fallback on failure.
+        # "fixed"  = always use fixed-duration segmentation.
+        #
+        normalized_vad_mode = str(vad_mode).strip().lower()
+
+        if normalized_vad_mode not in ("silero", "fixed"):
+            raise ValueError(
+                "vad_mode must be either 'silero' or 'fixed'."
+            )
+
+        self.vad_mode = normalized_vad_mode
+
         self.sampling_rate = sampling_rate
         self.threshold = threshold
         self.min_speech_duration_ms = min_speech_duration_ms
@@ -147,8 +188,14 @@ class SileroVAD:
         self.vad_available = False
 
         # ------------------------------------------------------------------
-        # ALWAYS TRY SILERO FIRST
+        # ALWAYS TRY SILERO FIRST ONLY WHEN REQUESTED
         # ------------------------------------------------------------------
+        #
+        # Fixed mode deliberately skips model loading.
+        # ------------------------------------------------------------------
+
+        if self.vad_mode == "fixed":
+            return
 
         try:
             self.model = load_silero_vad()
@@ -543,12 +590,20 @@ class SileroVAD:
 
         Priority:
 
-            1. Load audio
-            2. Try Silero VAD
-            3. If Silero fails -> fixed 10-second fallback
-            4. If Silero succeeds with no speech -> []
-            5. Merge regions
-            6. Split long regions
+            vad_mode="silero":
+
+                1. Load audio
+                2. Try Silero VAD
+                3. If Silero fails -> fixed-duration fallback
+                4. If Silero succeeds with no speech -> []
+                5. Merge regions
+                6. Split long regions
+
+            vad_mode="fixed":
+
+                1. Load audio
+                2. Divide complete audio into fixed-duration chunks
+                3. Return chunks
 
         Returns:
             List of (start_seconds, end_seconds)
@@ -588,7 +643,21 @@ class SileroVAD:
             return []
 
         # --------------------------------------------------------------
-        # SILERO FIRST
+        # FIXED MODE
+        #
+        # Explicitly selected by the caller.
+        #
+        # Silero is not used at all.
+        # --------------------------------------------------------------
+
+        if self.vad_mode == "fixed":
+
+            return self._fallback_segments(
+                duration
+            )
+
+        # --------------------------------------------------------------
+        # SILERO MODE
         #
         # If model loading failed in __init__, use fallback.
         # --------------------------------------------------------------
@@ -597,7 +666,7 @@ class SileroVAD:
 
             self._error(
                 "Silero VAD is unavailable. "
-                "Using fixed 10-second segmentation."
+                "Using fixed-duration segmentation."
             )
 
             return self._fallback_segments(
@@ -624,7 +693,7 @@ class SileroVAD:
             self._error(
                 "Silero VAD timestamp detection failed: "
                 f"{exc}. "
-                "Falling back to fixed 10-second segmentation."
+                "Falling back to fixed-duration segmentation."
             )
 
             return self._fallback_segments(

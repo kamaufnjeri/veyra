@@ -2,247 +2,315 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Mapping
+from typing import Callable, Optional
 
 
-ProgressCallback = Callable[["Progress"], None]
+# ============================================================
+# ERRORS
+# ============================================================
 
 
-@dataclass(frozen=True)
-class Progress:
+class MediaError(Exception):
+    """Base exception for media operations."""
+
+
+class MediaCancelled(MediaError):
+    """Raised when an operation is cancelled."""
+
+
+# ============================================================
+# COMMON SETTINGS
+# ============================================================
+
+
+@dataclass(frozen=True, slots=True)
+class MediaSettings:
     """
-    Represents operation progress.
+    Settings shared by media operations.
 
-    Attributes:
-        fraction:
-            Value from 0.0 to 1.0.
-        percent:
-            Percentage from 0 to 100.
-        elapsed:
-            Seconds elapsed.
-        remaining:
-            Estimated seconds remaining, if known.
-        speed:
-            ffmpeg processing speed, e.g. 1.5x.
-        message:
-            Human-readable status.
+    Copying is the default because it is considerably faster than
+    re-encoding. Operations that technically require encoding,
+    such as subtitle burning, override the necessary stream mode.
     """
 
-    fraction: float
-    percent: float
-    elapsed: float | None = None
-    remaining: float | None = None
-    speed: float | None = None
-    message: str = ""
-
-
-@dataclass(frozen=True)
-class MediaStream:
-    """Description of an individual media stream."""
-
-    index: int
-    codec_type: str
-    codec_name: str | None = None
-    codec_long_name: str | None = None
-
-    language: str | None = None
-    title: str | None = None
-
-    width: int | None = None
-    height: int | None = None
-
-    sample_rate: int | None = None
-    channels: int | None = None
-    channel_layout: str | None = None
-
-    frame_rate: float | None = None
-    bitrate: int | None = None
-    duration: float | None = None
-
-    disposition: Mapping[str, int] = field(default_factory=dict)
-    metadata: Mapping[str, str] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class MediaInfo:
-    """Complete media information returned by ffprobe."""
-
-    path: Path
-    format_name: str | None
-    format_long_name: str | None
-
-    duration: float
-    size: int | None
-    bitrate: int | None
-
-    streams: tuple[MediaStream, ...]
-
-    metadata: Mapping[str, str] = field(default_factory=dict)
-
-    @property
-    def video_streams(self) -> tuple[MediaStream, ...]:
-        return tuple(
-            stream
-            for stream in self.streams
-            if stream.codec_type == "video"
-        )
-
-    @property
-    def audio_streams(self) -> tuple[MediaStream, ...]:
-        return tuple(
-            stream
-            for stream in self.streams
-            if stream.codec_type == "audio"
-        )
-
-    @property
-    def subtitle_streams(self) -> tuple[MediaStream, ...]:
-        return tuple(
-            stream
-            for stream in self.streams
-            if stream.codec_type == "subtitle"
-        )
-
-    @property
-    def has_video(self) -> bool:
-        return bool(self.video_streams)
-
-    @property
-    def has_audio(self) -> bool:
-        return bool(self.audio_streams)
-
-    @property
-    def has_subtitles(self) -> bool:
-        return bool(self.subtitle_streams)
-
-
-@dataclass(frozen=True)
-class EncodeOptions:
-    """
-    Encoding configuration.
-
-    If video_codec/audio_codec are None, sensible defaults are selected
-    by the transcoder.
-    """
+    video_mode: str = "fast_copy"
+    audio_mode: str = "fast_copy"
 
     video_codec: str = "libx264"
     audio_codec: str = "aac"
 
-    preset: str = "medium"
-    crf: int = 23
-
+    preset: str = "veryfast"
+    crf: int = 20
     audio_bitrate: str = "192k"
 
     pixel_format: str = "yuv420p"
 
-    width: int | None = None
-    height: int | None = None
-
-    fps: float | None = None
-
-    video_bitrate: str | None = None
-
-    threads: int | None = None
-
     faststart: bool = True
+    overwrite: bool = False
 
-    tune: str | None = None
+    output_format: Optional[str] = None
 
-    profile: str | None = None
+    def validate(self) -> None:
+        if self.video_mode not in {"fast_copy", "reencode"}:
+            raise ValueError(
+                "video_mode must be 'fast_copy' or 'reencode'."
+            )
 
-    level: str | None = None
+        if self.audio_mode not in {"fast_copy", "reencode"}:
+            raise ValueError(
+                "audio_mode must be 'fast_copy' or 'reencode'."
+            )
 
-    extra_video_args: tuple[str, ...] = ()
-    extra_audio_args: tuple[str, ...] = ()
+        if not 0 <= self.crf <= 51:
+            raise ValueError("crf must be between 0 and 51.")
+
+        if not self.video_codec:
+            raise ValueError("video_codec cannot be empty.")
+
+        if not self.audio_codec:
+            raise ValueError("audio_codec cannot be empty.")
+
+        if not self.preset:
+            raise ValueError("preset cannot be empty.")
+
+        if not self.audio_bitrate:
+            raise ValueError("audio_bitrate cannot be empty.")
 
 
-@dataclass(frozen=True)
-class CutOptions:
-    """
-    Video cutting configuration.
-    """
+# ============================================================
+# SUBTITLE SETTINGS
+# ============================================================
+
+
+@dataclass(frozen=True, slots=True)
+class SubtitleSettings:
+    output_format: str = "same"
+    language: Optional[str] = None
+    encoding: str = "utf-8"
+    overwrite: bool = False
+
+    def validate(self) -> None:
+        if self.output_format.lower() not in {
+            "same",
+            "srt",
+            "vtt",
+            "ass",
+            "ssa",
+        }:
+            raise ValueError(
+                "output_format must be "
+                "'same', 'srt', 'vtt', 'ass', or 'ssa'."
+            )
+
+
+# ============================================================
+# CUTTER
+# ============================================================
+
+
+@dataclass(frozen=True, slots=True)
+class CutterSettings(MediaSettings):
+    mode: str = "duration"
+
+    parts: Optional[int] = None
+    duration: Optional[float] = None
+    durations: tuple[float, ...] = ()
+    timestamps: tuple[float, ...] = ()
 
     start: float = 0.0
-    end: float | None = None
+    end: Optional[float] = None
 
-    accurate: bool = True
+    cut_subtitles: bool = True
+    subtitle: SubtitleSettings = field(
+        default_factory=SubtitleSettings
+    )
 
-    reencode: bool = False
+    numbered_suffix: str = "-of-"
 
 
-@dataclass(frozen=True)
-class MuxSubtitle:
-    """External subtitle to add to a media container."""
+# ============================================================
+# JOINER
+# ============================================================
 
+
+@dataclass(frozen=True, slots=True)
+class JoinerSettings(MediaSettings):
+    """
+    Files should normally have compatible streams when using
+    fast_copy.
+    """
+
+    join_subtitles: bool = True
+    subtitle: SubtitleSettings = field(
+        default_factory=SubtitleSettings
+    )
+
+
+# ============================================================
+# CONVERTER
+# ============================================================
+
+
+@dataclass(frozen=True, slots=True)
+class ConverterSettings(MediaSettings):
+    """
+    Settings controlling media conversion.
+    """
+
+    output_format: str = "mp4"
+
+    keep_subtitles: bool = True
+    keep_metadata: bool = True
+
+    def validate(self) -> None:
+        super().validate()
+
+        allowed_formats = {
+            "mp4",
+            "mkv",
+            "mov",
+            "avi",
+            "webm",
+            "ts",
+        }
+
+        fmt = self.output_format.lower().lstrip(".")
+
+        if fmt not in allowed_formats:
+            raise ValueError(
+                f"Unsupported output format: {self.output_format}"
+            )
+
+
+
+# ============================================================
+# BURNER
+# ============================================================
+
+
+@dataclass(frozen=True, slots=True)
+class BurnerSettings:
+    """
+    Burning subtitles requires video re-encoding.
+
+    Audio remains copy by default.
+    """
+
+    video_codec: str = "libx264"
+    audio_mode: str = "fast_copy"
+    audio_codec: str = "aac"
+
+    preset: str = "veryfast"
+    crf: int = 20
+    audio_bitrate: str = "192k"
+
+    pixel_format: str = "yuv420p"
+
+    subtitle_font: Optional[str] = None
+    subtitle_font_size: Optional[int] = None
+    subtitle_color: Optional[str] = None
+
+    overwrite: bool = False
+    faststart: bool = True
+
+    def validate(self) -> None:
+        if self.audio_mode not in {
+            "fast_copy",
+            "reencode",
+        }:
+            raise ValueError(
+                "audio_mode must be 'fast_copy' or 'reencode'."
+            )
+
+        if not 0 <= self.crf <= 51:
+            raise ValueError(
+                "crf must be between 0 and 51."
+            )
+
+        if self.subtitle_font_size is not None:
+            if self.subtitle_font_size <= 0:
+                raise ValueError(
+                    "subtitle_font_size must be greater than zero."
+                )
+
+
+# ============================================================
+# SUBTITLE MODEL
+# ============================================================
+
+
+@dataclass(frozen=True, slots=True)
+class SubtitleTrack:
+    source: Path
+
+    language: Optional[str] = None
+    title: Optional[str] = None
+
+    embedded: bool = False
+    stream_index: Optional[int] = None
+    codec: Optional[str] = None
+
+
+# ============================================================
+# MEDIA MODEL
+# ============================================================
+
+
+@dataclass(frozen=True, slots=True)
+class MediaInput:
     path: Path
-    language: str | None = None
-    title: str | None = None
-
-    default: bool = False
-    forced: bool = False
-
-
-@dataclass(frozen=True)
-class MediaPart:
-    """
-    A video segment and its corresponding external subtitles.
-
-    Example:
-
-        MediaPart(
-            video=Path("episode1.mp4"),
-            subtitles={
-                "en": Path("episode1.en.srt"),
-                "es": Path("episode1.es.srt"),
-            },
-        )
-    """
-
-    video: Path
-
-    subtitles: Mapping[str, Path] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class ConversionResult:
-    input_path: Path
-    output_path: Path
     duration: float
-    reencoded: bool
+    subtitles: tuple[SubtitleTrack, ...] = ()
 
 
-@dataclass(frozen=True)
-class JoinResult:
-    video: Path
-    subtitles: Mapping[str, Path]
+@dataclass(frozen=True, slots=True)
+class MediaPart:
+    index: int
+    total: int
 
-    durations: tuple[float, ...]
-    total_duration: float
-
-    reencoded: bool
-
-
-@dataclass(frozen=True)
-class MuxResult:
+    source: Path
     output: Path
-
-
-@dataclass(frozen=True)
-class ExtractionResult:
-    output: Path
-
-
-@dataclass(frozen=True)
-class CutResult:
-    input_path: Path
-    output_path: Path
 
     start: float
-    end: float | None
+    end: float
+    duration: float
+
+    subtitle_outputs: tuple[Path, ...] = ()
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
+class CutResult:
+    source: Path
+    outputs: tuple[Path, ...]
+    parts: tuple[MediaPart, ...]
+    duration: float
+
+
+@dataclass(frozen=True, slots=True)
+class JoinResult:
+    inputs: tuple[Path, ...]
+    output: Path
+    duration: float
+
+
+@dataclass(frozen=True, slots=True)
+class ConvertResult:
+    source: Path
+    output: Path
+    duration: float
+
+
+@dataclass(frozen=True, slots=True)
 class BurnResult:
-    input_path: Path
-    subtitle_path: Path
-    output_path: Path
+    source: Path
+    subtitle: Path
+    output: Path
+    duration: float
+
+
+# ============================================================
+# CALLBACK
+# ============================================================
+
+
+ProgressCallback = Callable[..., None]

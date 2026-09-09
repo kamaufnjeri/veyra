@@ -1,233 +1,525 @@
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
+from typing import Optional
 
-from .exceptions import (
-    MediaOutputError,
-    MediaValidationError,
+from .ffmpeg import FFmpeg
+from .models import (
+    CutResult,
+    CutterSettings,
+    CutterSettings,
+    MediaInput,
+    MediaPart,
 )
-from .models import CutOptions, CutResult
-from .probe import MediaProbe
-from .runner import CommandRunner
-from .toolchain import FFmpegToolchain
+from .subtitles import SubtitleManager
 
 
 class MediaCutter:
-    """Trim media files."""
+
+    EPSILON = 1e-6
 
     def __init__(
         self,
-        probe: MediaProbe | None = None,
-        toolchain: FFmpegToolchain | None = None,
-        runner: CommandRunner | None = None,
-    ) -> None:
-        self.toolchain = toolchain or FFmpegToolchain()
-        self.runner = runner or CommandRunner()
-
-        self.probe = probe or MediaProbe(
-            toolchain=self.toolchain,
-            runner=self.runner,
+        *,
+        ffmpeg: str = "ffmpeg",
+        ffprobe: str = "ffprobe",
+        progress_callback=None,
+        cancellation_callback=None,
+    ):
+        self.ff = FFmpeg(
+            ffmpeg=ffmpeg,
+            ffprobe=ffprobe,
+            progress_callback=progress_callback,
+            cancellation_callback=cancellation_callback,
         )
 
-    def trim(
+        self.subtitles = SubtitleManager(
+            self.ff
+        )
+
+    # ========================================================
+    # PUBLIC
+    # ========================================================
+
+    def cut(
         self,
         input_path: str | Path,
-        output_path: str | Path,
-        *,
-        options: CutOptions | None = None,
-        overwrite: bool = True,
+        settings: Optional[CutterSettings] = None,
     ) -> CutResult:
-        input_path = Path(input_path).expanduser().resolve()
-        output_path = Path(output_path).expanduser().resolve()
 
-        options = options or CutOptions()
+        settings = settings or CutterSettings()
 
-        if options.start < 0:
-            raise MediaValidationError(
-                "Start time cannot be negative."
-            )
+        settings.validate()
 
-        if options.end is not None:
-            if options.end <= options.start:
-                raise MediaValidationError(
-                    "End time must be greater than start time."
+        source = Path(input_path)
+
+        self.ff.validate_input(source)
+
+        duration = self.ff.duration(source)
+
+        ranges = self._build_ranges(
+            duration,
+            settings,
+        )
+
+        output_dir = Path(
+            settings.output_directory
+            if hasattr(settings, "output_directory")
+            else source.parent
+        )
+
+        output_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        tracks = self.subtitles.discover(
+            source
+        )
+
+        tracks = self.subtitles.filter(
+            tracks,
+            settings.subtitle,
+        )
+
+        parts = []
+
+        try:
+            for index, (start, end) in enumerate(
+                ranges,
+                1,
+            ):
+
+                output = self._output_path(
+                    source,
+                    start,
+                    end,
+                    index,
+                    len(ranges),
+                    settings,
+                    output_dir,
                 )
 
-        if input_path == output_path:
-            raise MediaValidationError(
-                "Input and output cannot be the same file."
+                self.ff.validate_output(
+                    source,
+                    output,
+                    settings.overwrite,
+                )
+
+                self._cut_video(
+                    source,
+                    output,
+                    start,
+                    end,
+                    settings,
+                )
+
+                subtitle_outputs = []
+
+                if settings.cut_subtitles:
+                    for track in tracks:
+                        subtitle_output = (
+                            output.with_suffix(
+                                f".{track.language or 'sub'}"
+                                f"{self._subtitle_extension(track, settings)}"
+                            )
+                        )
+
+                        self.subtitles.cut(
+                            track,
+                            start,
+                            end,
+                            subtitle_output,
+                            settings.subtitle,
+                        )
+
+                        subtitle_outputs.append(
+                            subtitle_output
+                        )
+
+                parts.append(
+                    MediaPart(
+                        index=index,
+                        total=len(ranges),
+                        source=source,
+                        output=output,
+                        start=start,
+                        end=end,
+                        duration=end - start,
+                        subtitle_outputs=tuple(
+                            subtitle_outputs
+                        ),
+                    )
+                )
+
+            return CutResult(
+                source=source,
+                outputs=tuple(
+                    part.output
+                    for part in parts
+                ),
+                parts=tuple(parts),
+                duration=duration,
             )
 
-        duration = self.probe.duration(input_path)
+        finally:
+            self.ff.cleanup()
 
-        if options.start >= duration:
-            raise MediaValidationError(
-                "Start time is beyond the media duration."
-            )
+    # ========================================================
+    # VIDEO
+    # ========================================================
 
-        if options.end is not None:
-            end = min(options.end, duration)
-        else:
-            end = None
+    def _cut_video(
+        self,
+        source: Path,
+        output: Path,
+        start: float,
+        end: float,
+        settings: CutterSettings,
+    ) -> None:
 
-        if options.reencode:
-            self._trim_reencode(
-                input_path,
-                output_path,
-                start=options.start,
-                end=end,
-                overwrite=overwrite,
-            )
+        duration = end - start
 
-        elif options.accurate:
-            self._trim_copy_accurate(
-                input_path,
-                output_path,
-                start=options.start,
-                end=end,
-                overwrite=overwrite,
-            )
-
-        else:
-            self._trim_copy_fast(
-                input_path,
-                output_path,
-                start=options.start,
-                end=end,
-                overwrite=overwrite,
-            )
-
-        return CutResult(
-            input_path=input_path,
-            output_path=output_path,
-            start=options.start,
-            end=end,
+        temp = self.ff.temporary_path(
+            output.suffix or ".mp4"
         )
 
-    def _trim_copy_fast(
-        self,
-        input_path: Path,
-        output_path: Path,
-        *,
-        start: float,
-        end: float | None,
-        overwrite: bool,
-    ) -> None:
         command = [
-            self.toolchain.ffmpeg,
+            self.ff.ffmpeg,
             "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y" if overwrite else "-n",
+            "-y",
+            "-nostdin",
+
             "-ss",
-            str(start),
+            self._seconds(start),
+
             "-i",
-            str(input_path),
+            str(source),
+
+            "-t",
+            self._seconds(duration),
+
+            "-map",
+            "0:v:0?",
+            "-map",
+            "0:a?",
+            "-sn",
+            "-dn",
         ]
 
-        if end is not None:
-            command.extend(
-                [
-                    "-t",
-                    str(end - start),
-                ]
-            )
-
-        command.extend(
-            [
-                "-c",
-                "copy",
-                str(output_path),
-            ]
-        )
-
-        self.runner.run(command)
-
-    def _trim_copy_accurate(
-        self,
-        input_path: Path,
-        output_path: Path,
-        *,
-        start: float,
-        end: float | None,
-        overwrite: bool,
-    ) -> None:
-        command = [
-            self.toolchain.ffmpeg,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y" if overwrite else "-n",
-            "-i",
-            str(input_path),
-            "-ss",
-            str(start),
-        ]
-
-        if end is not None:
-            command.extend(
-                [
-                    "-t",
-                    str(end - start),
-                ]
-            )
-
-        command.extend(
-            [
-                "-c",
-                "copy",
-                str(output_path),
-            ]
-        )
-
-        self.runner.run(command)
-
-    def _trim_reencode(
-        self,
-        input_path: Path,
-        output_path: Path,
-        *,
-        start: float,
-        end: float | None,
-        overwrite: bool,
-    ) -> None:
-        command = [
-            self.toolchain.ffmpeg,
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y" if overwrite else "-n",
-            "-i",
-            str(input_path),
-            "-ss",
-            str(start),
-        ]
-
-        if end is not None:
-            command.extend(
-                [
-                    "-t",
-                    str(end - start),
-                ]
-            )
-
-        command.extend(
-            [
+        if settings.video_mode == "fast_copy":
+            command += [
                 "-c:v",
-                "libx264",
+                "copy",
+            ]
+        else:
+            command += [
+                "-c:v",
+                settings.video_codec,
                 "-preset",
-                "medium",
+                settings.preset,
                 "-crf",
-                "23",
+                str(settings.crf),
+                "-pix_fmt",
+                settings.pixel_format,
+            ]
+
+        if settings.audio_mode == "fast_copy":
+            command += [
                 "-c:a",
-                "aac",
+                "copy",
+            ]
+        else:
+            command += [
+                "-c:a",
+                settings.audio_codec,
                 "-b:a",
-                "192k",
+                settings.audio_bitrate,
+            ]
+
+        if (
+            settings.faststart
+            and output.suffix.lower()
+            in {".mp4", ".m4v", ".mov"}
+        ):
+            command += [
                 "-movflags",
                 "+faststart",
-                str(output_path),
             ]
+
+        command.append(str(temp))
+
+        self.ff.run(
+            command,
+            message="Cutting video",
+            duration=duration,
         )
 
-        self.runner.run(command)
+        self.ff.atomic_replace(
+            temp,
+            output,
+        )
+
+    # ========================================================
+    # RANGES
+    # ========================================================
+
+    def _build_ranges(
+        self,
+        duration: float,
+        settings: CutterSettings,
+    ) -> list[tuple[float, float]]:
+
+        mode = settings.mode
+
+        if mode == "parts":
+            if not settings.parts or settings.parts < 1:
+                raise ValueError(
+                    "parts must be at least 1."
+                )
+
+            return [
+                (
+                    duration * i / settings.parts,
+                    duration * (i + 1) / settings.parts,
+                )
+                for i in range(settings.parts)
+            ]
+
+        if mode == "duration":
+            if not settings.duration or settings.duration <= 0:
+                raise ValueError(
+                    "duration must be greater than zero."
+                )
+
+            return self._fixed_ranges(
+                duration,
+                settings.duration,
+            )
+
+        if mode == "durations":
+            return self._explicit_ranges(
+                duration,
+                settings.durations,
+            )
+
+        if mode == "timestamps":
+            return self._timestamp_ranges(
+                duration,
+                settings.timestamps,
+            )
+
+        if mode == "range":
+            start = settings.start
+            end = (
+                settings.end
+                if settings.end is not None
+                else duration
+            )
+
+            self._validate_range(
+                start,
+                end,
+                duration,
+            )
+
+            return [(start, end)]
+
+        raise ValueError(
+            f"Unknown cut mode: {mode}"
+        )
+
+    @classmethod
+    def _fixed_ranges(
+        cls,
+        duration: float,
+        size: float,
+    ):
+        result = []
+
+        start = 0.0
+
+        while start < duration - cls.EPSILON:
+            end = min(
+                start + size,
+                duration,
+            )
+
+            result.append(
+                (start, end)
+            )
+
+            start = end
+
+        return result
+
+    @classmethod
+    def _explicit_ranges(
+        cls,
+        duration: float,
+        durations,
+    ):
+        result = []
+
+        start = 0.0
+
+        for size in durations:
+            if size <= 0:
+                raise ValueError(
+                    "All durations must be positive."
+                )
+
+            if start >= duration:
+                break
+
+            end = min(
+                start + size,
+                duration,
+            )
+
+            result.append(
+                (start, end)
+            )
+
+            start = end
+
+        if not result:
+            raise ValueError(
+                "No valid durations supplied."
+            )
+
+        result[-1] = (
+            result[-1][0],
+            duration,
+        )
+
+        return result
+
+    @classmethod
+    def _timestamp_ranges(
+        cls,
+        duration: float,
+        timestamps,
+    ):
+        points = [0.0]
+
+        previous = 0.0
+
+        for value in timestamps:
+            value = float(value)
+
+            if value <= previous:
+                raise ValueError(
+                    "Timestamps must be strictly increasing."
+                )
+
+            if value >= duration:
+                if abs(value - duration) <= cls.EPSILON:
+                    value = duration
+                else:
+                    raise ValueError(
+                        "Timestamp exceeds media duration."
+                    )
+
+            points.append(value)
+            previous = value
+
+        points.append(duration)
+
+        return [
+            (a, b)
+            for a, b in zip(
+                points,
+                points[1:],
+            )
+            if b - a > cls.EPSILON
+        ]
+
+    @staticmethod
+    def _validate_range(
+        start,
+        end,
+        duration,
+    ):
+        if start < 0:
+            raise ValueError(
+                "start cannot be negative."
+            )
+
+        if end <= start:
+            raise ValueError(
+                "end must be greater than start."
+            )
+
+        if end > duration:
+            raise ValueError(
+                "end exceeds media duration."
+            )
+
+    # ========================================================
+    # OUTPUT
+    # ========================================================
+
+    @staticmethod
+    def _output_path(
+        source,
+        start,
+        end,
+        index,
+        total,
+        settings,
+        directory,
+    ):
+        if settings.mode == "range":
+            name = (
+                f"{source.stem}-"
+                f"{MediaCutter._time_name(start)}-"
+                f"{MediaCutter._time_name(end)}"
+                f"{source.suffix}"
+            )
+        else:
+            name = (
+                f"{source.stem}_"
+                f"{index}"
+                f"{settings.numbered_suffix}"
+                f"{total}"
+                f"{source.suffix}"
+            )
+
+        return directory / name
+
+    @staticmethod
+    def _time_name(seconds):
+        seconds = int(round(seconds))
+
+        hours, remainder = divmod(
+            seconds,
+            3600,
+        )
+
+        minutes, seconds = divmod(
+            remainder,
+            60,
+        )
+
+        if hours:
+            return f"{hours}h{minutes:02d}m{seconds:02d}s"
+
+        return f"{minutes}m{seconds:02d}s"
+
+    @staticmethod
+    def _seconds(value):
+        return f"{value:.6f}"
+
+    @staticmethod
+    def _subtitle_extension(
+        track,
+        settings,
+    ):
+        if settings.subtitle.output_format != "same":
+            return "." + settings.subtitle.output_format
+
+        if track.source.suffix:
+            return track.source.suffix.lower()
+
+        return ".srt"

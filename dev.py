@@ -22,6 +22,8 @@ WATCH_DIRECTORIES = [
     PROJECT_ROOT / "core",
     PROJECT_ROOT / "services",
     PROJECT_ROOT / "jobs",
+    PROJECT_ROOT / "media",
+
 ]
 
 # File types that trigger a restart.

@@ -29,6 +29,7 @@ from core.temp_manager import (
     remove_temp_file,
 )
 
+BATCH_SIZE = 100
 
 class SubtitleService:
     """
@@ -206,6 +207,8 @@ class SubtitleService:
         source_language: str = "en",
         target_language: Optional[str] = None,
         subtitle_format: str = "srt",
+        vad_mode: str = "silero",
+        audio_source: str = "wav",
         progress_callback: Optional[Callable[..., None]] = None,
         error_callback: Optional[Callable[[Any], None]] = None,
         overwrite_callback: Optional[Callable[..., bool]] = None,
@@ -262,9 +265,44 @@ class SubtitleService:
             format_type=self.subtitle_format,
             error_messages_callback=self._error,
         )
+        self.audio_source = (
+            str(audio_source or "wav")
+            .strip()
+            .lower()
+        )
+
+        if self.audio_source not in {
+            "wav",
+            "video",
+        }:
+            raise ValueError(
+                "Unsupported audio source: "
+                f"{self.audio_source}. "
+                "Valid sources are: wav, video, auto"
+            )
+
+        self.vad_mode = (
+            str(vad_mode or "silero")
+            .strip()
+            .lower()
+        )
+
+        if self.vad_mode not in {
+            "silero",
+            "fixed",
+        }:
+            raise ValueError(
+                "Unsupported VAD mode: "
+                f"{self.vad_mode}. "
+                "Valid modes are: silero, fixed"
+            )
+
+
 
         self.transcriber = AudioTranscriber(
             language=self.source_language,
+            vad_mode=self.vad_mode,
+            audio_source=self.audio_source,
             progress_callback=self._core_progress,
             error_callback=self._error,
             include_before=0.25,
@@ -1446,7 +1484,7 @@ class SubtitleService:
                                 filename,
                             )
                         ),
-                        batch_size=100,
+                        batch_size=BATCH_SIZE,
                         retry_count=3,
                         retry_delay=1.0,
                     )
@@ -1463,7 +1501,7 @@ class SubtitleService:
                             "SRTranslator / TranslatePy "
                             f"{self.source_language} -> "
                             f"{self.target_language} "
-                            "(batches of 200 subtitles)"
+                            f"(batches of {BATCH_SIZE})"
                         ),
                         filename,
                         70,

@@ -105,9 +105,13 @@ class ProcessingWorker(QObject):
         files: List[str],
         source_language: str,
         target_language: Optional[str],
+
         subtitle_format: str,
+      
         overwrite_mode: str,
         translation_mode: str,
+        vad_mode: str = "silero",
+        audio_source: str = "wav",
     ):
         super().__init__()
 
@@ -119,6 +123,19 @@ class ProcessingWorker(QObject):
 
         self.overwrite_mode = overwrite_mode
         self.translation_mode = translation_mode
+
+        self.vad_mode = (
+            str(vad_mode or "silero")
+            .strip()
+            .lower()
+        )
+
+        self.audio_source = (
+            str(audio_source or "wav")
+            .strip()
+            .lower()
+)
+
 
         self.processor: Optional[SubtitleJobProcessor] = None
 
@@ -249,7 +266,10 @@ class ProcessingWorker(QObject):
                 translate_callback=self.ask_translation,
                 overwrite_mode=self.overwrite_mode,
                 translation_mode=self.translation_mode,
+                vad_mode=self.vad_mode,
+                audio_source=self.audio_source,
             )
+
 
             if self._cancel_requested:
                 self.cancelled.emit()
@@ -531,6 +551,71 @@ class SubtitlePage(QWidget):
         main_layout.addLayout(
             translation_layout
         )
+
+                # ======================================================
+        # AUDIO / VAD
+        # ======================================================
+
+        audio_layout = QHBoxLayout()
+
+        audio_layout.addWidget(
+            QLabel("VAD:")
+        )
+
+        self.vad_mode_combo = QComboBox()
+
+        self.vad_mode_combo.addItem(
+            "Silero",
+            "silero",
+        )
+
+        self.vad_mode_combo.addItem(
+            "Fixed",
+            "fixed",
+        )
+
+        # Silero is the default.
+        self.vad_mode_combo.setCurrentIndex(
+            self.vad_mode_combo.findData("silero")
+        )
+
+        audio_layout.addWidget(
+            self.vad_mode_combo
+        )
+
+        audio_layout.addSpacing(20)
+
+        audio_layout.addWidget(
+            QLabel("Audio source:")
+        )
+
+        self.audio_source_combo = QComboBox()
+
+        self.audio_source_combo.addItem(
+            "WAV",
+            "wav",
+        )
+
+        self.audio_source_combo.addItem(
+            "Video",
+            "video",
+        )
+
+        # WAV is the default.
+        self.audio_source_combo.setCurrentIndex(
+            self.audio_source_combo.findData("wav")
+        )
+
+        audio_layout.addWidget(
+            self.audio_source_combo
+        )
+
+        audio_layout.addStretch()
+
+        main_layout.addLayout(
+            audio_layout
+        )
+
 
         # ======================================================
         # FORMAT
@@ -1064,6 +1149,15 @@ class SubtitlePage(QWidget):
             self.translation_mode_combo.currentData()
         )
 
+        vad_mode = (
+            self.vad_mode_combo.currentData()
+        )
+
+        audio_source = (
+            self.audio_source_combo.currentData()
+        )
+
+
         if not source_language:
 
             QMessageBox.warning(
@@ -1098,9 +1192,12 @@ class SubtitlePage(QWidget):
                 f"Source: {source_language}\n"
                 f"Target: "
                 f"{target_language or 'disabled'}\n"
-                f"Format: {subtitle_format.upper()}\n\n"
+                f"Format: {subtitle_format.upper()}\n"
+                f"VAD: {vad_mode}\n"
+                f"Audio source: {audio_source}\n\n"
                 "Start subtitle generation?"
             ),
+
             QMessageBox.Yes
             | QMessageBox.No,
             QMessageBox.Yes,
@@ -1166,7 +1263,10 @@ class SubtitlePage(QWidget):
             subtitle_format=subtitle_format,
             overwrite_mode=overwrite_mode,
             translation_mode=translation_mode,
+            vad_mode=vad_mode,
+            audio_source=audio_source,
         )
+
 
         self.worker.moveToThread(
             self.thread
@@ -1270,6 +1370,14 @@ class SubtitlePage(QWidget):
         self.translation_mode_combo.setEnabled(
             enabled
         )
+        self.vad_mode_combo.setEnabled(
+            enabled
+        )
+
+        self.audio_source_combo.setEnabled(
+            enabled
+        )
+
 
         self.format_combo.setEnabled(enabled)
 
@@ -1542,16 +1650,12 @@ class SubtitlePage(QWidget):
         )
 
         self.status_label.setText(
-            "Processing failed."
+            "Processing error occurred. See log."
         )
 
-        self._set_processing(False)
+        # Do not show a QMessageBox for processing errors.
+        # Errors are reported in the log instead.
 
-        QMessageBox.critical(
-            self,
-            "Processing Error",
-            message,
-        )
 
     # ==========================================================
     # FINISHED

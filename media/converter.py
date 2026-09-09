@@ -2,49 +2,187 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .ffmpeg import FFmpeg
 from .models import (
-    ConversionResult,
-    EncodeOptions,
-    ProgressCallback,
+    ConvertResult,
+    ConverterSettings,
 )
-from .probe import MediaProbe
-from .transcoder import MediaTranscoder
 
 
 class MediaConverter:
-    """High-level video conversion API."""
 
     def __init__(
         self,
-        probe: MediaProbe | None = None,
-        transcoder: MediaTranscoder | None = None,
-    ) -> None:
-        self.probe = probe or MediaProbe()
-        self.transcoder = transcoder or MediaTranscoder()
+        *,
+        ffmpeg="ffmpeg",
+        ffprobe="ffprobe",
+        progress_callback=None,
+        cancellation_callback=None,
+    ):
+        self.ff = FFmpeg(
+            ffmpeg=ffmpeg,
+            ffprobe=ffprobe,
+            progress_callback=progress_callback,
+            cancellation_callback=cancellation_callback,
+        )
 
     def convert(
         self,
         input_path: str | Path,
         output_path: str | Path,
-        *,
-        options: EncodeOptions | None = None,
-        overwrite: bool = True,
-        progress_callback: ProgressCallback | None = None,
-    ) -> ConversionResult:
-        info = self.probe.inspect(input_path)
+        settings: ConverterSettings | None = None,
+    ) -> ConvertResult:
 
-        output = self.transcoder.transcode(
-            input_path,
-            output_path,
-            options=options,
-            duration=info.duration,
-            overwrite=overwrite,
-            progress_callback=progress_callback,
+        settings = settings or ConverterSettings()
+        settings.validate()
+
+        source = Path(input_path)
+        output = Path(output_path)
+
+        # Output format is controlled by ConverterSettings.
+        output = output.with_suffix(
+            f".{settings.output_format.lstrip('.')}"
         )
 
-        return ConversionResult(
-            input_path=info.path,
-            output_path=output,
-            duration=info.duration,
-            reencoded=True,
+        self.ff.validate_input(source)
+
+        self.ff.validate_output(
+            source,
+            output,
+            settings.overwrite,
         )
+
+        duration = self.ff.duration(source)
+
+        temp = self.ff.temporary_path(
+            output.suffix or ".tmp"
+        )
+
+        try:
+            command = [
+                self.ff.ffmpeg,
+                "-hide_banner",
+                "-y",
+                "-nostdin",
+
+                "-i",
+                str(source),
+
+                "-map",
+                "0:v:0?",
+                "-map",
+                "0:a?",
+            ]
+
+            # ------------------------------------------------
+            # SUBTITLES
+            # ------------------------------------------------
+
+            if settings.keep_subtitles:
+                command += [
+                    "-map",
+                    "0:s?",
+                ]
+            else:
+                command += [
+                    "-sn",
+                ]
+
+            # ------------------------------------------------
+            # METADATA
+            # ------------------------------------------------
+
+            if settings.keep_metadata:
+                command += [
+                    "-map_metadata",
+                    "0",
+                ]
+            else:
+                command += [
+                    "-map_metadata",
+                    "-1",
+                ]
+
+            # ------------------------------------------------
+            # VIDEO
+            # ------------------------------------------------
+
+            if settings.video_mode == "fast_copy":
+                command += [
+                    "-c:v",
+                    "copy",
+                ]
+            else:
+                command += [
+                    "-c:v",
+                    settings.video_codec,
+                    "-preset",
+                    settings.preset,
+                    "-crf",
+                    str(settings.crf),
+                    "-pix_fmt",
+                    settings.pixel_format,
+                ]
+
+            # ------------------------------------------------
+            # AUDIO
+            # ------------------------------------------------
+
+            if settings.audio_mode == "fast_copy":
+                command += [
+                    "-c:a",
+                    "copy",
+                ]
+            else:
+                command += [
+                    "-c:a",
+                    settings.audio_codec,
+                    "-b:a",
+                    settings.audio_bitrate,
+                ]
+
+            # ------------------------------------------------
+            # SUBTITLE CODEC
+            # ------------------------------------------------
+
+            if settings.keep_subtitles:
+                command += [
+                    "-c:s",
+                    "copy",
+                ]
+
+            # ------------------------------------------------
+            # FASTSTART
+            # ------------------------------------------------
+
+            if (
+                settings.faststart
+                and output.suffix.lower()
+                in {".mp4", ".m4v", ".mov"}
+            ):
+                command += [
+                    "-movflags",
+                    "+faststart",
+                ]
+
+            command.append(str(temp))
+
+            self.ff.run(
+                command,
+                message="Converting media",
+                duration=duration,
+            )
+
+            self.ff.atomic_replace(
+                temp,
+                output,
+            )
+
+            return ConvertResult(
+                source=source,
+                output=output,
+                duration=duration,
+            )
+
+        finally:
+            self.ff.cleanup()

@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
 
 from cli.ui.subtitle_page import SubtitlePage
 from cli.ui.media_download_page import VideoDownloadPage
-from cli.ui.media_pipeline_page import MediaPipelinePage
+from cli.ui.media_engine_page import MediaEnginePage
 
 from core.temp_manager import (
     initialize_veyra_temp,
@@ -251,7 +251,7 @@ class VeyraWindow(QMainWindow):
         )
 
         self.media_processing_page = (
-            MediaPipelinePage()
+            MediaEnginePage()
         )
 
         # ======================================================

@@ -1,151 +1,237 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Sequence
 
-from .concatenator import MediaConcatenator
-from .exceptions import MediaValidationError
-from .models import (
-    EncodeOptions,
-    JoinResult,
-    MediaPart,
-    ProgressCallback,
-)
-from .probe import MediaProbe
-from subtitles import SubtitleJoiner
+from .ffmpeg import FFmpeg
+from .models import JoinResult, JoinerSettings
+from .subtitles import SubtitleManager
 
 
 class MediaJoiner:
-    """
-    Join video segments and their corresponding external subtitles.
-    """
 
     def __init__(
         self,
-        probe: MediaProbe | None = None,
-        concatenator: MediaConcatenator | None = None,
-        subtitle_joiner: SubtitleJoiner | None = None,
-    ) -> None:
-        self.probe = probe or MediaProbe()
-
-        self.concatenator = (
-            concatenator
-            or MediaConcatenator(
-                probe=self.probe,
-            )
+        *,
+        ffmpeg="ffmpeg",
+        ffprobe="ffprobe",
+        progress_callback=None,
+        cancellation_callback=None,
+    ):
+        self.ff = FFmpeg(
+            ffmpeg=ffmpeg,
+            ffprobe=ffprobe,
+            progress_callback=progress_callback,
+            cancellation_callback=cancellation_callback,
         )
 
-        self.subtitle_joiner = (
-            subtitle_joiner
-            or SubtitleJoiner()
+        self.subtitles = SubtitleManager(
+            self.ff
         )
 
     def join(
         self,
-        parts: Sequence[MediaPart],
-        output_video: str | Path,
-        *,
-        subtitle_outputs: Mapping[str, str | Path] | None = None,
-        reencode: bool = False,
-        encode_options: EncodeOptions | None = None,
-        overwrite: bool = True,
-        progress_callback: ProgressCallback | None = None,
+        inputs: Sequence[str | Path],
+        output: str | Path,
+        settings: JoinerSettings | None = None,
     ) -> JoinResult:
-        if len(parts) < 2:
-            raise MediaValidationError(
-                "At least two media parts are required."
+
+        settings = settings or JoinerSettings()
+
+        settings.validate()
+
+        paths = tuple(
+            Path(path)
+            for path in inputs
+        )
+
+        if not paths:
+            raise ValueError(
+                "At least one input is required."
             )
 
-        output_video = (
-            Path(output_video)
-            .expanduser()
-            .resolve()
+        for path in paths:
+            self.ff.validate_input(path)
+
+        output = Path(output)
+
+        self.ff.validate_output(
+            paths[0],
+            output,
+            settings.overwrite,
         )
 
-        durations = tuple(
-            self.probe.duration(part.video)
-            for part in parts
+        duration = sum(
+            self.ff.duration(path)
+            for path in paths
         )
 
-        videos = [
-            Path(part.video)
-            for part in parts
-        ]
-
-        output_video_result = self.concatenator.concatenate(
-            videos,
-            output_video,
-            reencode=reencode,
-            encode_options=encode_options,
-            overwrite=overwrite,
-            progress_callback=progress_callback,
+        concat_file = self.ff.temporary_path(
+            ".txt"
         )
 
-        languages = self._languages(parts)
+        try:
+            concat_file.write_text(
+                "\n".join(
+                    self._concat_line(path)
+                    for path in paths
+                ),
+                encoding="utf-8",
+            )
 
-        requested_outputs = (
-            dict(subtitle_outputs or {})
-        )
+            temp = self.ff.temporary_path(
+                output.suffix or ".mp4"
+            )
 
-        subtitle_results: dict[str, Path] = {}
+            command = [
+                self.ff.ffmpeg,
+                "-hide_banner",
+                "-y",
+                "-nostdin",
 
-        for language in languages:
-            paths = [
-                part.subtitles.get(language)
-                for part in parts
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+
+                "-i",
+                str(concat_file),
+
+                "-map",
+                "0:v:0?",
+                "-map",
+                "0:a?",
+                "-sn",
+                "-dn",
             ]
 
-            output = requested_outputs.get(language)
+            if settings.video_mode == "fast_copy":
+                command += [
+                    "-c:v",
+                    "copy",
+                ]
+            else:
+                command += [
+                    "-c:v",
+                    settings.video_codec,
+                    "-preset",
+                    settings.preset,
+                    "-crf",
+                    str(settings.crf),
+                    "-pix_fmt",
+                    settings.pixel_format,
+                ]
 
-            if output is None:
-                output = self._default_subtitle_output(
-                    output_video,
-                    language,
-                )
+            if settings.audio_mode == "fast_copy":
+                command += [
+                    "-c:a",
+                    "copy",
+                ]
+            else:
+                command += [
+                    "-c:a",
+                    settings.audio_codec,
+                    "-b:a",
+                    settings.audio_bitrate,
+                ]
 
-            output = Path(output).expanduser().resolve()
+            if (
+                settings.faststart
+                and output.suffix.lower()
+                in {".mp4", ".m4v", ".mov"}
+            ):
+                command += [
+                    "-movflags",
+                    "+faststart",
+                ]
 
-            subtitle_result = self.subtitle_joiner.join(
-                paths,
-                durations,
-                output,
-                overwrite=overwrite,
+            command.append(str(temp))
+
+            self.ff.run(
+                command,
+                message="Joining media",
+                duration=duration,
             )
 
-            subtitle_results[language] = subtitle_result
+            self.ff.atomic_replace(
+                temp,
+                output,
+            )
 
-        return JoinResult(
-            video=output_video_result,
-            subtitles=subtitle_results,
-            durations=durations,
-            total_duration=sum(durations),
-            reencoded=(
-                reencode
-                or not self.concatenator.can_stream_copy(
-                    [
-                        self.probe.inspect(part.video)
-                        for part in parts
-                    ]
+            if settings.join_subtitles:
+                self._join_sidecar_subtitles(
+                    paths,
+                    output,
+                    settings,
                 )
-            ),
-        )
+
+            return JoinResult(
+                inputs=paths,
+                output=output,
+                duration=duration,
+            )
+
+        finally:
+            self.ff.cleanup()
 
     @staticmethod
-    def _languages(
-        parts: Sequence[MediaPart],
-    ) -> set[str]:
-        languages: set[str] = set()
-
-        for part in parts:
-            languages.update(part.subtitles.keys())
-
-        return languages
-
-    @staticmethod
-    def _default_subtitle_output(
-        video: Path,
-        language: str,
-    ) -> Path:
-        return video.with_name(
-            f"{video.stem}.{language}.srt"
+    def _concat_line(path: Path) -> str:
+        value = str(
+            path.resolve()
+        ).replace(
+            "'",
+            "'\\''",
         )
+
+        return f"file '{value}'"
+
+    def _join_sidecar_subtitles(
+        self,
+        inputs,
+        output,
+        settings,
+    ):
+        groups = {}
+
+        for path in inputs:
+            tracks = self.subtitles.discover(
+                path
+            )
+
+            tracks = self.subtitles.filter(
+                tracks,
+                settings.subtitle,
+            )
+
+            for track in tracks:
+                if track.embedded:
+                    continue
+
+                key = (
+                    track.language
+                    or "und"
+                )
+
+                groups.setdefault(
+                    key,
+                    [],
+                ).append(
+                    track.source
+                )
+
+        for language, tracks in groups.items():
+            if len(tracks) != len(inputs):
+                continue
+
+            subtitle_output = output.with_name(
+                f"{output.stem}."
+                f"{language}"
+                f"{tracks[0].suffix}"
+            )
+
+            self.subtitles.join(
+                tracks,
+                subtitle_output,
+                settings.subtitle,
+            )

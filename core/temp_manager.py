@@ -29,14 +29,12 @@ def cleanup_veyra_temp() -> None:
         return
 
     try:
-
         shutil.rmtree(
             APP_TEMP_DIR,
             ignore_errors=True,
         )
 
     except Exception as exc:
-
         print(
             f"Failed to clean Veyra temporary files: {exc}"
         )
@@ -48,7 +46,6 @@ def initialize_veyra_temp() -> str:
     and create a fresh Veyra temporary directory.
     """
 
-    # Remove leftovers from a previous crash/session.
     cleanup_veyra_temp()
 
     os.makedirs(
@@ -88,7 +85,6 @@ def create_temp_file(
 
     filepath = temp_file.name
 
-    # Close it immediately so other libraries can use it.
     temp_file.close()
 
     return filepath
@@ -119,25 +115,38 @@ def create_temp_directory(
 # ==============================================================
 # DELETE SPECIFIC TEMP FILE
 # ==============================================================
-
 def remove_temp_file(
     filepath: Optional[str],
 ) -> None:
     """
-    Safely remove a temporary file.
+    Safely remove a file only when it belongs to Veyra's
+    temporary directory.
+
+    Files outside /tmp/veyra are NEVER deleted.
     """
 
     if not filepath:
         return
 
     try:
+        filepath = os.path.realpath(
+            os.path.abspath(filepath)
+        )
+
+        temp_dir = os.path.realpath(
+            os.path.abspath(APP_TEMP_DIR)
+        )
+
+        # File must be inside /tmp/veyra.
+        if os.path.commonpath(
+            [filepath, temp_dir]
+        ) != temp_dir:
+            return
 
         if os.path.isfile(filepath):
-
             os.remove(filepath)
 
-    except OSError:
-
+    except (OSError, ValueError):
         pass
 
 

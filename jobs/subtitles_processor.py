@@ -43,6 +43,8 @@ class SubtitleJobProcessor:
         source_language: str = "en",
         target_language: Optional[str] = None,
         subtitle_format: str = "srt",
+        vad_mode: str = "silero",
+        audio_source: str = "wav",
         progress_callback: Optional[Callable[..., None]] = None,
         error_callback: Optional[Callable[[Any], None]] = None,
         overwrite_callback: Optional[Callable[[str, str], bool]] = None,
@@ -54,11 +56,43 @@ class SubtitleJobProcessor:
         self.source_language = source_language
         self.target_language = target_language
         self.subtitle_format = subtitle_format
+        self.audio_source = (
+            str(audio_source or "wav")
+            .strip()
+            .lower()
+        )
 
-        self.progress_callback = progress_callback
-        self.error_callback = error_callback
+        if self.audio_source not in {
+            "wav",
+            "video",
+        }:
+            raise ValueError(
+                "Unsupported audio source: "
+                f"{self.audio_source}. "
+                "Valid sources are: wav, video, auto"
+            )
+
+        self.vad_mode = (
+            str(vad_mode or "silero")
+            .strip()
+            .lower()
+        )
+
+        valid_vad_modes = {
+            "silero",
+            "fixed",
+        }
+
+        if self.vad_mode not in valid_vad_modes:
+            raise ValueError(
+                "Invalid vad_mode. "
+                "Expected 'silero' or 'fixed'."
+            )
         self.overwrite_callback = overwrite_callback
         self.translate_callback = translate_callback
+        self.progress_callback = progress_callback
+        self.error_callback = error_callback
+
 
         self.cancelled = False
 
@@ -354,6 +388,8 @@ class SubtitleJobProcessor:
             source_language=self.source_language,
             target_language=self.target_language,
             subtitle_format=self.subtitle_format,
+            vad_mode=self.vad_mode,
+            audio_source=self.audio_source,
             progress_callback=self.progress_callback,
             error_callback=self.error_callback,
             overwrite_callback=self.should_overwrite,
@@ -499,6 +535,8 @@ def process(
     source_language: str = "en",
     target_language: Optional[str] = None,
     subtitle_format: str = "srt",
+    vad_mode: str = "silero",
+    audio_source: str = "wav",
     progress_callback: Optional[Callable[..., None]] = None,
     error_callback: Optional[Callable[[Any], None]] = None,
     overwrite_callback: Optional[
@@ -518,6 +556,8 @@ def process(
         source_language=source_language,
         target_language=target_language,
         subtitle_format=subtitle_format,
+        vad_mode=vad_mode,
+        audio_source=audio_source,
         progress_callback=progress_callback,
         error_callback=error_callback,
         overwrite_callback=overwrite_callback,
