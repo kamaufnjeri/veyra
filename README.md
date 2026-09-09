@@ -6,7 +6,15 @@ Veyra is a local Python-based media application built around three separate tool
 - **Media Download** — download videos, playlists, audio, or subtitles using [`yt-dlp`](https://github.com/yt-dlp/yt-dlp).
 - **Media Processing** — convert, cut, join, and burn subtitles into media.
 
-Veyra is an opinionated personal project designed around a specific media workflow. It is **not intended to be a universal media-processing solution**.
+## About
+
+Veyra is an opinionated personal media project built around how I personally work with media.
+
+It is **not designed to be a universal media-processing solution**. Instead, it focuses on the workflows, tools, and features that fit my needs and the way I prefer to manage and process media.
+
+The goal is to keep Veyra **tailored, practical, and useful for my specific use cases**, rather than trying to support every possible media workflow.
+
+Because of this, some design decisions may be highly specific to my preferences — and that's intentional.
 
 ---
 
