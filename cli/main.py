@@ -17,7 +17,7 @@ from PySide6.QtWidgets import (
 )
 
 from cli.ui.subtitle_page import SubtitlePage
-from cli.ui.media_download_page import VideoDownloadPage
+from cli.ui.media_download_page import MediaDownloadPage
 from cli.ui.media_engine_page import MediaEnginePage
 
 from core.temp_manager import (
@@ -177,7 +177,7 @@ class VeyraWindow(QMainWindow):
         )
 
         self.download_button = self._create_navigation_button(
-            "Video Download",
+            "Media Download",
             "VD",
             1,
         )
@@ -246,8 +246,8 @@ class VeyraWindow(QMainWindow):
 
         self.subtitle_page = SubtitlePage()
 
-        self.video_download_page = (
-            VideoDownloadPage()
+        self.media_download_page = (
+            MediaDownloadPage()
         )
 
         self.media_processing_page = (
@@ -263,7 +263,7 @@ class VeyraWindow(QMainWindow):
         )
 
         self.pages.addWidget(
-            self.video_download_page
+            self.media_download_page
         )
 
         self.pages.addWidget(

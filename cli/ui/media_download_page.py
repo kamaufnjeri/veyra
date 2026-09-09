@@ -2273,7 +2273,7 @@ class QueueItem:
 # MAIN PAGE
 # ============================================================
 
-class VideoDownloadPage(QWidget):
+class MediaDownloadPage(QWidget):
 
     download_requested = Signal(dict)
     cancel_requested = Signal()
