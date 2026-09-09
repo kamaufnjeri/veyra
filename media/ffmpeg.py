@@ -1,417 +1,767 @@
 from __future__ import annotations
 
+import os
+import subprocess
+import time
 from pathlib import Path
+from typing import Callable, Sequence
+import threading
 
-from .ffmpeg import FFmpeg
-from .models import BurnResult, BurnerSettings
+
+from .temp import create_temp_file, remove_temp_file
 
 
-class SubtitleBurner:
+# ============================================================
+# ERRORS
+# ============================================================
+
+
+class FFmpegError(Exception):
+    """Raised when FFmpeg fails."""
+
+
+class FFmpegCancelled(FFmpegError):
+    """Raised when an FFmpeg operation is cancelled."""
+
+
+# ============================================================
+# CALLBACKS
+# ============================================================
+
+
+ProgressCallback = Callable[[float], None]
+CancellationCallback = Callable[[], bool]
+
+
+# ============================================================
+# FFMPEG
+# ============================================================
+
+
+class FFmpeg:
     """
-    Burns subtitles permanently into a video.
+    Lightweight FFmpeg process wrapper.
 
-    Notes:
-    - Subtitle burning always requires video re-encoding.
-    - Audio is copied when possible to reduce processing time.
-    - CPU encoding is deliberately limited to reduce system load.
-    - ASS/SSA styling is preserved unless the user explicitly
-      provides style overrides.
+    FFprobe is intentionally handled separately by FFProbe.
+
+    This class is responsible only for:
+
+        - FFmpeg execution
+        - validation
+        - progress
+        - cancellation
+        - temporary files
+        - atomic replacement
+        - cleanup
+
+    Progress is read from FFmpeg's machine-readable:
+
+        -progress pipe:1
+
+    output rather than parsing human-readable FFmpeg status lines.
     """
+
+    MAX_OUTPUT_LINES = 100
 
     def __init__(
         self,
         *,
-        ffmpeg="ffmpeg",
-        ffprobe="ffprobe",
-        progress_callback=None,
-        cancellation_callback=None,
-    ):
-        self.ff = FFmpeg(
-            ffmpeg=ffmpeg,
-            ffprobe=ffprobe,
-            progress_callback=progress_callback,
-            cancellation_callback=cancellation_callback,
+        ffmpeg: str = "ffmpeg",
+        progress_callback: ProgressCallback | None = None,
+        cancellation_callback: CancellationCallback | None = None,
+    ) -> None:
+
+        if not ffmpeg:
+            raise ValueError(
+                "ffmpeg executable cannot be empty."
+            )
+
+        self.ffmpeg = str(ffmpeg)
+
+        self.progress_callback = progress_callback
+
+        self.cancellation_callback = (
+            cancellation_callback
         )
 
+        self._process: subprocess.Popen[str] | None = None
+
+        self._temporary_files: set[Path] = set()
+
     # ========================================================
-    # BURN
+    # VALIDATION
     # ========================================================
 
-    def burn(
-        self,
-        video: str | Path,
-        subtitle: str | Path,
+    @staticmethod
+    def validate_input(
+        path: str | Path,
+    ) -> Path:
+
+        path = Path(path).expanduser()
+
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Input does not exist: {path}"
+            )
+
+        if not path.is_file():
+            raise ValueError(
+                f"Input is not a file: {path}"
+            )
+
+        if not os.access(path, os.R_OK):
+            raise PermissionError(
+                f"Input is not readable: {path}"
+            )
+
+        return path
+
+    @staticmethod
+    def validate_output(
+        source: str | Path | None,
         output: str | Path,
-        settings: BurnerSettings | None = None,
-    ) -> BurnResult:
+        overwrite: bool = False,
+    ) -> Path:
 
-        settings = settings or BurnerSettings()
-        settings.validate()
+        output = Path(output).expanduser()
 
-        video = Path(video)
-        subtitle = Path(subtitle)
-        output = Path(output)
+        if not str(output):
+            raise ValueError(
+                "Output path cannot be empty."
+            )
 
-        # ----------------------------------------------------
-        # VALIDATE INPUTS
-        # ----------------------------------------------------
+        if source is not None:
+            source = Path(source).expanduser()
 
-        self.ff.validate_input(video)
-        self.ff.validate_input(subtitle)
+            try:
+                if output.resolve() == source.resolve():
+                    raise ValueError(
+                        "Output cannot be the same as input."
+                    )
+            except OSError:
+                if output.absolute() == source.absolute():
+                    raise ValueError(
+                        "Output cannot be the same as input."
+                    )
 
-        self.ff.validate_output(
-            video,
-            output,
-            settings.overwrite,
+        output.parent.mkdir(
+            parents=True,
+            exist_ok=True,
         )
 
-        # ----------------------------------------------------
-        # DURATION
-        # ----------------------------------------------------
+        if not output.parent.is_dir():
+            raise NotADirectoryError(
+                f"Output parent is not a directory: "
+                f"{output.parent}"
+            )
 
-        duration = self.ff.duration(video)
-
-        # ----------------------------------------------------
-        # TEMPORARY OUTPUT
-        # ----------------------------------------------------
-
-        temp = self.ff.temporary_path(
-            output.suffix or ".mp4"
-        )
-
-        # ----------------------------------------------------
-        # SUBTITLE FILTER
-        # ----------------------------------------------------
-
-        subtitle_filter = self._subtitle_filter(
-            subtitle,
-            settings,
-        )
-
-        # ----------------------------------------------------
-        # BASE COMMAND
-        # ----------------------------------------------------
-
-        command = [
-            self.ff.ffmpeg,
-
-            "-hide_banner",
-            "-y",
-            "-nostdin",
-
-            # Input
-            "-i",
-            str(video),
-
-            # Burn subtitles
-            "-vf",
-            subtitle_filter,
-
-            # Video stream
-            "-map",
-            "0:v:0?",
-
-            # Audio streams, if present
-            "-map",
-            "0:a?",
-        ]
-
-        # ----------------------------------------------------
-        # VIDEO
-        #
-        # Burning subtitles requires video encoding.
-        #
-        # We deliberately limit the number of CPU threads.
-        # This prevents FFmpeg from consuming the entire CPU
-        # and making the application/system appear frozen.
-        # ----------------------------------------------------
-
-        command += [
-            "-c:v",
-            settings.video_codec,
-
-            "-preset",
-            settings.preset,
-
-            "-crf",
-            str(settings.crf),
-
-            "-pix_fmt",
-            settings.pixel_format,
-
-            # Keep CPU usage under control.
-            "-threads",
-            "2",
-        ]
-
-        # ----------------------------------------------------
-        # AUDIO
-        # ----------------------------------------------------
-
-        if settings.audio_mode == "fast_copy":
-            command += [
-                "-c:a",
-                "copy",
-            ]
-        else:
-            command += [
-                "-c:a",
-                settings.audio_codec,
-
-                "-b:a",
-                settings.audio_bitrate,
-            ]
-
-        # ----------------------------------------------------
-        # FASTSTART
-        # ----------------------------------------------------
-
-        if (
-            settings.faststart
-            and output.suffix.lower()
-            in {".mp4", ".m4v", ".mov"}
+        if not os.access(
+            output.parent,
+            os.W_OK,
         ):
-            command += [
-                "-movflags",
-                "+faststart",
-            ]
-
-        # ----------------------------------------------------
-        # OUTPUT
-        # ----------------------------------------------------
-
-        command.append(str(temp))
-
-        # ----------------------------------------------------
-        # RUN
-        # ----------------------------------------------------
-
-        try:
-            self.ff.run(
-                command,
-                message="Burning subtitles",
-                duration=duration,
+            raise PermissionError(
+                f"Output directory is not writable: "
+                f"{output.parent}"
             )
 
-            # ------------------------------------------------
-            # ATOMIC REPLACE
-            # ------------------------------------------------
+        if output.exists():
 
-            self.ff.atomic_replace(
-                temp,
-                output,
-            )
+            if output.is_dir():
+                raise IsADirectoryError(
+                    f"Output path is a directory: {output}"
+                )
 
-            return BurnResult(
-                source=video,
-                subtitle=subtitle,
-                output=output,
-                duration=duration,
-            )
+            if not overwrite:
+                raise FileExistsError(
+                    f"Output already exists: {output}"
+                )
 
-        finally:
-            self.ff.cleanup()
+        return output
 
     # ========================================================
-    # SUBTITLE FILTER
+    # TEMPORARY FILES
     # ========================================================
 
-    @staticmethod
-    def _subtitle_filter(
-        subtitle: Path,
-        settings: BurnerSettings,
-    ) -> str:
-        """
-        Build the FFmpeg subtitles filter.
+    def temporary_path(
+        self,
+        suffix: str = "",
+    ) -> Path:
 
-        ASS/SSA files normally contain their own styling.
-        We preserve that styling unless the user has selected
-        explicit font/size/color overrides.
+        if suffix and not suffix.startswith("."):
+            suffix = f".{suffix}"
 
-        SRT/VTT/etc. can also receive force_style options.
-        """
-
-        path = SubtitleBurner._escape_filter_path(
-            subtitle
+        path = Path(
+            create_temp_file(
+                suffix=suffix,
+                prefix="veyra_",
+                delete=False,
+            )
         )
 
-        options: list[str] = []
+        # FFmpeg needs to create the file itself.
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
 
-        # ----------------------------------------------------
-        # FONT
-        # ----------------------------------------------------
-
-        if settings.subtitle_font:
-            font = str(settings.subtitle_font)
-
-            # Escape characters that could interfere with
-            # FFmpeg's filter parser.
-            font = (
-                font
-                .replace("\\", r"\\")
-                .replace(",", r"\,")
-                .replace("'", r"\'")
-            )
-
-            options.append(
-                f"FontName={font}"
-            )
-
-        # ----------------------------------------------------
-        # FONT SIZE
-        # ----------------------------------------------------
-
-        if settings.subtitle_font_size:
-            options.append(
-                f"FontSize={settings.subtitle_font_size}"
-            )
-
-        # ----------------------------------------------------
-        # COLOR
-        # ----------------------------------------------------
-
-        if settings.subtitle_color:
-            ass_color = SubtitleBurner._to_ass_color(
-                settings.subtitle_color
-            )
-
-            options.append(
-                f"PrimaryColour={ass_color}"
-            )
-
-        # ----------------------------------------------------
-        # BUILD FILTER
-        # ----------------------------------------------------
-
-        if options:
-            force_style = ",".join(options)
-
-            return (
-                f"subtitles='{path}':"
-                f"force_style='{force_style}'"
-            )
-
-        return f"subtitles='{path}'"
-
-    # ========================================================
-    # PATH ESCAPING
-    # ========================================================
-
-    @staticmethod
-    def _escape_filter_path(
-        subtitle: Path,
-    ) -> str:
-        """
-        Escape a subtitle path for FFmpeg's filter parser.
-
-        This is particularly important on Windows where paths
-        commonly contain drive letters such as C:\\.
-        """
-
-        path = str(subtitle.resolve())
-
-        path = path.replace("\\", "/")
-
-        # FFmpeg filter syntax treats ':' specially.
-        path = path.replace(":", r"\:")
-
-        # Protect single quotes.
-        path = path.replace("'", r"\'")
+        self._temporary_files.add(path)
 
         return path
 
     # ========================================================
-    # COLOR CONVERSION
+    # COMMAND
     # ========================================================
 
     @staticmethod
-    def _to_ass_color(
-        color: str,
-    ) -> str:
+    def _prepare_command(
+        command: Sequence[str],
+    ) -> list[str]:
+
+        if not command:
+            raise ValueError(
+                "FFmpeg command cannot be empty."
+            )
+
+        command = [
+            str(part)
+            for part in command
+        ]
+
+        if not command[0]:
+            raise ValueError(
+                "FFmpeg executable cannot be empty."
+            )
+
+        return command
+
+    @staticmethod
+    def _add_progress_output(
+        command: Sequence[str],
+    ) -> list[str]:
+
+        command = [
+            str(part)
+            for part in command
+        ]
+
+        if "-progress" in command:
+            return command
+
+        return [
+            command[0],
+            "-nostats",
+            "-progress",
+            "pipe:1",
+            *command[1:],
+        ]
+
+
+    # ========================================================
+    # RUN
+    # ========================================================
+
+    def run(
+        self,
+        command: Sequence[str],
+        *,
+        message: str | None = None,
+        duration: float | None = None,
+    ) -> None:
         """
-        Convert common user-facing colors into ASS/SSA color
-        notation.
+        Execute FFmpeg.
 
-        ASS uses:
-            &HAABBGGRR
+        When duration is supplied, progress is calculated from
+        FFmpeg's machine-readable progress output.
 
-        The AA component is kept at 00 (opaque).
+        The callback receives a value between:
+
+            0.0 and 1.0
         """
 
-        value = str(color).strip().lower()
+        command = self._prepare_command(command)
 
-        # ----------------------------------------------------
-        # Common named colors
-        # ----------------------------------------------------
+        self._check_cancelled()
 
-        named_colors = {
-            "white": "FFFFFF",
-            "black": "000000",
-            "red": "FF0000",
-            "green": "00FF00",
-            "blue": "0000FF",
-            "yellow": "FFFF00",
-            "cyan": "00FFFF",
-            "magenta": "FF00FF",
-            "orange": "FFA500",
-            "purple": "800080",
-            "gray": "808080",
-            "grey": "808080",
-        }
+        if message:
+            self._emit_message(message)
 
-        if value in named_colors:
-            value = named_colors[value]
+        self._emit_progress(0.0)
 
-        # ----------------------------------------------------
-        # #RRGGBB
-        # ----------------------------------------------------
+        started = time.monotonic()
 
-        elif value.startswith("#"):
-            value = value[1:]
+        process: subprocess.Popen[str] | None = None
 
-        # ----------------------------------------------------
-        # RRGGBB
-        # ----------------------------------------------------
+        output_lines: list[str] = []
 
-        elif len(value) == 6:
-            value = value
-
-        # ----------------------------------------------------
-        # Already ASS format
-        # ----------------------------------------------------
-
-        elif value.startswith("&h"):
-            return value.upper()
-
-        # ----------------------------------------------------
-        # Invalid color
-        # ----------------------------------------------------
-
-        else:
-            # Fall back to white rather than generating an
-            # invalid FFmpeg filter.
-            value = "FFFFFF"
-
-        # ----------------------------------------------------
-        # Validate RGB
-        # ----------------------------------------------------
-
-        if len(value) != 6:
-            value = "FFFFFF"
+        last_progress = 0.0
 
         try:
-            int(value, 16)
+
+            command = self._add_progress_output(
+                command
+            )
+
+            try:
+                process = subprocess.Popen(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                )
+
+            except FileNotFoundError as exc:
+                raise FFmpegError(
+                    f"FFmpeg was not found: {command[0]}"
+                ) from exc
+
+            except PermissionError as exc:
+                raise FFmpegError(
+                    f"FFmpeg executable is not executable: "
+                    f"{command[0]}"
+                ) from exc
+
+            except OSError as exc:
+                raise FFmpegError(
+                    f"Unable to start FFmpeg: {exc}"
+                ) from exc
+
+            self._process = process
+
+            stdout = process.stdout
+            stderr = process.stderr
+
+            if stdout is None:
+                raise FFmpegError(
+                    "FFmpeg did not provide progress output."
+                )
+
+            if stderr is None:
+                raise FFmpegError(
+                    "FFmpeg did not provide diagnostic output."
+                )
+
+            # ------------------------------------------------
+            # IMPORTANT
+            # ------------------------------------------------
+            #
+            # stdout contains:
+            #
+            #     out_time_ms=...
+            #     speed=...
+            #     progress=continue
+            #
+            # stderr contains normal FFmpeg diagnostics.
+            #
+            # We read both streams concurrently so that neither
+            # pipe can fill up and block FFmpeg.
+            # ------------------------------------------------
+
+            stderr_lines: list[str] = []
+
+            stderr_thread = threading.Thread(
+
+                target=self._collect_stderr,
+                args=(
+                    stderr,
+                    stderr_lines,
+                ),
+                daemon=True,
+            )
+
+            stderr_thread.start()
+
+            for raw_line in stdout:
+
+                self._check_cancelled(
+                    terminate=True
+                )
+
+                line = raw_line.strip()
+
+                if not line:
+                    continue
+
+                progress = self._parse_machine_progress(
+                    line,
+                    duration,
+                )
+
+                if progress is not None:
+
+                    if progress >= last_progress:
+                        last_progress = progress
+
+                        self._emit_progress(
+                            progress
+                        )
+
+            return_code = process.wait()
+
+            stderr_thread.join(
+                timeout=2.0
+            )
+
+            elapsed = (
+                time.monotonic() - started
+            )
+
+            if return_code != 0:
+
+                diagnostic = "\n".join(
+                    stderr_lines[
+                        -self.MAX_OUTPUT_LINES:
+                    ]
+                )
+
+                raise FFmpegError(
+                    self._format_error(
+                        command,
+                        return_code,
+                        diagnostic,
+                        elapsed,
+                    )
+                )
+
+            # FFmpeg completed successfully.
+            #
+            # Always force the final progress value to 1.0.
+            if last_progress < 1.0:
+                self._emit_progress(1.0)
+
+        except FFmpegCancelled:
+            raise
+
+        except KeyboardInterrupt as exc:
+            self.cancel()
+
+            raise FFmpegCancelled(
+                "FFmpeg operation was cancelled by user."
+            ) from exc
+
+        finally:
+
+            self._process = None
+
+            if process is not None:
+                self._close_process_pipes(
+                    process
+                )
+
+    # ========================================================
+    # STDERR
+    # ========================================================
+
+    @staticmethod
+    def _collect_stderr(
+        stderr,
+        output_lines: list[str],
+    ) -> None:
+        """
+        Collect FFmpeg diagnostics without blocking the main
+        progress-reading loop.
+        """
+
+        try:
+
+            for raw_line in stderr:
+
+                line = raw_line.rstrip()
+
+                if not line:
+                    continue
+
+                output_lines.append(line)
+
+                if (
+                    len(output_lines)
+                    > FFmpeg.MAX_OUTPUT_LINES
+                ):
+                    del output_lines[
+                        :-FFmpeg.MAX_OUTPUT_LINES
+                    ]
+
+        except (
+            OSError,
+            ValueError,
+        ):
+            pass
+
+    # ========================================================
+    # PROGRESS
+    # ========================================================
+
+    @staticmethod
+    def _parse_machine_progress(
+        line: str,
+        duration: float | None,
+    ) -> float | None:
+
+        if duration is None or duration <= 0:
+            return None
+
+        if not line.startswith("out_time_us="):
+            return None
+
+        try:
+            microseconds = int(
+                line.split("=", 1)[1].strip()
+            )
         except ValueError:
-            value = "FFFFFF"
+            return None
 
-        # ----------------------------------------------------
-        # RRGGBB -> BBGGRR
-        # ----------------------------------------------------
+        elapsed = microseconds / 1_000_000
 
-        red = value[0:2]
-        green = value[2:4]
-        blue = value[4:6]
+        return max(
+            0.0,
+            min(
+                1.0,
+                elapsed / duration,
+            ),
+        )
+
+
+    @staticmethod
+    def _parse_timestamp(
+        value: str,
+    ) -> float | None:
+        """
+        Parse:
+
+            HH:MM:SS.microseconds
+        """
+
+        parts = value.split(":")
+
+        if len(parts) != 3:
+            return None
+
+        try:
+
+            hours = float(parts[0])
+            minutes = float(parts[1])
+            seconds = float(parts[2])
+
+        except ValueError:
+            return None
 
         return (
-            f"&H00{blue}{green}{red}".upper()
+            hours * 3600
+            + minutes * 60
+            + seconds
+        )
+
+    def _emit_progress(
+        self,
+        progress: float,
+    ) -> None:
+
+        callback = self.progress_callback
+
+        if callback is None:
+            return
+
+        try:
+            callback(
+                max(
+                    0.0,
+                    min(
+                        1.0,
+                        float(progress),
+                    ),
+                )
+            )
+        except Exception:
+            pass
+
+    def _emit_message(
+        self,
+        message: str,
+    ) -> None:
+
+        _ = message
+
+    # ========================================================
+    # CANCELLATION
+    # ========================================================
+
+    def _is_cancelled(self) -> bool:
+
+        callback = self.cancellation_callback
+
+        if callback is None:
+            return False
+
+        try:
+            return bool(callback())
+        except Exception:
+            return False
+
+    def _check_cancelled(
+        self,
+        *,
+        terminate: bool = False,
+    ) -> None:
+
+        if not self._is_cancelled():
+            return
+
+        if terminate:
+            self.cancel()
+
+        raise FFmpegCancelled(
+            "FFmpeg operation was cancelled."
+        )
+
+    def cancel(self) -> None:
+
+        process = self._process
+
+        if process is None:
+            return
+
+        if process.poll() is not None:
+            return
+
+        try:
+
+            process.terminate()
+
+            try:
+                process.wait(
+                    timeout=3.0
+                )
+
+            except subprocess.TimeoutExpired:
+
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+
+                try:
+                    process.wait(
+                        timeout=3.0
+                    )
+                except subprocess.TimeoutExpired:
+                    pass
+
+        except OSError:
+            pass
+
+        finally:
+
+            self._close_process_pipes(
+                process
+            )
+
+    @staticmethod
+    def _close_process_pipes(
+        process: subprocess.Popen[str],
+    ) -> None:
+
+        for pipe in (
+            process.stdout,
+            process.stdin,
+            process.stderr,
+        ):
+            if pipe is None:
+                continue
+
+            try:
+                pipe.close()
+            except (
+                OSError,
+                ValueError,
+            ):
+                pass
+
+    # ========================================================
+    # ATOMIC OUTPUT
+    # ========================================================
+
+    def atomic_replace(
+        self,
+        source: str | Path,
+        destination: str | Path,
+    ) -> None:
+
+        source = Path(source)
+        destination = Path(destination)
+
+        if not source.exists():
+            raise FileNotFoundError(
+                f"Temporary output does not exist: {source}"
+            )
+
+        if not source.is_file():
+            raise ValueError(
+                f"Temporary output is not a file: {source}"
+            )
+
+        destination.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        os.replace(
+            source,
+            destination,
+        )
+
+        self._temporary_files.discard(
+            source
+        )
+
+    # ========================================================
+    # CLEANUP
+    # ========================================================
+
+    def cleanup(self) -> None:
+
+        if self._process is not None:
+            self.cancel()
+
+        for path in tuple(
+            self._temporary_files
+        ):
+            remove_temp_file(
+                str(path)
+            )
+
+        self._temporary_files.clear()
+
+    # ========================================================
+    # ERROR
+    # ========================================================
+
+    @staticmethod
+    def _format_error(
+        command: Sequence[str],
+        return_code: int,
+        output: str,
+        elapsed: float,
+    ) -> str:
+
+        command_text = " ".join(
+            str(part)
+            for part in command
+        )
+
+        diagnostic = (
+            output.strip()
+            or "No diagnostic output."
+        )
+
+        return (
+            f"FFmpeg failed "
+            f"(exit code {return_code}) "
+            f"after {elapsed:.2f}s.\n\n"
+            f"Command:\n"
+            f"{command_text}\n\n"
+            f"Output:\n"
+            f"{diagnostic}"
         )

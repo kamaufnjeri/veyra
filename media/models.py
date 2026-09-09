@@ -163,7 +163,7 @@ class ConverterSettings(MediaSettings):
     keep_metadata: bool = True
 
     def validate(self) -> None:
-        super().validate()
+        MediaSettings.validate(self)
 
         allowed_formats = {
             "mp4",

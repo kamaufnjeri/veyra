@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .ffmpeg import FFmpeg
+from .ffprobe import FFProbe
 from .models import (
     ConvertResult,
     ConverterSettings,
@@ -14,16 +15,19 @@ class MediaConverter:
     def __init__(
         self,
         *,
-        ffmpeg="ffmpeg",
-        ffprobe="ffprobe",
+        ffmpeg: str = "ffmpeg",
+        ffprobe: str = "ffprobe",
         progress_callback=None,
         cancellation_callback=None,
     ):
         self.ff = FFmpeg(
             ffmpeg=ffmpeg,
-            ffprobe=ffprobe,
             progress_callback=progress_callback,
             cancellation_callback=cancellation_callback,
+        )
+
+        self.ffprobe = FFProbe(
+            executable=ffprobe
         )
 
     def convert(
@@ -34,13 +38,12 @@ class MediaConverter:
     ) -> ConvertResult:
 
         settings = settings or ConverterSettings()
+
         settings.validate()
 
         source = Path(input_path)
-        output = Path(output_path)
 
-        # Output format is controlled by ConverterSettings.
-        output = output.with_suffix(
+        output = Path(output_path).with_suffix(
             f".{settings.output_format.lstrip('.')}"
         )
 
@@ -52,13 +55,16 @@ class MediaConverter:
             settings.overwrite,
         )
 
-        duration = self.ff.duration(source)
+        duration = self.ffprobe.duration(
+            source
+        )
 
         temp = self.ff.temporary_path(
             output.suffix or ".tmp"
         )
 
         try:
+
             command = [
                 self.ff.ffmpeg,
                 "-hide_banner",
@@ -79,11 +85,14 @@ class MediaConverter:
             # ------------------------------------------------
 
             if settings.keep_subtitles:
+
                 command += [
                     "-map",
                     "0:s?",
                 ]
+
             else:
+
                 command += [
                     "-sn",
                 ]
@@ -92,27 +101,24 @@ class MediaConverter:
             # METADATA
             # ------------------------------------------------
 
-            if settings.keep_metadata:
-                command += [
-                    "-map_metadata",
-                    "0",
-                ]
-            else:
-                command += [
-                    "-map_metadata",
-                    "-1",
-                ]
+            command += [
+                "-map_metadata",
+                "0" if settings.keep_metadata else "-1",
+            ]
 
             # ------------------------------------------------
             # VIDEO
             # ------------------------------------------------
 
             if settings.video_mode == "fast_copy":
+
                 command += [
                     "-c:v",
                     "copy",
                 ]
+
             else:
+
                 command += [
                     "-c:v",
                     settings.video_codec,
@@ -129,11 +135,14 @@ class MediaConverter:
             # ------------------------------------------------
 
             if settings.audio_mode == "fast_copy":
+
                 command += [
                     "-c:a",
                     "copy",
                 ]
+
             else:
+
                 command += [
                     "-c:a",
                     settings.audio_codec,
@@ -146,10 +155,36 @@ class MediaConverter:
             # ------------------------------------------------
 
             if settings.keep_subtitles:
-                command += [
-                    "-c:s",
-                    "copy",
-                ]
+
+                output_format = output.suffix.lower()
+
+                if output_format in {
+                    ".mp4",
+                    ".m4v",
+                    ".mov",
+                }:
+
+                    command += [
+                        "-c:s",
+                        "mov_text",
+                    ]
+
+                elif output_format in {
+                    ".mkv",
+                    ".webm",
+                }:
+
+                    command += [
+                        "-c:s",
+                        "ass",
+                    ]
+
+                else:
+
+                    command += [
+                        "-c:s",
+                        "copy",
+                    ]
 
             # ------------------------------------------------
             # FASTSTART
@@ -165,7 +200,9 @@ class MediaConverter:
                     "+faststart",
                 ]
 
-            command.append(str(temp))
+            command.append(
+                str(temp)
+            )
 
             self.ff.run(
                 command,

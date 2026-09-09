@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QObject, QThread, Slot
 from PySide6.QtWidgets import (
     QProgressBar,
     QCheckBox,
@@ -43,6 +43,260 @@ from jobs.media_engine_processor import (
     MediaEngineProcessor,
 )
 
+
+class MediaEngineWorker(QObject):
+    """
+    Runs MediaEngineProcessor away from the GUI thread so the UI
+    remains responsive and the Cancel button can be used.
+    """
+
+    progress = Signal(int, str)
+    error = Signal(object)
+    job_event = Signal(str, object)
+    finished = Signal(object)
+    cancelled = Signal()
+    failed = Signal(object)
+
+    def __init__(
+        self,
+        job: MediaEngineJob,
+        *,
+        ffmpeg: str,
+        ffprobe: str,
+    ) -> None:
+        super().__init__()
+
+        self.job = job
+
+        self.processor = MediaEngineProcessor(
+            ffmpeg=ffmpeg,
+            ffprobe=ffprobe,
+            progress_callback=self._on_progress,
+            error_callback=self._on_error,
+            job_callback=self._on_job,
+        )
+
+    def _on_progress(self, *args: Any) -> None:
+        if len(args) < 2:
+            return
+
+        try:
+            progress = float(args[1])
+        except (TypeError, ValueError):
+            return
+
+        percent = (
+            int(progress * 100)
+            if progress <= 1.0
+            else int(progress)
+        )
+
+        percent = max(0, min(100, percent))
+
+        message = str(args[2]) if len(args) >= 3 else ""
+
+        self.progress.emit(percent, message)
+
+
+
+    def _on_error(self, error: Any) -> None:
+        self.error.emit(error)
+
+    def _on_job(self, event: str, *args: Any) -> None:
+        self.job_event.emit(event, args)
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            result = self.processor.process(self.job)
+            self.finished.emit(result)
+
+        except JobCancelled:
+            self.cancelled.emit()
+
+        except Exception as exc:
+            self.failed.emit(exc)
+
+    def cancel(self) -> None:
+        self.processor.cancel()
+class TimeInput(QWidget):
+    """
+    Hours / minutes / seconds input.
+
+    Returns the total value as seconds.
+    """
+
+    valueChanged = Signal()
+
+    def __init__(
+        self,
+        *,
+        maximum_hours: int = 23,
+        parent: QWidget | None = None,
+    ) -> None:
+
+        super().__init__(parent)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(
+            0,
+            0,
+            0,
+            0,
+        )
+        layout.setSpacing(
+            4
+        )
+
+        self.hours = QSpinBox()
+        self.hours.setRange(
+            0,
+            maximum_hours,
+        )
+
+        self.minutes = QSpinBox()
+        self.minutes.setRange(
+            0,
+            59,
+        )
+
+        self.seconds = QDoubleSpinBox()
+        self.seconds.setRange(
+            0.0,
+            59.999,
+        )
+
+        self.seconds.setDecimals(
+            3
+        )
+
+        self.seconds.setSingleStep(
+            1.0
+        )
+
+        layout.addWidget(
+            self.hours
+        )
+
+        layout.addWidget(
+            QLabel("h")
+        )
+
+        layout.addWidget(
+            self.minutes
+        )
+
+        layout.addWidget(
+            QLabel("m")
+        )
+
+        layout.addWidget(
+            self.seconds
+        )
+
+        layout.addWidget(
+            QLabel("s")
+        )
+
+        self.hours.valueChanged.connect(
+            self._emit_changed
+        )
+
+        self.minutes.valueChanged.connect(
+            self._emit_changed
+        )
+
+        self.seconds.valueChanged.connect(
+            self._emit_changed
+        )
+
+    def _emit_changed(
+        self,
+        *_: Any,
+    ) -> None:
+
+        self.valueChanged.emit()
+
+    def value(self) -> float:
+        return (
+            self.hours.value() * 3600
+            + self.minutes.value() * 60
+            + self.seconds.value()
+        )
+
+    def setValue(
+        self,
+        total_seconds: float,
+    ) -> None:
+
+        total_seconds = max(
+            0.0,
+            float(total_seconds),
+        )
+
+        hours = int(
+            total_seconds // 3600
+        )
+
+        remainder = (
+            total_seconds
+            - hours * 3600
+        )
+
+        minutes = int(
+            remainder // 60
+        )
+
+        seconds = (
+            remainder
+            - minutes * 60
+        )
+
+        self.hours.setValue(
+            hours
+        )
+
+        self.minutes.setValue(
+            minutes
+        )
+
+        self.seconds.setValue(
+            seconds
+        )
+
+    def setMaximumHours(
+        self,
+        hours: int,
+    ) -> None:
+
+        self.hours.setMaximum(
+            hours
+        )
+
+    def setPlaceholderText(
+        self,
+        text: str,
+    ) -> None:
+        """
+        Compatibility method for code that treats TimeInput
+        like a text input.
+
+        QSpinBox and QDoubleSpinBox do not support normal
+        placeholder text, so use their special-value text
+        when their value is zero.
+        """
+
+        text = str(text).strip()
+
+        if not text:
+            self.hours.setSpecialValueText("")
+            self.minutes.setSpecialValueText("")
+            self.seconds.setSpecialValueText("")
+            return
+
+        self.hours.setSpecialValueText(text)
+        self.minutes.setSpecialValueText("")
+        self.seconds.setSpecialValueText("")
 
 # ============================================================
 # MEDIA ENGINE PAGE
@@ -132,6 +386,11 @@ class MediaEnginePage(QWidget):
             job_callback=self._on_job,
         )
 
+        self._worker_thread: QThread | None = None
+        self._worker: MediaEngineWorker | None = None
+        self._processing = False
+
+
         # ----------------------------------------------------
         # UI
         # ----------------------------------------------------
@@ -140,6 +399,83 @@ class MediaEnginePage(QWidget):
         self._connect_signals()
 
         self._update_operation_ui()
+
+    def _set_processing_state(self, processing: bool) -> None:
+        """
+        Enable/disable controls while a media job is running.
+
+        The Cancel button remains enabled while processing.
+        """
+
+        self._processing = processing
+
+        # --------------------------------------------------------
+        # Main operation controls
+        # --------------------------------------------------------
+
+        self.run_button.setEnabled(not processing)
+        self.operation_combo.setEnabled(not processing)
+
+        # --------------------------------------------------------
+        # Media controls
+        # --------------------------------------------------------
+
+        for widget in (
+            self.add_media_button,
+            self.add_srt_button,
+            self.remove_media_button,
+            self.clear_media_button,
+            self.media_list,
+            self.srt_list,
+            self.inspect_button,
+            self.work_selected_button,
+            self.work_all_button,
+            self.choose_work_button,
+            self.browse_work_button,
+            self.use_selected_subtitle_button,
+            self.browse_subtitle_button,
+            self.output_button,
+            self.output_name,
+            self.convert_output_format,
+            self.video_mode,
+            self.audio_mode,
+            self.video_codec,
+            self.audio_codec,
+            self.preset,
+            self.crf,
+            self.audio_bitrate,
+            self.pixel_format,
+            self.faststart,
+            self.overwrite,
+            self.cut_mode,
+            self.cut_duration,
+            self.cut_parts,
+            self.timestamp_input,
+            self.add_timestamp_button,
+            self.remove_timestamp_button,
+            self.clear_timestamps_button,
+            self.cut_start,
+            self.cut_end,
+            self.cut_subtitles,
+            self.join_subtitles,
+            self.burn_subtitle_combo,
+            self.burn_font,
+            self.burn_font_size,
+            self.burn_color,
+        ):
+            widget.setEnabled(not processing)
+
+        # --------------------------------------------------------
+        # Cancel
+        # --------------------------------------------------------
+
+        self.cancel_button.setEnabled(processing)
+
+        if processing:
+            self.cancel_button.setText("Cancel Process")
+        else:
+            self.cancel_button.setText("Cancel")
+
 
     # ========================================================
     # BUILD UI
@@ -884,29 +1220,15 @@ class MediaEnginePage(QWidget):
 
         layout = QFormLayout(widget)
 
-        self.cut_duration = QDoubleSpinBox()
-
-        self.cut_duration.setRange(
-            0.001,
-            86400.0,
-        )
-
-        self.cut_duration.setDecimals(
-            3
-        )
-
-        self.cut_duration.setSingleStep(
-            1.0
+        self.cut_duration = TimeInput(
+            maximum_hours=23
         )
 
         self.cut_duration.setValue(
             60.0
         )
 
-        self.cut_duration.setSuffix(
-            " seconds"
-        )
-
+       
         layout.addRow(
             "Duration:",
             self.cut_duration,
@@ -980,7 +1302,9 @@ class MediaEnginePage(QWidget):
 
         row = QHBoxLayout()
 
-        self.timestamp_input = QLineEdit()
+        self.timestamp_input = TimeInput(
+            maximum_hours=23
+        )
 
         self.timestamp_input.setPlaceholderText(
             "Example: 00:05:00 or 300"
@@ -1053,43 +1377,22 @@ class MediaEnginePage(QWidget):
 
         layout = QFormLayout(widget)
 
-        self.cut_start = QDoubleSpinBox()
-
-        self.cut_start.setRange(
-            0.0,
-            86400.0,
-        )
-
-        self.cut_start.setDecimals(
-            3
+        self.cut_start = TimeInput(
+            maximum_hours=23
         )
 
         self.cut_start.setValue(
             0.0
         )
 
-        self.cut_start.setSuffix(
-            " seconds"
-        )
-
-        self.cut_end = QDoubleSpinBox()
-
-        self.cut_end.setRange(
-            0.0,
-            86400.0,
-        )
-
-        self.cut_end.setDecimals(
-            3
+        self.cut_end = TimeInput(
+            maximum_hours=23
         )
 
         self.cut_end.setValue(
             60.0
         )
 
-        self.cut_end.setSuffix(
-            " seconds"
-        )
 
         layout.addRow(
             "Start:",
@@ -1153,13 +1456,17 @@ class MediaEnginePage(QWidget):
         self.burn_subtitle_combo = QComboBox()
 
         self.burn_font = QComboBox()
+        self.burn_font.addItem("Default", None)
+        self.burn_font.addItem("Arial", "Arial")
+        self.burn_font.addItem("Helvetica", "Helvetica")
+        self.burn_font.addItem("Tahoma", "Tahoma")
+        self.burn_font.addItem("Verdana", "Verdana")
+        self.burn_font.addItem("Trebuchet MS", "Trebuchet MS")
+        self.burn_font.addItem("DejaVu Sans", "DejaVu Sans")
+        self.burn_font.addItem("Liberation Sans", "Liberation Sans")
 
-        self.burn_font.addItems([
-            "Default",
-            "Arial",
-            "Helvetica",
-            "DejaVu Sans",
-        ])
+        self.burn_font.setCurrentText("Arial")
+
 
         self.burn_font_size = QComboBox()
 
@@ -1171,16 +1478,21 @@ class MediaEnginePage(QWidget):
             "28",
             "32",
             "36",
+            "40",
+            "44",
+            "48",
         ])
 
+        self.burn_font_size.setCurrentText("20")
         self.burn_color = QComboBox()
 
-        self.burn_color.addItems([
-            "White",
-            "Yellow",
-            "Green",
-            "Cyan",
-        ])
+        self.burn_color.addItem("White", "#FFFFFF")
+        self.burn_color.addItem("Yellow", "#FFFF00")
+        self.burn_color.addItem("Green", "#00FF00")
+        self.burn_color.addItem("Cyan", "#00FFFF")
+
+        self.burn_color.setCurrentText("White")
+
 
         layout.addRow(
             "Subtitle:",
@@ -3585,9 +3897,12 @@ class MediaEnginePage(QWidget):
 
                 subtitle_font = font_text
 
-            subtitle_color = (
-                self.burn_color.currentText()
-            )
+            subtitle_color = self.burn_color.currentData()
+
+            if not subtitle_color:
+                subtitle_color = "#FFFFFF"
+          
+
 
             settings = BurnerSettings(
                 video_codec=self.video_codec.currentText(),
@@ -3730,30 +4045,9 @@ class MediaEnginePage(QWidget):
 
     def _add_timestamp(self) -> None:
 
-        text = (
-            self.timestamp_input.text()
-            .strip()
-        )
+        seconds = self.timestamp_input.value()
 
-        if not text:
-            return
-
-        try:
-
-            seconds = (
-                self._parse_timestamp(
-                    text
-                )
-            )
-
-        except ValueError as exc:
-
-            QMessageBox.warning(
-                self,
-                "Invalid Timestamp",
-                str(exc),
-            )
-
+        if seconds < 0:
             return
 
         existing: list[float] = []
@@ -3767,7 +4061,6 @@ class MediaEnginePage(QWidget):
             )
 
             try:
-
                 existing.append(
                     float(
                         item.data(
@@ -3810,7 +4103,10 @@ class MediaEnginePage(QWidget):
 
         self._sort_timestamp_list()
 
-        self.timestamp_input.clear()
+        self.timestamp_input.setValue(
+            0.0
+        )
+
 
     def _remove_timestamp(self) -> None:
 
@@ -3966,7 +4262,6 @@ class MediaEnginePage(QWidget):
 
     def _validate_cut_range(
         self,
-        value: float,
     ) -> None:
 
         if (
@@ -3984,43 +4279,161 @@ class MediaEnginePage(QWidget):
                 ""
             )
 
+    def _worker_progress(
+        self,
+        percent: int,
+        message: str,
+    ) -> None:
+        self.progress_bar.setValue(percent)
+
+        if message:
+            self.progress_label.setText(message)
+
+    def _on_progress(
+        self,
+        *args: Any,
+    ) -> None:
+
+        if len(args) < 2:
+            return
+
+        try:
+            progress = float(args[1])
+        except (TypeError, ValueError):
+            return
+
+        if progress <= 1.0:
+            percent = int(progress * 100)
+        else:
+            percent = int(progress)
+
+        percent = max(
+            0,
+            min(100, percent),
+        )
+
+        message = ""
+
+        if len(args) >= 3:
+            message = str(args[2])
+
+        self.progress.emit(
+            percent,
+            message,
+        )
+
+
+
+
+    def _worker_error(
+        self,
+        error: Any,
+    ) -> None:
+
+        self._on_error(error)
+
+
+    def _worker_job_event(
+        self,
+        event: str,
+        args: Any,
+    ) -> None:
+
+        if isinstance(args, tuple):
+            self._on_job(event, *args)
+        else:
+            self._on_job(event)
+
+
+    def _worker_finished(
+        self,
+        result: MediaEngineJobResult,
+    ) -> None:
+
+        self.progress_bar.setValue(
+            100
+        )
+
+        self.progress_label.setText(
+            "Completed"
+        )
+
+        self._handle_completed_result(
+            result
+        )
+
+
+    def _worker_cancelled(self) -> None:
+
+        self.progress_label.setText(
+            "Cancelled"
+        )
+
+        self.progress_bar.setValue(
+            0
+        )
+
+
+    def _worker_failed(
+        self,
+        error: Any,
+    ) -> None:
+
+        self.progress_label.setText(
+            "Failed"
+        )
+
+        QMessageBox.critical(
+            self,
+            "Media Engine Error",
+            str(error),
+        )
+
+
+    def _worker_thread_finished(self) -> None:
+
+        self._set_processing_state(
+            False
+        )
+
+        if self._worker is not None:
+            self._worker.deleteLater()
+
+        if self._worker_thread is not None:
+            self._worker_thread.deleteLater()
+
+        self._worker = None
+        self._worker_thread = None
+
+
     # ========================================================
     # RUN
     # ========================================================
 
     def _run(self) -> None:
 
-        self.processor.reset_cancellation()
+        if self._processing:
+            return
 
         try:
-
             job = self._build_job()
 
         except Exception as exc:
-
             QMessageBox.warning(
                 self,
                 "Cannot Start",
                 str(exc),
             )
-
             return
 
-        # ----------------------------------------------------
-        # CONFIRM OVERWRITE
-        #
-        # For cut, output is a directory and individual output
-        # names are generated by the cutter, so don't perform
-        # the single-file existence check here.
-        # ----------------------------------------------------
+        # --------------------------------------------------------
+        # Confirm overwrite
+        # --------------------------------------------------------
 
         if (
             self.operation != "cut"
             and job.output is not None
-            and isinstance(
-                job.output,
-                Path,
-            )
+            and isinstance(job.output, Path)
             and job.output.exists()
             and not getattr(
                 job.settings,
@@ -4037,28 +4450,25 @@ class MediaEnginePage(QWidget):
                     f"{job.output}\n\n"
                     "Do you want to replace it?"
                 ),
-                QMessageBox.Yes
-                | QMessageBox.No,
+                QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )
 
             if answer != QMessageBox.Yes:
                 return
 
-        # ----------------------------------------------------
-        # CUT DIRECTORY CHECK
-        # ----------------------------------------------------
+        # --------------------------------------------------------
+        # Cut output directory
+        # --------------------------------------------------------
 
         if self.operation == "cut":
 
             if self.output_directory is None:
-
                 QMessageBox.warning(
                     self,
                     "No Output Directory",
                     "Choose an output directory first.",
                 )
-
                 return
 
             self.output_directory.mkdir(
@@ -4066,21 +4476,77 @@ class MediaEnginePage(QWidget):
                 exist_ok=True,
             )
 
-        # ----------------------------------------------------
-        # UI STATE
-        # ----------------------------------------------------
+        # --------------------------------------------------------
+        # Create worker
+        # --------------------------------------------------------
 
-        self.run_button.setEnabled(
-            False
+        self._worker_thread = QThread(self)
+
+        self._worker = MediaEngineWorker(
+            job,
+            ffmpeg=self.ffmpeg,
+            ffprobe=self.ffprobe,
         )
 
-        self.cancel_button.setEnabled(
-            True
+        self._worker.moveToThread(
+            self._worker_thread
         )
 
-        self.operation_combo.setEnabled(
-            False
+        # --------------------------------------------------------
+        # Worker signals
+        # --------------------------------------------------------
+
+        self._worker_thread.started.connect(
+            self._worker.run
         )
+
+        self._worker.progress.connect(
+            self._worker_progress
+        )
+
+        self._worker.error.connect(
+            self._worker_error
+        )
+
+        self._worker.job_event.connect(
+            self._worker_job_event
+        )
+
+        self._worker.finished.connect(
+            self._worker_finished
+        )
+
+        self._worker.cancelled.connect(
+            self._worker_cancelled
+        )
+
+        self._worker.failed.connect(
+            self._worker_failed
+        )
+
+        # --------------------------------------------------------
+        # Cleanup
+        # --------------------------------------------------------
+
+        self._worker.finished.connect(
+            self._worker_thread.quit
+        )
+
+        self._worker.cancelled.connect(
+            self._worker_thread.quit
+        )
+
+        self._worker.failed.connect(
+            self._worker_thread.quit
+        )
+
+        self._worker_thread.finished.connect(
+            self._worker_thread_finished
+        )
+
+        # --------------------------------------------------------
+        # UI
+        # --------------------------------------------------------
 
         self.progress_bar.setRange(
             0,
@@ -4095,59 +4561,10 @@ class MediaEnginePage(QWidget):
             f"Running {self.operation}..."
         )
 
-        # ----------------------------------------------------
-        # EXECUTE
-        # ----------------------------------------------------
+        self._set_processing_state(True)
 
-        try:
+        self._worker_thread.start()
 
-            result = self.processor.process(
-                job
-            )
-
-            self.progress_bar.setValue(
-                100
-            )
-
-            self.progress_label.setText(
-                "Completed"
-            )
-
-            self._handle_completed_result(
-                result
-            )
-
-        except JobCancelled:
-
-            self.progress_label.setText(
-                "Cancelled"
-            )
-
-        except Exception as exc:
-
-            self.progress_label.setText(
-                "Failed"
-            )
-
-            QMessageBox.critical(
-                self,
-                "Media Engine Error",
-                str(exc),
-            )
-
-        finally:
-
-            self.run_button.setEnabled(
-                True
-            )
-
-            self.cancel_button.setEnabled(
-                False
-            )
-
-            self.operation_combo.setEnabled(
-                True
-            )
 
     # ========================================================
     # RESULT
@@ -4240,68 +4657,44 @@ class MediaEnginePage(QWidget):
     # ========================================================
     # CANCEL
     # ========================================================
-
     def _cancel(self) -> None:
 
-        self.processor.cancel()
+        if not self._processing:
+            return
 
         self.cancel_button.setEnabled(
             False
+        )
+
+        self.cancel_button.setText(
+            "Cancelling..."
         )
 
         self.progress_label.setText(
             "Cancelling..."
         )
 
+        if self._worker is not None:
+            self._worker.cancel()
+
+
     # ========================================================
     # PROGRESS
     # ========================================================
 
-    def _on_progress(
+    def _worker_progress(
         self,
-        *args: Any,
+        percent: int,
+        message: str,
     ) -> None:
 
-        if len(args) >= 2:
+        self.progress_bar.setValue(
+            percent
+        )
 
-            try:
-
-                value = float(
-                    args[1]
-                )
-
-                if value <= 1.0:
-
-                    percent = int(
-                        value * 100
-                    )
-
-                else:
-
-                    percent = int(
-                        value
-                    )
-
-                self.progress_bar.setValue(
-                    max(
-                        0,
-                        min(
-                            100,
-                            percent,
-                        ),
-                    )
-                )
-
-            except (
-                TypeError,
-                ValueError,
-            ):
-                pass
-
-        if len(args) >= 3:
-
+        if message:
             self.progress_label.setText(
-                str(args[2])
+                message
             )
 
     # ========================================================
@@ -4452,7 +4845,7 @@ class MediaEnginePage(QWidget):
         )
 
         self.timestamp_list.clear()
-        self.timestamp_input.clear()
+        self.timestamp_input.setValue(0.0)
 
         self._reset_output()
 
@@ -4591,7 +4984,7 @@ class MediaEnginePage(QWidget):
         )
 
         self.timestamp_list.clear()
-        self.timestamp_input.clear()
+        self.timestamp_input.setValue(0.0)
 
         # --------------------------------------------------------
         # JOIN
@@ -4605,17 +4998,10 @@ class MediaEnginePage(QWidget):
         # BURN
         # --------------------------------------------------------
 
-        self.burn_font.setCurrentText(
-            "Default"
-        )
+        self.burn_font.setCurrentText("Arial")
+        self.burn_font_size.setCurrentText("18")
+        self.burn_color.setCurrentText("White")
 
-        self.burn_font_size.setCurrentText(
-            "Default"
-        )
-
-        self.burn_color.setCurrentText(
-            "White"
-        )
 
         self._reset_output()
 
@@ -4658,7 +5044,7 @@ class MediaEnginePage(QWidget):
         )
 
         self.timestamp_list.clear()
-        self.timestamp_input.clear()
+        self.timestamp_input.setValue(0.0)
 
         self._reset_output()
 

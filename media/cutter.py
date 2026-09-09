@@ -4,11 +4,10 @@ from pathlib import Path
 from typing import Optional
 
 from .ffmpeg import FFmpeg
+from .ffprobe import FFProbe
 from .models import (
     CutResult,
     CutterSettings,
-    CutterSettings,
-    MediaInput,
     MediaPart,
 )
 from .subtitles import SubtitleManager
@@ -28,13 +27,17 @@ class MediaCutter:
     ):
         self.ff = FFmpeg(
             ffmpeg=ffmpeg,
-            ffprobe=ffprobe,
             progress_callback=progress_callback,
             cancellation_callback=cancellation_callback,
         )
 
+        self.ffprobe = FFProbe(
+            executable=ffprobe,
+        )
+
         self.subtitles = SubtitleManager(
-            self.ff
+            ffmpeg=self.ff,
+            ffprobe=self.ffprobe,
         )
 
     # ========================================================
@@ -55,7 +58,7 @@ class MediaCutter:
 
         self.ff.validate_input(source)
 
-        duration = self.ff.duration(source)
+        duration = self.ffprobe.duration(source)
 
         ranges = self._build_ranges(
             duration,
@@ -118,6 +121,7 @@ class MediaCutter:
 
                 if settings.cut_subtitles:
                     for track in tracks:
+
                         subtitle_output = (
                             output.with_suffix(
                                 f".{track.language or 'sub'}"
@@ -186,6 +190,7 @@ class MediaCutter:
 
         command = [
             self.ff.ffmpeg,
+
             "-hide_banner",
             "-y",
             "-nostdin",
@@ -208,11 +213,14 @@ class MediaCutter:
         ]
 
         if settings.video_mode == "fast_copy":
+
             command += [
                 "-c:v",
                 "copy",
             ]
+
         else:
+
             command += [
                 "-c:v",
                 settings.video_codec,
@@ -225,11 +233,14 @@ class MediaCutter:
             ]
 
         if settings.audio_mode == "fast_copy":
+
             command += [
                 "-c:a",
                 "copy",
             ]
+
         else:
+
             command += [
                 "-c:a",
                 settings.audio_codec,
@@ -247,7 +258,9 @@ class MediaCutter:
                 "+faststart",
             ]
 
-        command.append(str(temp))
+        command.append(
+            str(temp)
+        )
 
         self.ff.run(
             command,
@@ -272,8 +285,16 @@ class MediaCutter:
 
         mode = settings.mode
 
+        # ====================================================
+        # SPLIT INTO EQUAL PARTS
+        # ====================================================
+
         if mode == "parts":
-            if not settings.parts or settings.parts < 1:
+
+            if (
+                not settings.parts
+                or settings.parts < 1
+            ):
                 raise ValueError(
                     "parts must be at least 1."
                 )
@@ -286,8 +307,16 @@ class MediaCutter:
                 for i in range(settings.parts)
             ]
 
+        # ====================================================
+        # FIXED DURATION
+        # ====================================================
+
         if mode == "duration":
-            if not settings.duration or settings.duration <= 0:
+
+            if (
+                not settings.duration
+                or settings.duration <= 0
+            ):
                 raise ValueError(
                     "duration must be greater than zero."
                 )
@@ -297,20 +326,45 @@ class MediaCutter:
                 settings.duration,
             )
 
+        # ====================================================
+        # EXPLICIT DURATIONS
+        # ====================================================
+
         if mode == "durations":
+
             return self._explicit_ranges(
                 duration,
                 settings.durations,
             )
 
+        # ====================================================
+        # TIMESTAMPS
+        # ====================================================
+
         if mode == "timestamps":
+
             return self._timestamp_ranges(
                 duration,
                 settings.timestamps,
             )
 
-        if mode == "range":
+        # ====================================================
+        # START / END RANGE
+        #
+        # "start_end" is the UI name.
+        # "range" is the original backend name.
+        #
+        # Both mean:
+        #     cut from start timestamp to end timestamp.
+        # ====================================================
+
+        if mode in {
+            "range",
+            "start_end",
+        }:
+
             start = settings.start
+
             end = (
                 settings.end
                 if settings.end is not None
@@ -323,11 +377,21 @@ class MediaCutter:
                 duration,
             )
 
-            return [(start, end)]
+            return [
+                (
+                    start,
+                    end,
+                )
+            ]
+
+        # ====================================================
+        # UNKNOWN MODE
+        # ====================================================
 
         raise ValueError(
             f"Unknown cut mode: {mode}"
         )
+
 
     @classmethod
     def _fixed_ranges(
@@ -340,6 +404,7 @@ class MediaCutter:
         start = 0.0
 
         while start < duration - cls.EPSILON:
+
             end = min(
                 start + size,
                 duration,
@@ -364,6 +429,7 @@ class MediaCutter:
         start = 0.0
 
         for size in durations:
+
             if size <= 0:
                 raise ValueError(
                     "All durations must be positive."
@@ -406,6 +472,7 @@ class MediaCutter:
         previous = 0.0
 
         for value in timestamps:
+
             value = float(value)
 
             if value <= previous:
@@ -414,14 +481,17 @@ class MediaCutter:
                 )
 
             if value >= duration:
+
                 if abs(value - duration) <= cls.EPSILON:
                     value = duration
+
                 else:
                     raise ValueError(
                         "Timestamp exceeds media duration."
                     )
 
             points.append(value)
+
             previous = value
 
         points.append(duration)
@@ -470,14 +540,21 @@ class MediaCutter:
         settings,
         directory,
     ):
-        if settings.mode == "range":
+
+        if settings.mode in {
+            "range",
+            "start_end",
+        }:
+
             name = (
                 f"{source.stem}-"
                 f"{MediaCutter._time_name(start)}-"
                 f"{MediaCutter._time_name(end)}"
                 f"{source.suffix}"
             )
+
         else:
+
             name = (
                 f"{source.stem}_"
                 f"{index}"
@@ -490,7 +567,10 @@ class MediaCutter:
 
     @staticmethod
     def _time_name(seconds):
-        seconds = int(round(seconds))
+
+        seconds = int(
+            round(seconds)
+        )
 
         hours, remainder = divmod(
             seconds,
@@ -503,9 +583,16 @@ class MediaCutter:
         )
 
         if hours:
-            return f"{hours}h{minutes:02d}m{seconds:02d}s"
+            return (
+                f"{hours}h"
+                f"{minutes:02d}m"
+                f"{seconds:02d}s"
+            )
 
-        return f"{minutes}m{seconds:02d}s"
+        return (
+            f"{minutes}m"
+            f"{seconds:02d}s"
+        )
 
     @staticmethod
     def _seconds(value):
@@ -516,6 +603,7 @@ class MediaCutter:
         track,
         settings,
     ):
+
         if settings.subtitle.output_format != "same":
             return "." + settings.subtitle.output_format
 

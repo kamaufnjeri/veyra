@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Sequence
 
 from .ffmpeg import FFmpeg
+from .ffprobe import FFProbe
 from .models import JoinResult, JoinerSettings
 from .subtitles import SubtitleManager
 
@@ -14,20 +14,24 @@ class MediaJoiner:
     def __init__(
         self,
         *,
-        ffmpeg="ffmpeg",
-        ffprobe="ffprobe",
+        ffmpeg: str = "ffmpeg",
+        ffprobe: str = "ffprobe",
         progress_callback=None,
         cancellation_callback=None,
     ):
         self.ff = FFmpeg(
             ffmpeg=ffmpeg,
-            ffprobe=ffprobe,
             progress_callback=progress_callback,
             cancellation_callback=cancellation_callback,
         )
 
+        self.ffprobe = FFProbe(
+            executable=ffprobe
+        )
+
         self.subtitles = SubtitleManager(
-            self.ff
+            ffmpeg=self.ff,
+            ffprobe=self.ffprobe
         )
 
     def join(
@@ -63,7 +67,7 @@ class MediaJoiner:
         )
 
         duration = sum(
-            self.ff.duration(path)
+            self.ffprobe.duration(path)
             for path in paths
         )
 
@@ -72,6 +76,7 @@ class MediaJoiner:
         )
 
         try:
+
             concat_file.write_text(
                 "\n".join(
                     self._concat_line(path)
@@ -107,11 +112,14 @@ class MediaJoiner:
             ]
 
             if settings.video_mode == "fast_copy":
+
                 command += [
                     "-c:v",
                     "copy",
                 ]
+
             else:
+
                 command += [
                     "-c:v",
                     settings.video_codec,
@@ -124,11 +132,14 @@ class MediaJoiner:
                 ]
 
             if settings.audio_mode == "fast_copy":
+
                 command += [
                     "-c:a",
                     "copy",
                 ]
+
             else:
+
                 command += [
                     "-c:a",
                     settings.audio_codec,
@@ -146,7 +157,9 @@ class MediaJoiner:
                     "+faststart",
                 ]
 
-            command.append(str(temp))
+            command.append(
+                str(temp)
+            )
 
             self.ff.run(
                 command,
@@ -160,6 +173,7 @@ class MediaJoiner:
             )
 
             if settings.join_subtitles:
+
                 self._join_sidecar_subtitles(
                     paths,
                     output,
@@ -173,10 +187,14 @@ class MediaJoiner:
             )
 
         finally:
+
             self.ff.cleanup()
 
     @staticmethod
-    def _concat_line(path: Path) -> str:
+    def _concat_line(
+        path: Path,
+    ) -> str:
+
         value = str(
             path.resolve()
         ).replace(
@@ -192,9 +210,11 @@ class MediaJoiner:
         output,
         settings,
     ):
+
         groups = {}
 
         for path in inputs:
+
             tracks = self.subtitles.discover(
                 path
             )
@@ -205,6 +225,7 @@ class MediaJoiner:
             )
 
             for track in tracks:
+
                 if track.embedded:
                     continue
 
@@ -221,6 +242,7 @@ class MediaJoiner:
                 )
 
         for language, tracks in groups.items():
+
             if len(tracks) != len(inputs):
                 continue
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .ffmpeg import FFmpeg
+from .ffprobe import FFProbe
 from .models import BurnResult, BurnerSettings
 
 
@@ -11,16 +12,19 @@ class SubtitleBurner:
     def __init__(
         self,
         *,
-        ffmpeg="ffmpeg",
-        ffprobe="ffprobe",
+        ffmpeg: str = "ffmpeg",
+        ffprobe: str = "ffprobe",
         progress_callback=None,
         cancellation_callback=None,
     ):
         self.ff = FFmpeg(
             ffmpeg=ffmpeg,
-            ffprobe=ffprobe,
             progress_callback=progress_callback,
             cancellation_callback=cancellation_callback,
+        )
+
+        self.ffprobe = FFProbe(
+            executable=ffprobe
         )
 
     def burn(
@@ -48,7 +52,7 @@ class SubtitleBurner:
             settings.overwrite,
         )
 
-        duration = self.ff.duration(
+        duration = self.ffprobe.duration(
             video
         )
 
@@ -81,8 +85,6 @@ class SubtitleBurner:
 
         # ----------------------------------------------------
         # VIDEO
-        #
-        # Burning subtitles necessarily requires encoding.
         # ----------------------------------------------------
 
         command += [
@@ -104,17 +106,24 @@ class SubtitleBurner:
         # ----------------------------------------------------
 
         if settings.audio_mode == "fast_copy":
+
             command += [
                 "-c:a",
                 "copy",
             ]
+
         else:
+
             command += [
                 "-c:a",
                 settings.audio_codec,
                 "-b:a",
                 settings.audio_bitrate,
             ]
+
+        # ----------------------------------------------------
+        # FASTSTART
+        # ----------------------------------------------------
 
         if (
             settings.faststart
@@ -131,6 +140,7 @@ class SubtitleBurner:
         )
 
         try:
+
             self.ff.run(
                 command,
                 message="Burning subtitles",
@@ -150,14 +160,29 @@ class SubtitleBurner:
             )
 
         finally:
+
             self.ff.cleanup()
 
     # ========================================================
     # FILTER
     # ========================================================
+    @staticmethod
+    def _ass_color(hex_color: str) -> str:
+        hex_color = hex_color.lstrip("#")
+
+        if len(hex_color) != 6:
+            raise ValueError("Color must be #RRGGBB")
+
+        rr = hex_color[0:2]
+        gg = hex_color[2:4]
+        bb = hex_color[4:6]
+
+        return f"&H00{bb}{gg}{rr}"
+
 
     @staticmethod
     def _subtitle_filter(
+        
         subtitle: Path,
         settings: BurnerSettings,
     ) -> str:
@@ -177,22 +202,33 @@ class SubtitleBurner:
         options = []
 
         if settings.subtitle_font:
+
             options.append(
                 f"FontName={settings.subtitle_font}"
             )
 
         if settings.subtitle_font_size:
+
             options.append(
                 f"FontSize={settings.subtitle_font_size}"
             )
 
         if settings.subtitle_color:
-            options.append(
-                f"PrimaryColour={settings.subtitle_color}"
+
+            color = SubtitleBurner._ass_color(
+                settings.subtitle_color
             )
 
+            options.append(
+                f"PrimaryColour={color}"
+    )
+
+
         if options:
-            force_style = ",".join(options)
+
+            force_style = ",".join(
+                options
+            )
 
             return (
                 f"subtitles='{path}':"

@@ -227,24 +227,38 @@ class MediaEngineProcessor:
     # SERVICE
     # ==========================================================
 
-    def _create_service(self) -> MediaEngineService:
+    def _create_service(
+        self,
+        job: MediaEngineJob,
+    ) -> MediaEngineService:
         """
-        Create a fresh MediaEngineService for the current
-        processing operation.
+        Create a MediaEngineService for the current job.
 
-        This follows the same pattern as:
+        FFmpeg emits progress as:
 
-            service = SubtitleService(...)
+            callback(progress)
 
-        inside SubtitleProcessor.process().
+        while the processor callback receives:
+
+            callback(job, progress, message)
+
+        This method adapts the two callback interfaces.
         """
+
+        def on_progress(progress: float) -> None:
+            self._emit_progress(
+                job,
+                progress,
+                "Processing",
+            )
 
         return MediaEngineService(
             ffmpeg=self.ffmpeg,
             ffprobe=self.ffprobe,
-            progress_callback=self.progress_callback,
+            progress_callback=on_progress,
             cancellation_callback=self.check_cancelled,
-        )
+    )
+
 
     # ==========================================================
     # SINGLE JOB
@@ -284,7 +298,7 @@ class MediaEngineProcessor:
             # CREATE SERVICE
             # --------------------------------------------------
 
-            service = self._create_service()
+            service = self._create_service(job)
 
             self.check_cancelled()
 
