@@ -2,13 +2,13 @@
 
 Veyra is a local Python-based media application built around three separate tools:
 
-- **Subtitle Generation** — generate and translate subtitles from video or audio.
+- **Subtitle Generation** — generate and translate subtitles from video or WAV audio.
 - **Media Download** — download videos, playlists, audio, or subtitles using [`yt-dlp`](https://github.com/yt-dlp/yt-dlp).
-- **Media Processing** — convert, cut, join, and burn subtitles into media.
+- **Media Processing** — inspect, convert, cut, extract, compress, join, mux, and burn subtitles into media.
 
 ## About
 
-Veyra is an opinionated personal media project built around how I personally work with media.
+Veyra is an **opinionated personal media project** built around how I personally work with media.
 
 It is **not designed to be a universal media-processing solution**. Instead, it focuses on the workflows, tools, and features that fit my needs and the way I prefer to manage and process media.
 
@@ -47,7 +47,7 @@ Optional Translation
 
 Veyra supports two methods for detecting speech regions and generating their timestamps:
 
-- **[Silero VAD](https://github.com/snakers4/silero-vad)** — detects regions of the audio that contain speech and provides timestamps for those regions.
+- [**Silero VAD**](https://github.com/snakers4/silero-vad) — detects regions of the audio that contain speech and provides timestamps for those regions.
 - **Fixed segments** — divides the audio into fixed 10-second segments and uses those segments as the regions to process.
 
 These methods are used for **speech detection and timing**, not for converting speech into text.
@@ -127,13 +127,40 @@ Websites can change their systems, authentication requirements, or anti-bot meas
 
 Media processing is a separate part of Veyra and does not require the subtitle-generation or download features.
 
-Veyra uses **[FFmpeg](https://ffmpeg.org/)** and **FFprobe** for media operations such as:
+Veyra uses [**FFmpeg**](https://ffmpeg.org/) and **FFprobe** for media operations.
 
+Current processing capabilities include:
+
+- Inspect media and subtitle files
 - Convert media
-- Cut videos into parts
+- Cut media
+- Extract video
+- Extract audio
+- Extract subtitles
+- Compress media
 - Join videos
-- Burn subtitles
-- Inspect media information
+- Join audio files
+- Join subtitle files
+- Mux video, audio, and subtitles
+- Burn subtitles into video
+
+The processing tools are designed around Veyra's specific workflows rather than attempting to provide every FFmpeg feature.
+
+---
+
+### Inspection
+
+Veyra can inspect supported media and subtitle files and display their available information.
+
+Inspection can be used with files such as:
+
+- Video files
+- Audio files
+- Subtitle files
+
+The inspection result is presented in a readable format rather than simply displaying raw JSON.
+
+---
 
 ### Conversion
 
@@ -143,15 +170,19 @@ Examples:
 
 ```text
 MKV → MP4
+
 MOV → MP4
+
 MP4 → MKV
 ```
 
 Depending on the operation, streams may be copied without re-encoding or re-encoded when necessary.
 
+---
+
 ### Cutting
 
-Videos can be divided into parts using options such as:
+Veyra can cut media into separate parts using options such as:
 
 - Duration
 - Number of parts
@@ -169,19 +200,127 @@ Part 3
 Part 4
 ```
 
+---
+
 ### Joining
 
-Multiple compatible video files can be joined into a single file:
+Veyra can join compatible files into a single output.
+
+Joining is available separately for:
+
+#### Video
 
 ```text
-Part 1
-Part 2
-Part 3
-  ↓
+Video Part 1
+Video Part 2
+Video Part 3
+      ↓
 Complete Video
 ```
 
-The files should have compatible media properties for reliable joining.
+#### Audio
+
+```text
+Audio Part 1
+Audio Part 2
+Audio Part 3
+      ↓
+Complete Audio
+```
+
+#### Subtitles
+
+```text
+Subtitle Part 1
+Subtitle Part 2
+Subtitle Part 3
+       ↓
+ Complete Subtitle
+```
+
+Subtitle joining takes the timing of each preceding subtitle file into account so that subsequent subtitle timestamps can be offset appropriately.
+
+The files should have compatible properties and formats for reliable joining.
+
+---
+
+### Extraction
+
+Veyra can extract individual streams from media.
+
+Supported extraction workflows include:
+
+#### Extract Video
+
+```text
+Video + Audio + Subtitles
+          ↓
+        Video
+```
+
+#### Extract Audio
+
+```text
+Video + Audio + Subtitles
+          ↓
+        Audio
+```
+
+#### Extract Subtitles
+
+```text
+Video + Audio + Subtitles
+          ↓
+       Subtitle
+```
+
+Extraction is useful when a media file contains streams that need to be handled independently.
+
+---
+
+### Compression
+
+Veyra can compress media to reduce file size while retaining a practical level of quality.
+
+The compression workflow uses FFmpeg encoding settings selected by Veyra.
+
+```text
+Input Media
+     ↓
+   FFmpeg
+     ↓
+Compressed Media
+```
+
+Compression is intended for practical file-size reduction rather than lossless preservation in every case.
+
+---
+
+### Muxing
+
+Veyra can combine separate video, audio, and subtitle streams into a single media container.
+
+For example:
+
+```text
+Video
+  +
+Audio
+  +
+Subtitles
+  ↓
+ Mux
+  ↓
+Final Media File
+```
+
+Muxing is different from burning subtitles.
+
+With **muxing**, subtitles remain a separate subtitle stream and can normally be enabled or disabled by the media player.
+
+With **burning**, subtitles become permanently rendered into the video image.
+
+---
 
 ### Burning Subtitles
 
@@ -202,6 +341,46 @@ Subtitle appearance can be configured using options such as:
 - Font
 - Font size
 - Font color
+
+---
+
+# Media Processing Overview
+
+The current media-processing workflows can be summarized as:
+
+```text
+                    ┌────────────────────┐
+                    │   Media / Files    │
+                    └─────────┬──────────┘
+                              │
+          ┌───────────────────┼───────────────────┐
+          ↓                   ↓                   ↓
+      Inspect              Extract              Convert
+                              │
+                    ┌─────────┼─────────┐
+                    ↓         ↓         ↓
+                  Video     Audio    Subtitle
+
+          ┌───────────────────┼───────────────────┐
+          ↓                   ↓                   ↓
+        Cut                 Join               Compress
+                              │
+                    ┌─────────┼─────────┐
+                    ↓         ↓         ↓
+                  Video     Audio    Subtitle
+
+                              ↓
+                            Mux
+                              ↓
+                    Video + Audio + Subs
+
+                              ↓
+                       Burn Subtitles
+                              ↓
+                       Final Video
+```
+
+These operations are intentionally separated so that individual streams can be extracted, processed independently, joined, and then combined again when needed.
 
 ---
 
@@ -307,7 +486,7 @@ python3 dev.py
 Veyra's main Python dependencies include:
 
 | Package | Purpose |
-|---|---|
+| --- | --- |
 | [`PySide6`](https://pypi.org/project/PySide6/) | Graphical user interface |
 | [`pysubs2`](https://pypi.org/project/pysubs2/) | Subtitle manipulation |
 | [`pysrt`](https://pypi.org/project/pysrt/) | SRT subtitle handling |
@@ -326,7 +505,7 @@ Python standard-library modules such as `re`, `signal`, and `threading` do not n
 
 Veyra also requires:
 
-- **[FFmpeg](https://ffmpeg.org/)**
+- [**FFmpeg**](https://ffmpeg.org/)
 - **FFprobe**
 - An available speech-recognition service supported by the configured [`SpeechRecognition`](https://pypi.org/project/SpeechRecognition/) setup
 
@@ -403,6 +582,8 @@ Google Speech Recognition and other external services may also have availability
 
 External services and websites can change independently of Veyra.
 
+Media-processing compatibility also depends on the codecs, streams, containers, and subtitle formats contained in the input files.
+
 ---
 
 # Credits
@@ -443,4 +624,4 @@ Veyra is an independent project and is not affiliated with or endorsed by PyAuto
 
 Veyra is released under the **MIT License**.
 
-See the [`LICENSE`](LICENSE) file for the complete license text.
+See the `LICENSE` file for the complete license text.

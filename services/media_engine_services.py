@@ -4,36 +4,74 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from media.burner import SubtitleBurner
+from media.compressor import MediaCompressor
 from media.cutter import MediaCutter
 from media.converter import MediaConverter
+from media.extractor import MediaExtractor
 from media.inspector import MediaInspector
 from media.joiner import MediaJoiner
+from media.muxer import MediaMuxer
 from media.models import (
     BurnerSettings,
     BurnResult,
+    CompressorSettings,
+    CompressResult,
     ConvertResult,
     ConverterSettings,
     CutResult,
     CutterSettings,
+    ExtractResult,
+    ExtractorSettings,
     JoinResult,
     JoinerSettings,
+    MuxResult,
+    MuxerSettings,
 )
 
 
 class MediaEngineService:
     """
-    High-level facade for the media engine.
+    High-level facade for the complete media engine.
 
-    Provides a single API for:
+    Provides a single public API for:
 
         - inspecting media
         - converting media
         - cutting media
         - joining media
+        - muxing media
+        - compressing media
+        - extracting media
         - burning subtitles
 
-    The service delegates the actual work to the specialized
+    The service delegates the actual work to specialized
     media operation classes.
+
+    Operation responsibilities:
+
+        inspect
+            Inspect media streams and metadata.
+
+        convert
+            Convert or re-encode a media file.
+
+        cut
+            Split media into segments.
+
+        join
+            Sequentially join compatible media files.
+
+        mux
+            Combine independent video/audio/subtitle streams.
+
+        compress
+            Reduce video/audio size or quality.
+
+        extract
+            Extract video, audio, or subtitle streams.
+
+        burn_subtitles
+            Permanently render subtitles into video.
     """
 
     def __init__(
@@ -52,19 +90,63 @@ class MediaEngineService:
             "cancellation_callback": cancellation_callback,
         }
 
+        # ========================================================
+        # INSPECTOR
+        # ========================================================
+
         self.inspector = MediaInspector()
+
+        # ========================================================
+        # CONVERTER
+        # ========================================================
 
         self.converter = MediaConverter(
             **common,
         )
 
+        # ========================================================
+        # CUTTER
+        # ========================================================
+
         self.cutter = MediaCutter(
             **common,
         )
 
+        # ========================================================
+        # JOINER
+        # ========================================================
+
         self.joiner = MediaJoiner(
             **common,
         )
+
+        # ========================================================
+        # MUXER
+        # ========================================================
+
+        self.muxer = MediaMuxer(
+            **common,
+        )
+
+        # ========================================================
+        # COMPRESSOR
+        # ========================================================
+
+        self.compressor = MediaCompressor(
+            **common,
+        )
+
+        # ========================================================
+        # EXTRACTOR
+        # ========================================================
+
+        self.extractor = MediaExtractor(
+            **common,
+        )
+
+        # ========================================================
+        # SUBTITLE BURNER
+        # ========================================================
 
         self.burner = SubtitleBurner(
             **common,
@@ -159,12 +241,106 @@ class MediaEngineService:
         settings: JoinerSettings | None = None,
     ) -> JoinResult:
         """
-        Join multiple media files into one output.
+        Sequentially join compatible media files.
+
+        Examples:
+
+            video + video -> video
+
+            audio + audio -> audio
+
+            video(with audio) + video(with audio)
+                -> video(with audio)
+
+        Sidecar subtitles are handled by MediaJoiner.
         """
 
         return self.joiner.join(
             inputs,
             output,
+            settings,
+        )
+
+    # ============================================================
+    # MUX
+    # ============================================================
+
+    def mux(
+        self,
+        inputs: Sequence[str | Path],
+        output: str | Path,
+        settings: MuxerSettings | None = None,
+    ) -> MuxResult:
+        """
+        Combine independent media streams.
+
+        Examples:
+
+            video + audio -> video/audio
+
+            video + subtitle -> video/subtitle
+
+            video + audio + subtitle
+                -> video/audio/subtitle
+
+        Muxing does not concatenate media sequentially.
+        """
+
+        return self.muxer.mux(
+            inputs,
+            output,
+            settings,
+        )
+
+    # ============================================================
+    # COMPRESS
+    # ============================================================
+
+    def compress(
+        self,
+        input_path: str | Path,
+        output_path: str | Path,
+        settings: CompressorSettings | None = None,
+    ) -> CompressResult:
+        """
+        Compress media to reduce file size and/or quality.
+
+        Supports:
+
+            - video compression
+            - audio compression
+            - video + audio compression
+        """
+
+        return self.compressor.compress(
+            input_path,
+            output_path,
+            settings,
+        )
+
+    # ============================================================
+    # EXTRACT
+    # ============================================================
+
+    def extract(
+        self,
+        input_path: str | Path,
+        output_path: str | Path,
+        settings: ExtractorSettings | None = None,
+    ) -> ExtractResult:
+        """
+        Extract a media stream.
+
+        Supported stream types include:
+
+            - audio
+            - video
+            - subtitle
+        """
+
+        return self.extractor.extract(
+            input_path,
+            output_path,
             settings,
         )
 

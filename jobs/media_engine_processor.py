@@ -6,13 +6,17 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from services.media_engine_services import MediaEngineService
 from media.models import (
     BurnerSettings,
+    CompressorSettings,
     ConverterSettings,
     CutterSettings,
+    ExtractorSettings,
     JoinerSettings,
+    MuxerSettings,
 )
+
+from services.media_engine_services import MediaEngineService
 
 
 # ============================================================
@@ -21,7 +25,9 @@ from media.models import (
 
 
 class JobCancelled(Exception):
-    """Raised when a media engine job is cancelled."""
+    """
+    Raised when a media engine job is cancelled.
+    """
 
 
 # ============================================================
@@ -42,16 +48,51 @@ class MediaEngineJob:
     options: dict[str, Any] | None = None
 
 
+# ============================================================
+# JOB RESULT
+# ============================================================
+
+
 @dataclass(frozen=True, slots=True)
 class MediaEngineJobResult:
     """
-    Result returned after a successful operation.
+    Result returned for every submitted job.
+
+    A job can either have:
+
+        result
+            Successful operation result.
+
+    or:
+
+        error
+            Exception raised by the operation.
+
+    This guarantees that batch results always preserve the
+    relationship between submitted jobs and returned results.
     """
 
     operation: str
     inputs: tuple[Path, ...]
     output: Path | None
     result: Any = None
+    error: Exception | None = None
+
+    @property
+    def succeeded(self) -> bool:
+        """
+        Return True when the job completed successfully.
+        """
+
+        return self.error is None and self.result is not None
+
+    @property
+    def failed(self) -> bool:
+        """
+        Return True when the job failed.
+        """
+
+        return self.error is not None
 
 
 # ============================================================
@@ -61,7 +102,7 @@ class MediaEngineJobResult:
 
 class MediaEngineProcessor:
     """
-    Processes media engine jobs.
+    Processes MediaEngineJob objects.
 
     Responsibilities:
 
@@ -74,6 +115,10 @@ class MediaEngineProcessor:
         - creating MediaEngineService
         - dispatching through MediaEngineService
         - preserving operation-specific settings
+
+    The processor does not perform media operations itself.
+
+    All actual media work is delegated to MediaEngineService.
     """
 
     def __init__(
@@ -105,15 +150,21 @@ class MediaEngineProcessor:
         """
         Request cancellation.
         """
+
         self.cancelled = True
 
     def reset_cancellation(self) -> None:
         """
         Reset cancellation before starting a new processing session.
         """
+
         self.cancelled = False
 
     def check_cancelled(self) -> None:
+        """
+        Raise JobCancelled when cancellation has been requested.
+        """
+
         if self.cancelled:
             raise JobCancelled(
                 "Media processing cancelled."
@@ -152,6 +203,10 @@ class MediaEngineProcessor:
             pass
 
     def _restore_signal_handler(self) -> None:
+        """
+        Restore the original SIGINT handler.
+        """
+
         if self._original_sigint_handler is None:
             return
 
@@ -176,6 +231,10 @@ class MediaEngineProcessor:
         signum: int,
         frame: Any,
     ) -> None:
+        """
+        Handle Ctrl+C.
+        """
+
         self.cancel()
 
         self._emit_error(
@@ -196,6 +255,7 @@ class MediaEngineProcessor:
 
         try:
             self.progress_callback(*args)
+
         except Exception:
             pass
 
@@ -208,6 +268,7 @@ class MediaEngineProcessor:
 
         try:
             self.error_callback(error)
+
         except Exception:
             pass
 
@@ -220,6 +281,7 @@ class MediaEngineProcessor:
 
         try:
             self.job_callback(*args)
+
         except Exception:
             pass
 
@@ -233,16 +295,6 @@ class MediaEngineProcessor:
     ) -> MediaEngineService:
         """
         Create a MediaEngineService for the current job.
-
-        FFmpeg emits progress as:
-
-            callback(progress)
-
-        while the processor callback receives:
-
-            callback(job, progress, message)
-
-        This method adapts the two callback interfaces.
         """
 
         def on_progress(progress: float) -> None:
@@ -257,8 +309,7 @@ class MediaEngineProcessor:
             ffprobe=self.ffprobe,
             progress_callback=on_progress,
             cancellation_callback=self.check_cancelled,
-    )
-
+        )
 
     # ==========================================================
     # SINGLE JOB
@@ -271,13 +322,18 @@ class MediaEngineProcessor:
         """
         Process a single media engine job.
 
-        MediaEngineService is created here and all operations
-        are executed through its public API.
+        A normal exception is raised to the caller so that batch
+        processing can record the failure.
+
+        Cancellation remains separate from ordinary failure.
         """
 
         self.check_cancelled()
 
-        if not isinstance(job, MediaEngineJob):
+        if not isinstance(
+            job,
+            MediaEngineJob,
+        ):
             raise TypeError(
                 "Expected MediaEngineJob."
             )
@@ -298,12 +354,14 @@ class MediaEngineProcessor:
             # CREATE SERVICE
             # --------------------------------------------------
 
-            service = self._create_service(job)
+            service = self._create_service(
+                job,
+            )
 
             self.check_cancelled()
 
             # --------------------------------------------------
-            # DISPATCH THROUGH SERVICE
+            # DISPATCH
             # --------------------------------------------------
 
             result = self._dispatch(
@@ -313,11 +371,16 @@ class MediaEngineProcessor:
 
             self.check_cancelled()
 
+            # --------------------------------------------------
+            # RESULT
+            # --------------------------------------------------
+
             output = MediaEngineJobResult(
                 operation=job.operation,
                 inputs=job.inputs,
                 output=job.output,
                 result=result,
+                error=None,
             )
 
             self._emit_progress(
@@ -338,6 +401,7 @@ class MediaEngineProcessor:
                 "cancelled",
                 job,
             )
+
             raise
 
         except KeyboardInterrupt:
@@ -359,7 +423,9 @@ class MediaEngineProcessor:
                 exc,
             )
 
-            self._emit_error(exc)
+            self._emit_error(
+                exc,
+            )
 
             raise
 
@@ -374,17 +440,6 @@ class MediaEngineProcessor:
     ) -> Any:
         """
         Dispatch the job through MediaEngineService.
-
-        The processor does NOT access:
-
-            service.converter
-            service.cutter
-            service.joiner
-            service.burner
-
-        directly.
-
-        Everything goes through the public MediaEngineService API.
         """
 
         self.check_cancelled()
@@ -450,7 +505,9 @@ class MediaEngineProcessor:
                 1,
             )
 
-            self._require_output(job)
+            self._require_output(
+                job,
+            )
 
             settings = job.settings
 
@@ -509,7 +566,9 @@ class MediaEngineProcessor:
                     "join requires at least one input."
                 )
 
-            self._require_output(job)
+            self._require_output(
+                job,
+            )
 
             settings = job.settings
 
@@ -531,6 +590,105 @@ class MediaEngineProcessor:
             )
 
         # ======================================================
+        # MUX
+        # ======================================================
+
+        if operation == "mux":
+            if len(job.inputs) < 2:
+                raise ValueError(
+                    "mux requires at least two inputs."
+                )
+
+            self._require_output(
+                job,
+            )
+
+            settings = job.settings
+
+            if settings is None:
+                settings = MuxerSettings()
+
+            if not isinstance(
+                settings,
+                MuxerSettings,
+            ):
+                raise TypeError(
+                    "mux requires MuxerSettings."
+                )
+
+            return service.mux(
+                inputs=job.inputs,
+                output=job.output,
+                settings=settings,
+            )
+
+        # ======================================================
+        # COMPRESS
+        # ======================================================
+
+        if operation == "compress":
+            self._require_inputs(
+                job,
+                1,
+            )
+
+            self._require_output(
+                job,
+            )
+
+            settings = job.settings
+
+            if settings is None:
+                settings = CompressorSettings()
+
+            if not isinstance(
+                settings,
+                CompressorSettings,
+            ):
+                raise TypeError(
+                    "compress requires CompressorSettings."
+                )
+
+            return service.compress(
+                input_path=job.inputs[0],
+                output_path=job.output,
+                settings=settings,
+            )
+
+        # ======================================================
+        # EXTRACT
+        # ======================================================
+
+        if operation == "extract":
+            self._require_inputs(
+                job,
+                1,
+            )
+
+            self._require_output(
+                job,
+            )
+
+            settings = job.settings
+
+            if settings is None:
+                settings = ExtractorSettings()
+
+            if not isinstance(
+                settings,
+                ExtractorSettings,
+            ):
+                raise TypeError(
+                    "extract requires ExtractorSettings."
+                )
+
+            return service.extract(
+                input_path=job.inputs[0],
+                output_path=job.output,
+                settings=settings,
+            )
+
+        # ======================================================
         # BURN SUBTITLES
         # ======================================================
 
@@ -540,7 +698,9 @@ class MediaEngineProcessor:
                 2,
             )
 
-            self._require_output(job)
+            self._require_output(
+                job,
+            )
 
             settings = job.settings
 
@@ -562,6 +722,10 @@ class MediaEngineProcessor:
                 settings=settings,
             )
 
+        # ======================================================
+        # UNKNOWN OPERATION
+        # ======================================================
+
         raise ValueError(
             f"Unsupported media operation: {operation}"
         )
@@ -575,6 +739,10 @@ class MediaEngineProcessor:
         job: MediaEngineJob,
         count: int,
     ) -> None:
+        """
+        Require an exact number of inputs.
+        """
+
         if len(job.inputs) != count:
             raise ValueError(
                 f"{job.operation} requires exactly "
@@ -586,6 +754,10 @@ class MediaEngineProcessor:
     def _require_output(
         job: MediaEngineJob,
     ) -> None:
+        """
+        Require an output path.
+        """
+
         if job.output is None:
             raise ValueError(
                 f"{job.operation} requires an output path."
@@ -602,9 +774,13 @@ class MediaEngineProcessor:
         """
         Process jobs sequentially.
 
-        Individual failures are reported and processing continues.
+        Every submitted job produces exactly one result unless the
+        entire batch is cancelled.
 
-        Cancellation stops the batch.
+        Individual failures are recorded in MediaEngineJobResult
+        and processing continues with the remaining jobs.
+
+        Cancellation stops the entire batch.
         """
 
         job_list = list(jobs)
@@ -633,9 +809,13 @@ class MediaEngineProcessor:
                 )
 
                 try:
-                    result = self.process(job)
+                    result = self.process(
+                        job,
+                    )
 
-                    results.append(result)
+                    results.append(
+                        result,
+                    )
 
                 except JobCancelled:
                     raise
@@ -648,9 +828,41 @@ class MediaEngineProcessor:
                     )
 
                 except Exception as exc:
-                    self._emit_error(exc)
+                    # ------------------------------------------
+                    # IMPORTANT:
+                    #
+                    # Do NOT discard the failed job.
+                    #
+                    # The GUI needs one result for every submitted
+                    # job so it can correctly report:
+                    #
+                    # Total jobs
+                    # Completed
+                    # Failed
+                    # ------------------------------------------
 
-                    # Continue processing the remaining jobs.
+                    failed_result = MediaEngineJobResult(
+                        operation=job.operation,
+                        inputs=job.inputs,
+                        output=job.output,
+                        result=None,
+                        error=exc,
+                    )
+
+                    results.append(
+                        failed_result,
+                    )
+
+                    self._emit_job(
+                        "failed_recorded",
+                        failed_result,
+                    )
+
+                    self._emit_error(
+                        exc,
+                    )
+
+                    # Continue with the next job.
                     continue
 
         finally:
